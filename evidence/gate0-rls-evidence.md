@@ -11,9 +11,43 @@ $ npm run test:rls
 PASS: PostgreSQL RLS hid Org B call from an Org A database role; API maps zero rows to 404.
 
 $ npm run test:e2e
-E2E PASS: registration, secure session, TOTP, signed invite, login, and Org A -> Org B 404
+E2E PASS: registration, secure session, TOTP, signed invite, login, Org A -> Org B 404, and idempotent Telnyx replay (1 event, 1 call)
 PASS: FastAPI auth flow and cross-org 404 completed over PostgreSQL wire protocol.
+
+$ .venv/bin/pytest -q
+.................                                                        [100%]
+17 passed, 1 warning in 0.59s
+
+$ npm run test:feature-data
+PASS: feature schema has 30 tenant tables; raw Telnyx dedupe and private recording constraints hold.
+
+$ npm run test:telnyx-ingestion
+PASS: raw event stored once; duplicate skipped; replay reused durable payload; one private recording key with a 300-second signed URL.
 ```
+
+The feature migration is `alembic/versions/20260809_feature_data.sql` with
+revision `20260809_feature_data`, immediately after `20260809_gate0`. It adds
+companies, contacts/contact phones/contact emails, recordings, transcripts and
+segments, summaries/promises/actions/follow-ups/notes, task lists/tasks,
+campaigns/briefs/chats/materials/claims, spend ledger/org balance/campaign
+reads, test personas/suites/sessions, instructions, activity log,
+integrations, security events, and the `telnyx_webhook_events` inbox. Gate 0's
+`organizations` and `app_users` remain the canonical organisation and user
+tables.
+
+## Telnyx ingestion proof
+
+`app.ingestion.ingest_telnyx_event` commits the raw JSON inbox row first. The
+second transaction normalizes call-shaped events and upserts `calls` by
+`(org_id, external_call_key)`; recording media goes through the configured
+private storage adapter. A failed parser or storage copy marks the durable raw
+row `failed`, and `replay_telnyx_event` reuses that raw body. A repeated event
+ID returns `duplicate` without applying the call a second time.
+
+The signed recording route queries only the requested recording ID under the
+active RLS transaction and returns a signer-generated URL. `recordings` has a
+database `CHECK (is_private = true)` and no public URL field; settings reject
+signed URL lifetimes above 900 seconds.
 
 ## Database-level proof
 

@@ -596,6 +596,56 @@ def _inventory_rows(
     return rows
 
 
+async def _load_demo_bundle_on_connection(
+    connection: AsyncConnection,
+    bundle: DemoBundle,
+    *,
+    org_id: UUID,
+    department_id: UUID,
+) -> None:
+    """Write a demo run using an already-open, tenant-scoped transaction."""
+
+    await _set_scope(connection, org_id=org_id, department_id=department_id)
+    existing = await _active_run_id(connection, org_id=org_id, department_id=department_id)
+    if existing is not None:
+        raise DemoSeedError(
+            "A flagged demo run already exists for this scope "
+            f"({existing}). Run `wipe` first; this command will not blend runs."
+        )
+    await connection.execute(
+        text(
+            """
+            INSERT INTO demo_seed_runs (
+                id, org_id, department_id, label, seed_version, run_metadata
+            ) VALUES (
+                :id, :org_id, :department_id, :label, :seed_version,
+                CAST(:run_metadata AS jsonb)
+            )
+            """
+        ),
+        {
+            "id": bundle.run_id,
+            "org_id": org_id,
+            "department_id": department_id,
+            "label": DEMO_LABEL,
+            "seed_version": SEED_VERSION,
+            "run_metadata": _json(
+                {
+                    "demo_seed": True,
+                    "analytics_excluded": True,
+                    "marker": DEMO_LABEL,
+                    "contact_count": CONTACT_COUNT,
+                    "call_count": CALL_COUNT,
+                }
+            ),
+        },
+    )
+    for entity_type in ENTITY_TABLES:
+        await _insert_rows(connection, entity_type, bundle.records.get(entity_type, []))
+    inventory = _inventory_rows(bundle, org_id=org_id, department_id=department_id)
+    await connection.execute(_insert_statement("demo_seed_records", inventory[0]), inventory)
+
+
 async def load_demo_bundle(
     bundle: DemoBundle,
     *,
@@ -608,87 +658,62 @@ async def load_demo_bundle(
     engine = create_async_engine(database_url, pool_pre_ping=True)
     try:
         async with engine.begin() as connection:
-            await _set_scope(connection, org_id=org_id, department_id=department_id)
-            existing = await _active_run_id(connection, org_id=org_id, department_id=department_id)
-            if existing is not None:
-                raise DemoSeedError(
-                    "A flagged demo run already exists for this scope "
-                    f"({existing}). Run `wipe` first; this command will not blend runs."
-                )
-            await connection.execute(
-                text(
-                    """
-                    INSERT INTO demo_seed_runs (
-                        id, org_id, department_id, label, seed_version, run_metadata
-                    ) VALUES (
-                        :id, :org_id, :department_id, :label, :seed_version,
-                        CAST(:run_metadata AS jsonb)
-                    )
-                    """
-                ),
-                {
-                    "id": bundle.run_id,
-                    "org_id": org_id,
-                    "department_id": department_id,
-                    "label": DEMO_LABEL,
-                    "seed_version": SEED_VERSION,
-                    "run_metadata": _json(
-                        {
-                            "demo_seed": True,
-                            "analytics_excluded": True,
-                            "marker": DEMO_LABEL,
-                            "contact_count": CONTACT_COUNT,
-                            "call_count": CALL_COUNT,
-                        }
-                    ),
-                },
-            )
-            for entity_type in ENTITY_TABLES:
-                await _insert_rows(connection, entity_type, bundle.records.get(entity_type, []))
-            inventory = _inventory_rows(bundle, org_id=org_id, department_id=department_id)
-            await connection.execute(
-                _insert_statement("demo_seed_records", inventory[0]), inventory
+            await _load_demo_bundle_on_connection(
+                connection,
+                bundle,
+                org_id=org_id,
+                department_id=department_id,
             )
     finally:
         await engine.dispose()
 
 
-async def wipe_demo_run(
-    *, org_id: UUID, department_id: UUID, database_url: str
+async def _wipe_demo_run_on_connection(
+    connection: AsyncConnection, *, org_id: UUID, department_id: UUID
 ) -> tuple[UUID | None, dict[str, int]]:
     """Delete exactly the rows registered to this scope's flagged demo run."""
 
     deleted: dict[str, int] = {}
+    await _set_scope(connection, org_id=org_id, department_id=department_id)
+    run_id = await _active_run_id(connection, org_id=org_id, department_id=department_id)
+    if run_id is None:
+        return None, deleted
+    for entity_type in WIPE_ORDER:
+        result = await connection.execute(
+            text(
+                f"""
+                DELETE FROM {ENTITY_TABLES[entity_type]}
+                WHERE id IN (
+                    SELECT record_id
+                    FROM demo_seed_records
+                    WHERE seed_run_id = :run_id AND entity_type = :entity_type
+                )
+                """
+            ),
+            {"run_id": run_id, "entity_type": entity_type},
+        )
+        deleted[entity_type] = max(result.rowcount or 0, 0)
+    await connection.execute(
+        text("DELETE FROM demo_seed_records WHERE seed_run_id = :run_id"), {"run_id": run_id}
+    )
+    await connection.execute(
+        text("DELETE FROM demo_seed_runs WHERE id = :run_id"),
+        {"run_id": run_id},
+    )
+    return run_id, deleted
+
+
+async def wipe_demo_run(
+    *, org_id: UUID, department_id: UUID, database_url: str
+) -> tuple[UUID | None, dict[str, int]]:
+    """Open a transaction and delete only the current flagged demo run."""
+
     engine = create_async_engine(database_url, pool_pre_ping=True)
     try:
         async with engine.begin() as connection:
-            await _set_scope(connection, org_id=org_id, department_id=department_id)
-            run_id = await _active_run_id(connection, org_id=org_id, department_id=department_id)
-            if run_id is None:
-                return None, deleted
-            for entity_type in WIPE_ORDER:
-                result = await connection.execute(
-                    text(
-                        f"""
-                        DELETE FROM {ENTITY_TABLES[entity_type]}
-                        WHERE id IN (
-                            SELECT record_id
-                            FROM demo_seed_records
-                            WHERE seed_run_id = :run_id AND entity_type = :entity_type
-                        )
-                        """
-                    ),
-                    {"run_id": run_id, "entity_type": entity_type},
-                )
-                deleted[entity_type] = max(result.rowcount or 0, 0)
-            await connection.execute(
-                text("DELETE FROM demo_seed_records WHERE seed_run_id = :run_id"),
-                {"run_id": run_id},
+            return await _wipe_demo_run_on_connection(
+                connection, org_id=org_id, department_id=department_id
             )
-            await connection.execute(
-                text("DELETE FROM demo_seed_runs WHERE id = :run_id"), {"run_id": run_id}
-            )
-            return run_id, deleted
     finally:
         await engine.dispose()
 

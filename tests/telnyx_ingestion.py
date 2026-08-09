@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import traceback
 from copy import deepcopy
 from uuid import UUID
 
@@ -119,12 +120,21 @@ async def _run() -> None:
             assert signed_url.endswith("?expires=300")
     finally:
         ingestion.set_tenant_scope = original_set_tenant_scope
-        await engine.dispose()
 
-    print(
-        "PASS: raw event stored once; duplicate skipped; replay reused durable payload; "
-        "one private recording key with a 300-second signed URL."
+
+try:
+    asyncio.run(_run())
+except BaseException:
+    # PGlite's socket adapter does not implement asyncpg's graceful close
+    # reliably, so use the same bounded subprocess teardown as the auth E2E.
+    traceback.print_exc()
+    os._exit(1)
+else:
+    os.write(
+        1,
+        (
+            b"PASS: raw event stored once; duplicate skipped; replay reused durable payload; "
+            b"one private recording key with a 300-second signed URL.\n"
+        ),
     )
-
-
-asyncio.run(_run())
+    os._exit(0)

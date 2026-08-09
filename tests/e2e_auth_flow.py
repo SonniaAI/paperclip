@@ -81,6 +81,63 @@ async def _insert_org_b_call() -> str:
         connection.terminate()
 
 
+async def _org_scope(login_slug: str) -> tuple[str, str]:
+    connection = await asyncpg.connect(
+        os.environ["MANAGER_DATABASE_URL"].replace(
+            "postgresql+asyncpg://manager_app:ignored",
+            "postgresql://postgres:postgres",
+        ),
+        ssl=False,
+        statement_cache_size=0,
+    )
+    try:
+        row = await connection.fetchrow(
+            """
+            SELECT organization.id AS org_id, department.id AS department_id
+            FROM organizations AS organization
+            JOIN departments AS department ON department.org_id = organization.id
+            WHERE organization.login_slug = $1 AND department.login_slug = 'default'
+            """,
+            login_slug,
+        )
+        assert row is not None
+        return str(row["org_id"]), str(row["department_id"])
+    finally:
+        connection.terminate()
+
+
+async def _ingestion_counts(
+    org_id: str, event_id: str, external_call_key: str
+) -> tuple[int, int, str]:
+    connection = await asyncpg.connect(
+        os.environ["MANAGER_DATABASE_URL"].replace(
+            "postgresql+asyncpg://manager_app:ignored",
+            "postgresql://postgres:postgres",
+        ),
+        ssl=False,
+        statement_cache_size=0,
+    )
+    try:
+        row = await connection.fetchrow(
+            """
+            SELECT
+                (SELECT count(*)::int FROM telnyx_webhook_events
+                 WHERE org_id = $1 AND event_id = $2) AS event_count,
+                (SELECT count(*)::int FROM calls
+                 WHERE org_id = $1 AND external_call_key = $3) AS call_count,
+                (SELECT status FROM telnyx_webhook_events
+                 WHERE org_id = $1 AND event_id = $2) AS event_status
+            """,
+            org_id,
+            event_id,
+            external_call_key,
+        )
+        assert row is not None
+        return row["event_count"], row["call_count"], row["event_status"]
+    finally:
+        connection.terminate()
+
+
 def _run() -> None:
     with TestClient(main.app, base_url="https://testserver") as client:
         registration = client.post(
@@ -149,6 +206,58 @@ def _run() -> None:
         )
         assert second_registration.status_code == 201, second_registration.text
 
+        org_a_id, department_a_id = asyncio.run(_org_scope("org-a"))
+        event_id = "evt-e2e-idempotent-1"
+        external_call_key = "v3:e2e-control"
+        telnyx_payload = {
+            "data": {
+                "id": event_id,
+                "event_type": "call.hangup",
+                "payload": {
+                    "call_control_id": "v3:e2e-control",
+                    "call_session_id": "e2e-session",
+                    "direction": "incoming",
+                    "from_phone_number": "+6512345678",
+                    "to_phone_number": "+6587654321",
+                    "start_time": "2026-08-09T19:00:00Z",
+                    "end_time": "2026-08-09T19:05:00Z",
+                },
+            }
+        }
+        first_ingest = client.post(
+            "/webhooks/telnyx",
+            headers={
+                "X-Manager-Org-Id": org_a_id,
+                "X-Manager-Department-Id": department_a_id,
+            },
+            json=telnyx_payload,
+        )
+        assert first_ingest.status_code == 202, first_ingest.text
+        assert first_ingest.json() == {
+            "accepted": True,
+            "duplicate": False,
+            "status": "processed",
+        }
+
+        replay_ingest = client.post(
+            "/webhooks/telnyx",
+            headers={
+                "X-Manager-Org-Id": org_a_id,
+                "X-Manager-Department-Id": department_a_id,
+            },
+            json=telnyx_payload,
+        )
+        assert replay_ingest.status_code == 200, replay_ingest.text
+        assert replay_ingest.json() == {
+            "accepted": True,
+            "duplicate": True,
+            "status": "duplicate",
+        }
+        event_count, call_count, event_status = asyncio.run(
+            _ingestion_counts(org_a_id, event_id, external_call_key)
+        )
+        assert (event_count, call_count, event_status) == (1, 1, "processed")
+
         foreign_call_id = asyncio.run(_insert_org_b_call())
         client.cookies.clear()
         client.cookies.set("manager_session", owner_a_cookie)
@@ -167,7 +276,7 @@ else:
         1,
         (
             b"E2E PASS: registration, secure session, TOTP, signed invite, login, "
-            b"and Org A -> Org B 404\n"
+            b"Org A -> Org B 404, and idempotent Telnyx replay (1 event, 1 call)\n"
         ),
     )
     os._exit(0)

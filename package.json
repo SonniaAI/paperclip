@@ -5,6 +5,7 @@
   "scripts": {
     "test:rls": "node tests/rls_isolation.mjs",
     "test:feature-data": "node tests/feature_data.mjs",
+    "test:telnyx-ingestion": "node tests/telnyx_ingestion.mjs",
     "test:e2e": "node tests/e2e_auth_flow.mjs",
     "test:demo-seed": "node tests/demo_seed.mjs"
   },
