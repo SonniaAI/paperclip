@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "name": "manager-sonnia-api-rls-evidence",
+  "type": "module",
+  "scripts": {
+    "test:rls": "node tests/rls_isolation.mjs",
+    "test:feature-data": "node tests/feature_data.mjs",
+    "test:e2e": "node tests/e2e_auth_flow.mjs",
+    "test:demo-seed": "node tests/demo_seed.mjs"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.4",
+    "@electric-sql/pglite-socket": "^0.2.7"
+  }
+}
