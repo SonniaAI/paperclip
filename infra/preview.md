@@ -38,5 +38,6 @@ MANAGER_RECORDING_SIGNED_URL_TTL_SECONDS=300
 
 GitHub Actions runs Ruff, Python tests, a wheel/sdist build, the real PGLite
 RLS proof, the FastAPI/PGLite auth-flow proof, and a Docker build. Phase 1
-must render the deliberately non-functional copy `Add credit → contact us`;
-no payment-provider integration is configured.
+uses authenticated `GET /api/billing/top-up` for the deliberately
+non-functional `Add credit → contact us` affordance; no payment-provider
+integration is configured.

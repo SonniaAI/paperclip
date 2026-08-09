@@ -79,3 +79,9 @@ class InviteResponse(BaseModel):
 class CallResponse(BaseModel):
     subject: str
     created_at: datetime
+
+
+class BillingTopUpPlaceholderResponse(BaseModel):
+    label: str = "Add credit"
+    action: str = "contact_us"
+    enabled: bool = False

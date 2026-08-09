@@ -31,6 +31,7 @@ from app.models import (
 )
 from app.schemas import (
     AuthResponse,
+    BillingTopUpPlaceholderResponse,
     CallResponse,
     InviteAcceptRequest,
     InviteCreateRequest,
@@ -500,3 +501,11 @@ async def get_recording_url(recording_id: UUID, context: CurrentContext) -> dict
         "url": signed_url,
         "expires_in_seconds": settings.recording_signed_url_ttl_seconds,
     }
+
+
+@app.get("/api/billing/top-up", response_model=BillingTopUpPlaceholderResponse)
+async def billing_top_up_placeholder(context: CurrentContext) -> BillingTopUpPlaceholderResponse:
+    """Expose Phase 1's contact-us affordance without making a payment attempt."""
+
+    del context
+    return BillingTopUpPlaceholderResponse()
