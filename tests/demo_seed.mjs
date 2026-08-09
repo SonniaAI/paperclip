@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PGlite } from '@electric-sql/pglite'
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket'
@@ -18,9 +18,12 @@ const ids = {
 
 function runCycle(environment) {
   return new Promise((resolve, reject) => {
+    const pythonPath = process.env.PYTHONPATH
+      ? `${root}${delimiter}${process.env.PYTHONPATH}`
+      : root
     const child = spawn(process.env.PYTHON ?? 'python3', ['tests/demo_seed_cycle.py'], {
       cwd: root,
-      env: { ...process.env, ...environment },
+      env: { ...process.env, PYTHONPATH: pythonPath, ...environment },
       stdio: 'inherit',
     })
     child.on('error', reject)
