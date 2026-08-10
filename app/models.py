@@ -311,6 +311,29 @@ class Recording(Base, TenantScoped):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class Transcript(Base, TenantScoped):
+    """Canonical call transcript; Hindsight only receives a redacted copy."""
+
+    __tablename__ = "transcripts"
+    __table_args__ = (UniqueConstraint("org_id", "call_id", name="transcripts_org_id_call_id_key"),)
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    call_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("calls.id"))
+    provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    language_code: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class TelnyxWebhookEvent(Base, TenantScoped):
     __tablename__ = "telnyx_webhook_events"
     __table_args__ = (
@@ -397,6 +420,109 @@ class ContactEmail(Base, TenantScoped):
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ContactMemoryBatch(Base, TenantScoped):
+    """One idempotent source write and its stable Hindsight document identity."""
+
+    __tablename__ = "contact_memory_batches"
+    __table_args__ = (
+        UniqueConstraint("org_id", "id", name="contact_memory_batches_org_id_id_key"),
+        UniqueConstraint(
+            "org_id",
+            "contact_id",
+            "idempotency_key",
+            name="contact_memory_batches_idempotency_key",
+        ),
+        UniqueConstraint(
+            "org_id",
+            "hindsight_document_id",
+            name="contact_memory_batches_document_key",
+        ),
+        CheckConstraint(
+            "source_kind IN ('manual', 'call_transcript')",
+            name="contact_memory_batches_source_kind_check",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    contact_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("contacts.id"))
+    call_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("calls.id"), nullable=True
+    )
+    transcript_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("transcripts.id"), nullable=True
+    )
+    source_kind: Mapped[str] = mapped_column(String(20), default="manual")
+    idempotency_key: Mapped[str] = mapped_column(String(200))
+    hindsight_document_id: Mapped[str] = mapped_column(String(200))
+    created_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ContactMemoryEntry(Base, TenantScoped):
+    """A deterministic fact or preference used before any fuzzy fallback."""
+
+    __tablename__ = "contact_memory_entries"
+    __table_args__ = (
+        UniqueConstraint("org_id", "id", name="contact_memory_entries_org_id_id_key"),
+        CheckConstraint(
+            "kind IN ('fact', 'preference')", name="contact_memory_entries_kind_check"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    batch_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("contact_memory_batches.id")
+    )
+    contact_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("contacts.id"))
+    kind: Mapped[str] = mapped_column(String(20))
+    value: Mapped[str] = mapped_column(Text)
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class HindsightSyncJob(Base, TenantScoped):
+    """Durable post-commit Hindsight outbox row for a contact-memory batch."""
+
+    __tablename__ = "hindsight_sync_jobs"
+    __table_args__ = (
+        UniqueConstraint("org_id", "batch_id", name="hindsight_sync_jobs_batch_key"),
+        CheckConstraint(
+            "status IN ('pending', 'failed', 'delivered')",
+            name="hindsight_sync_jobs_status_check",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    batch_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("contact_memory_batches.id")
+    )
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    attempts: Mapped[int] = mapped_column(default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 

@@ -16,7 +16,13 @@ from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.contact_memory import (
+    ContactMemoryNotFoundError,
+    ContactMemoryRecallHit,
+    recall_contact_memory,
+)
 from app.database import TenantScope, get_session, set_tenant_scope
+from app.hindsight import configured_hindsight_client
 from app.ingestion import TelnyxPayloadError, ingest_telnyx_event
 from app.materials import (
     MAX_MATERIAL_BYTES,
@@ -87,6 +93,9 @@ from app.schemas import (
     TotpEnrollmentResponse,
     TotpVerifyRequest,
     UserSessionResponse,
+    VoiceMemoryRecallHitResponse,
+    VoiceMemoryRecallRequest,
+    VoiceMemoryRecallResponse,
 )
 from app.security import (
     decode_invite_token,
@@ -108,6 +117,7 @@ from app.son419 import (
     preview_import,
 )
 from app.storage import configured_private_object_storage
+from app.transcript_memory import dispatch_transcript_memory
 
 settings = get_settings()
 app = FastAPI(title="manager.sonnia.ai", version="0.1.0")
@@ -270,6 +280,19 @@ async def telnyx_webhook(request: Request, db: DatabaseSession) -> JSONResponse:
         )
     except TelnyxPayloadError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if result.status in {"processed", "duplicate"}:
+        await dispatch_transcript_memory(
+            db,
+            scope=scope,
+            event_id=result.event_id,
+            payload=payload,
+            call_id=result.call_id,
+            hindsight=configured_hindsight_client(
+                base_url=settings.hindsight_base_url,
+                api_key=settings.hindsight_api_key,
+                timeout_seconds=settings.hindsight_timeout_seconds,
+            ),
+        )
     return JSONResponse(
         status_code=status.HTTP_200_OK if result.duplicate else status.HTTP_202_ACCEPTED,
         content={"accepted": True, "duplicate": result.duplicate, "status": result.status},
@@ -526,6 +549,63 @@ async def get_call(
     if call is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found")
     return CallResponse(subject=call.subject, created_at=call.created_at)
+
+
+@app.post(
+    "/api/voice/contacts/{contact_id}/memory-recall",
+    response_model=VoiceMemoryRecallResponse,
+)
+async def voice_contact_memory_recall(
+    contact_id: UUID,
+    payload: VoiceMemoryRecallRequest,
+    context: CurrentContext,
+) -> VoiceMemoryRecallResponse:
+    """Ground a voice turn in deterministic memory before any fuzzy fallback."""
+
+    try:
+        recall = await recall_contact_memory(
+            context.session,
+            scope=context.scope,
+            contact_id=contact_id,
+            query=payload.query,
+            limit=payload.limit,
+            hindsight=configured_hindsight_client(
+                base_url=settings.hindsight_base_url,
+                api_key=settings.hindsight_api_key,
+                timeout_seconds=settings.hindsight_timeout_seconds,
+            ),
+        )
+    except ContactMemoryNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Contact not found",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    return VoiceMemoryRecallResponse(
+        deterministic=[_voice_memory_hit(hit) for hit in recall.deterministic],
+        fuzzy=[_voice_memory_hit(hit) for hit in recall.fuzzy],
+        used_hindsight=recall.used_hindsight,
+        hindsight_status=recall.hindsight_status,
+    )
+
+
+def _voice_memory_hit(hit: ContactMemoryRecallHit) -> VoiceMemoryRecallHitResponse:
+    """Make the public voice response explicit instead of leaking provider objects."""
+
+    return VoiceMemoryRecallHitResponse(
+        text=hit.text,
+        source=hit.source,
+        label=hit.label,
+        kind=hit.kind,
+        entry_id=hit.entry_id,
+        memory_id=hit.memory_id,
+        document_id=hit.document_id,
+        confidence=hit.confidence,
+    )
 
 
 @app.get("/api/recordings/{recording_id}/url")

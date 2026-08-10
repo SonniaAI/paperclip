@@ -38,6 +38,13 @@ then layers the §15 product model and Telnyx ingestion on top of it.
   maximum 15-minute lifetime.
 - `app.crm.CRMAdapter` keeps the canonical model independent of any connector;
   no provider-specific CRM is installed.
+- Contact facts and preferences are written to tenant-scoped PostgreSQL rows
+  first.  A durable outbox then sends a redacted, idempotent transcript/fact
+  copy to the optional Hindsight service.  Processed and duplicate Telnyx
+  transcript events invoke that post-commit dispatch path, using explicit SDK
+  replacement mode on retries.  The authenticated voice-memory route uses
+  deterministic rows first and receives explicitly labeled Hindsight results
+  only as a fuzzy fallback; fuzzy results never overwrite the contact book.
 - `POST /api/materials/extract` accepts an authenticated pitch material upload
   and returns a ranked, source-linked cold-call brief through the deterministic
   offline fallback. See [`docs/materials-strategy.md`](docs/materials-strategy.md)
@@ -61,7 +68,8 @@ npm run test:feature-data
 # Run the async SQLAlchemy/PGlite replay proof, including private recordings:
 npm run test:telnyx-ingestion
 
-# Run the FastAPI + async SQLAlchemy auth flow against PostgreSQL wire protocol:
+# Run the FastAPI + async SQLAlchemy auth, Telnyx transcript-memory, and
+# deterministic-first voice recall flow against PostgreSQL wire protocol:
 npm run test:e2e
 ```
 
@@ -72,7 +80,9 @@ that absence into a 404 without querying by organization in application code.
 
 `npm run test:e2e` starts an ephemeral PostgreSQL-WASM wire server and verifies
 registration, the `Secure`/`HttpOnly` session cookie, TOTP enrollment,
-tokenized invite acceptance, login, and Org A receiving a 404 for Org B's call.
+tokenized invite acceptance, login, a real Telnyx transcript-memory write,
+idempotent duplicate handling, deterministic-first voice recall with a labeled
+Hindsight fallback, and Org A receiving a 404 for Org B's call.
 
 `npm run test:feature-data` applies Gate 0 plus the feature migration to
 PostgreSQL-WASM and verifies all 30 new tables carry both tenant keys, forced
@@ -105,10 +115,16 @@ in the runtime role, and no access to user, call, invite, or session tables.
   index), personal-or-team task lists, tenant-scoped forced-RLS contact
   imports, a privacy flag on activity entries, and organisation onboarding
   state.
+- `alembic/versions/20260810_hindsight_memory.sql` — tenant-scoped
+  deterministic contact-memory batches/entries and retryable Hindsight outbox.
 - `app/` — FastAPI, async SQLAlchemy, ingestion, private storage, CRM seam,
   sessions, TOTP, invites, and the SON-419 service layer (`app/son419.py`)
   and routes (`/api/instructions`, `/api/tasks`, `/api/task-lists`,
   `/api/activity`, `/api/settings/*`, `/api/contacts/import*`, `/api/onboarding`).
+- `app/contact_memory.py` — deterministic-first contact-memory write, outbox
+  dispatch, redaction, and voice-agent recall seam; `app/transcript_memory.py`
+  is the post-commit Telnyx transcript dispatcher; `app/hindsight.py` wraps the
+  optional maintained Hindsight SDK.
 - `tests/rls_isolation.mjs`, `tests/feature_data.mjs`,
   `tests/telnyx_ingestion.mjs` — database-level and wire proofs.
 - `tests/son419_migration.mjs` — full-chain migration proof for the SON-419

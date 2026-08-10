@@ -18,6 +18,10 @@ const son419Schema = await readFile(
   join(here, '..', 'alembic', 'versions', '20260809_son419.sql'),
   'utf8',
 )
+const hindsightSchema = await readFile(
+  join(here, '..', 'alembic', 'versions', '20260810_hindsight_memory.sql'),
+  'utf8',
+)
 
 const db = new PGlite()
 const server = new PGLiteSocketServer({ db, host: '127.0.0.1', port: 0, maxConnections: 10 })
@@ -49,6 +53,7 @@ try {
   await db.exec(schema)
   await db.exec(featureSchema)
   await db.exec(son419Schema)
+  await db.exec(hindsightSchema)
   await db.exec(`
     CREATE ROLE manager_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
     CREATE ROLE manager_auth_resolver NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS;

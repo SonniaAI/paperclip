@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     storage_endpoint_url: str | None = None
     storage_max_copy_bytes: int = 268_435_456
     recording_signed_url_ttl_seconds: int = 300
+    hindsight_base_url: str | None = None
+    hindsight_api_key: str | None = None
+    hindsight_timeout_seconds: float = 10.0
 
     @model_validator(mode="after")
     def require_real_production_secret(self) -> Settings:
@@ -40,6 +43,8 @@ class Settings(BaseSettings):
             raise ValueError("recording signed URLs must expire within 15 minutes")
         if self.storage_max_copy_bytes < 1:
             raise ValueError("MANAGER_STORAGE_MAX_COPY_BYTES must be positive")
+        if not 0 < self.hindsight_timeout_seconds <= 15:
+            raise ValueError("MANAGER_HINDSIGHT_TIMEOUT_SECONDS must be between 0 and 15")
         return self
 
 
