@@ -1,0 +1,139 @@
+{
+  "processing": {
+    "state": "completed",
+    "mode": "offline-fallback",
+    "message": "Processed locally with deterministic extraction; no external model or connector was used.",
+    "claims_are_verbatim": true,
+    "notes": []
+  },
+  "material": {
+    "filename": "sample-solar-pitch.pptx",
+    "content_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "extension": ".pptx"
+  },
+  "selling_points": [
+    {
+      "rank": 1,
+      "claim": "Customers recover 12 hours per week.",
+      "source": {
+        "document": "sample-solar-pitch.pptx",
+        "kind": "slide",
+        "locator": "slide 3",
+        "link": "source://sample-solar-pitch.pptx#slide%203",
+        "excerpt": "Customers recover 12 hours per week."
+      },
+      "inference": false
+    },
+    {
+      "rank": 2,
+      "claim": "Solar teams reduce quote time by 30%.",
+      "source": {
+        "document": "sample-solar-pitch.pptx",
+        "kind": "slide",
+        "locator": "slide 3",
+        "link": "source://sample-solar-pitch.pptx#slide%203",
+        "excerpt": "Solar teams reduce quote time by 30%."
+      },
+      "inference": false
+    }
+  ],
+  "proof_points": [
+    {
+      "claim": "Customers recover 12 hours per week.",
+      "source": {
+        "document": "sample-solar-pitch.pptx",
+        "kind": "slide",
+        "locator": "slide 3",
+        "link": "source://sample-solar-pitch.pptx#slide%203",
+        "excerpt": "Customers recover 12 hours per week."
+      },
+      "inference": false
+    }
+  ],
+  "objection_material": [
+    {
+      "claim": "Security and integration questions are answered in the implementation guide.",
+      "source": {
+        "document": "sample-solar-pitch.pptx",
+        "kind": "slide",
+        "locator": "slide 4",
+        "link": "source://sample-solar-pitch.pptx#slide%204",
+        "excerpt": "Security and integration questions are answered in the implementation guide."
+      },
+      "inference": false
+    }
+  ],
+  "risky_claims": [],
+  "slides_useless_on_phone": [
+    {
+      "slide": "slide 1",
+      "reason": "Navigation only; it gives no source-backed customer outcome for a cold call.",
+      "source": {
+        "document": "sample-solar-pitch.pptx",
+        "kind": "slide",
+        "locator": "slide 1",
+        "link": "source://sample-solar-pitch.pptx#slide%201",
+        "excerpt": "Agenda"
+      },
+      "inference": true
+    }
+  ],
+  "missing": [
+    {
+      "item": "call-to-action",
+      "reason": "The material does not state what the prospect should do next.",
+      "inference": true,
+      "evidence_sources": []
+    }
+  ],
+  "suggested_brief": {
+    "inference": true,
+    "note": "This brief is assembled from verbatim source claims; confirm the ask and approval flags before calling.",
+    "twenty_second_call": {
+      "opener": "Customers recover 12 hours per week.",
+      "proof": "Customers recover 12 hours per week.",
+      "objection": "Security and integration questions are answered in the implementation guide.",
+      "ask": "The material does not state a call-to-action; confirm the ask before use."
+    },
+    "source_for": {
+      "opener": {
+        "document": "sample-solar-pitch.pptx",
+        "kind": "slide",
+        "locator": "slide 3",
+        "link": "source://sample-solar-pitch.pptx#slide%203",
+        "excerpt": "Customers recover 12 hours per week."
+      },
+      "proof": {
+        "document": "sample-solar-pitch.pptx",
+        "kind": "slide",
+        "locator": "slide 3",
+        "link": "source://sample-solar-pitch.pptx#slide%203",
+        "excerpt": "Customers recover 12 hours per week."
+      },
+      "objection": {
+        "document": "sample-solar-pitch.pptx",
+        "kind": "slide",
+        "locator": "slide 4",
+        "link": "source://sample-solar-pitch.pptx#slide%204",
+        "excerpt": "Security and integration questions are answered in the implementation guide."
+      },
+      "ask": null
+    },
+    "source_links": [
+      {
+        "document": "sample-solar-pitch.pptx",
+        "kind": "slide",
+        "locator": "slide 3",
+        "link": "source://sample-solar-pitch.pptx#slide%203",
+        "excerpt": "Customers recover 12 hours per week."
+      },
+      {
+        "document": "sample-solar-pitch.pptx",
+        "kind": "slide",
+        "locator": "slide 4",
+        "link": "source://sample-solar-pitch.pptx#slide%204",
+        "excerpt": "Security and integration questions are answered in the implementation guide."
+      }
+    ]
+  }
+}

@@ -38,6 +38,10 @@ then layers the §15 product model and Telnyx ingestion on top of it.
   maximum 15-minute lifetime.
 - `app.crm.CRMAdapter` keeps the canonical model independent of any connector;
   no provider-specific CRM is installed.
+- `POST /api/materials/extract` accepts an authenticated pitch material upload
+  and returns a ranked, source-linked cold-call brief through the deterministic
+  offline fallback. See [`docs/materials-strategy.md`](docs/materials-strategy.md)
+  and [`evidence/materials-strategy-sample.json`](evidence/materials-strategy-sample.json).
 
 ## Required verification
 

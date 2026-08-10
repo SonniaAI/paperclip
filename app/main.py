@@ -17,6 +17,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database import TenantScope, get_session, set_tenant_scope
 from app.ingestion import TelnyxPayloadError, ingest_telnyx_event
+from app.materials import (
+    MAX_MATERIAL_BYTES,
+    MaterialUploadError,
+    UnsupportedMaterialError,
+    extract_material,
+    parse_upload_body,
+)
 from app.models import (
     AppUser,
     Call,
@@ -501,6 +508,42 @@ async def get_recording_url(recording_id: UUID, context: CurrentContext) -> dict
         "url": signed_url,
         "expires_in_seconds": settings.recording_signed_url_ttl_seconds,
     }
+
+
+@app.post("/api/materials/extract")
+async def extract_uploaded_material(
+    request: Request,
+    context: CurrentContext,
+) -> dict[str, object]:
+    """Extract one pitch material into a source-linked cold-call brief.
+
+    The Phase 1 route is intentionally synchronous and deterministic.  It is
+    an offline fallback: the upload is read in memory, parsed locally, and
+    returned with an honest processing state.  No material claim is generated
+    without a document locator.  Persistence can be added once campaign UI
+    chooses a campaign; the single-campaign demo does not need that coupling.
+    """
+
+    del context  # Authentication and RLS scope are enforced by the dependency.
+    body = await request.body()
+    if len(body) > MAX_MATERIAL_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="material is larger than the 25 MB Phase 1 limit",
+        )
+    try:
+        upload = parse_upload_body(
+            body,
+            request.headers.get("content-type"),
+            request.headers.get("x-material-filename") or request.headers.get("x-filename"),
+        )
+        return extract_material(upload)
+    except UnsupportedMaterialError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=str(exc)
+        ) from exc
+    except MaterialUploadError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @app.get("/api/billing/top-up", response_model=BillingTopUpPlaceholderResponse)
