@@ -100,8 +100,17 @@ in the runtime role, and no access to user, call, invite, or session tables.
   statements.
 - `alembic/versions/20260809_feature_data.sql` — §15 schema, inbox, indexes,
   and forced RLS policies.
+- `alembic/versions/20260809_son419.sql` — SON-419 layer: versioned
+  instructions (slug/version/effective_from/superseded_at + partial unique
+  index), personal-or-team task lists, tenant-scoped forced-RLS contact
+  imports, a privacy flag on activity entries, and organisation onboarding
+  state.
 - `app/` — FastAPI, async SQLAlchemy, ingestion, private storage, CRM seam,
-  sessions, TOTP, and invites.
+  sessions, TOTP, invites, and the SON-419 service layer (`app/son419.py`)
+  and routes (`/api/instructions`, `/api/tasks`, `/api/task-lists`,
+  `/api/activity`, `/api/settings/*`, `/api/contacts/import*`, `/api/onboarding`).
 - `tests/rls_isolation.mjs`, `tests/feature_data.mjs`,
   `tests/telnyx_ingestion.mjs` — database-level and wire proofs.
+- `tests/son419_migration.mjs` — full-chain migration proof for the SON-419
+  layer (versioning cycle, forced-RLS imports, privacy flag, onboarding state).
 - `tests/` — security and route-isolation contracts.

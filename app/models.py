@@ -77,7 +77,61 @@ class Organization(Base, TenantScoped):
         DUPLICATE_CALL_PROTECTION_ENUM,
         default=DuplicateCallProtection.WARN,
     )
+    onboarding_state: Mapped[str] = mapped_column(
+        String(20), default="pending", server_default="pending"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Company(Base, TenantScoped):
+    """Company entity from the §15 feature model."""
+
+    __tablename__ = "companies"
+    __table_args__ = (UniqueConstraint("org_id", "id", name="companies_org_id_id_key"),)
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    name: Mapped[str] = mapped_column(Text)
+    legal_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    domain: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class Integration(Base, TenantScoped):
+    """§4.5 integrations row (provider/kind, config, status)."""
+
+    __tablename__ = "integrations"
+    __table_args__ = (
+        UniqueConstraint("org_id", "department_id", "provider", "kind"),
+        CheckConstraint(
+            "status IN ('active', 'paused', 'error', 'revoked')",
+            name="integrations_status_check",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    provider: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text)
+    external_account_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    credentials_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    config: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Department(Base, TenantScoped):
@@ -282,3 +336,281 @@ class TelnyxWebhookEvent(Base, TenantScoped):
     )
     parsed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Contact(Base, TenantScoped):
+    """§11 CRM contact, tenant-scoped and RLS-forced by the feature migration."""
+
+    __tablename__ = "contacts"
+    __table_args__ = (UniqueConstraint("org_id", "id", name="contacts_org_id_id_key"),)
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    company_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("companies.id"), nullable=True
+    )
+    display_name: Mapped[str] = mapped_column(Text)
+    first_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    job_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    do_not_contact: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ContactPhone(Base, TenantScoped):
+    __tablename__ = "contact_phones"
+    __table_args__ = (UniqueConstraint("org_id", "contact_id", "phone_e164"),)
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    contact_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("contacts.id"))
+    phone_e164: Mapped[str] = mapped_column(Text)
+    label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ContactEmail(Base, TenantScoped):
+    __tablename__ = "contact_emails"
+    __table_args__ = (UniqueConstraint("org_id", "contact_id", "email"),)
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    contact_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("contacts.id"))
+    email: Mapped[str] = mapped_column(Text)
+    label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Note(Base, TenantScoped):
+    __tablename__ = "notes"
+    __table_args__ = (
+        CheckConstraint(
+            "visibility IN ('private', 'shared')", name="notes_visibility_check"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    contact_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("contacts.id"), nullable=True
+    )
+    call_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("calls.id"), nullable=True
+    )
+    author_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
+    )
+    body: Mapped[str] = mapped_column(Text)
+    visibility: Mapped[str] = mapped_column(String(10), default="shared")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class TaskList(Base, TenantScoped):
+    """§4.4 personal (private) or team (shared) task list.
+
+    The SON-419 migration makes these lists personal-or-team; the owner is
+    the user a private list belongs to, and shared lists are company team
+    lists.
+    """
+
+    __tablename__ = "task_lists"
+    __table_args__ = (
+        UniqueConstraint("org_id", "department_id", "name"),
+        CheckConstraint(
+            "visibility IN ('private', 'shared')", name="task_lists_visibility_check"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    name: Mapped[str] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    owner_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
+    )
+    visibility: Mapped[str] = mapped_column(String(10), default="private")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class Task(Base, TenantScoped):
+    """§4.4 task with private/assigned/shared visibility and markdown body."""
+
+    __tablename__ = "tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('open', 'in_progress', 'done', 'cancelled')", name="tasks_status_check"
+        ),
+        CheckConstraint(
+            "visibility IN ('private', 'shared')", name="tasks_visibility_check"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    task_list_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("task_lists.id"), nullable=True
+    )
+    contact_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("contacts.id"), nullable=True
+    )
+    call_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("calls.id"), nullable=True
+    )
+    owner_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
+    )
+    created_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
+    )
+    title: Mapped[str] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="open")
+    visibility: Mapped[str] = mapped_column(String(10), default="shared")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class Instruction(Base, TenantScoped):
+    """§12 editable instructions with version history + in-effect-since.
+
+    The SON-419 migration adds ``slug``/``version``/``effective_from``/
+    ``superseded_at`` and a partial unique index guaranteeing at most one
+    active (non-superseded) version per topic within a tenant.
+    """
+
+    __tablename__ = "instructions"
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    title: Mapped[str] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(Text)
+    applies_to: Mapped[str] = mapped_column(Text, default="all")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    slug: Mapped[str] = mapped_column(Text, default="")
+    version: Mapped[int] = mapped_column(default=1)
+    effective_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ActivityLogEntry(Base, TenantScoped):
+    """§12 one chronological feed, privacy-respecting.
+
+    Private entries (e.g. a private note/task event) are written with a
+    ``private`` flag; the feed query hides them from anyone other than the
+    actor.
+    """
+
+    __tablename__ = "activity_log"
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    actor_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
+    )
+    action: Mapped[str] = mapped_column(Text)
+    entity_type: Mapped[str] = mapped_column(Text)
+    entity_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    private: Mapped[bool] = mapped_column(Boolean, default=False)
+    activity_metadata: Mapped[dict[str, object]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class SecurityEvent(Base, TenantScoped):
+    """§4.5 visible log of security events (login, TOTP, password, revoke)."""
+
+    __tablename__ = "security_events"
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    actor_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
+    )
+    event_type: Mapped[str] = mapped_column(Text)
+    ip_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_metadata: Mapped[dict[str, object]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ContactImport(Base, TenantScoped):
+    """§11 durable CSV import run with mapping/preview/dedupe/summary."""
+
+    __tablename__ = "contact_imports"
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    filename: Mapped[str] = mapped_column(Text)
+    column_count: Mapped[int] = mapped_column(nullable=False)
+    row_count: Mapped[int] = mapped_column(nullable=False)
+    created_count: Mapped[int] = mapped_column(default=0)
+    merged_count: Mapped[int] = mapped_column(default=0)
+    skipped_count: Mapped[int] = mapped_column(default=0)
+    created_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

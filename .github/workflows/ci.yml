@@ -30,7 +30,9 @@ jobs:
       - run: npm ci --include=dev
       - run: npm run test:rls
       - run: npm run test:feature-data
-      - run: PYTHON=python npm run test:e2e
+      - run: npm run test:son419-migration
+      - run: npm run test:e2e
+      - run: PYTHON=python npm run test:e2e-son419
       - run: PYTHON=python npm run test:telnyx-ingestion
       - run: PYTHON=python npm run test:demo-seed
       - run: docker build --tag manager-sonnia-api:ci .

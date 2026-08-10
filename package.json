@@ -5,8 +5,10 @@
   "scripts": {
     "test:rls": "node tests/rls_isolation.mjs",
     "test:feature-data": "node tests/feature_data.mjs",
+    "test:son419-migration": "node tests/son419_migration.mjs",
     "test:telnyx-ingestion": "node tests/telnyx_ingestion.mjs",
     "test:e2e": "node tests/e2e_auth_flow.mjs",
+    "test:e2e-son419": "node tests/e2e_son419_flow.mjs",
     "test:demo-seed": "node tests/demo_seed.mjs"
   },
   "devDependencies": {
