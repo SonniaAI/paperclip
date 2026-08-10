@@ -280,12 +280,12 @@ async def telnyx_webhook(request: Request, db: DatabaseSession) -> JSONResponse:
         )
     except TelnyxPayloadError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    if result.status in {"processed", "duplicate"}:
+    if result.status in {"processed", "duplicate"} and result.canonical_payload is not None:
         await dispatch_transcript_memory(
             db,
             scope=scope,
             event_id=result.event_id,
-            payload=payload,
+            payload=result.canonical_payload,
             call_id=result.call_id,
             hindsight=configured_hindsight_client(
                 base_url=settings.hindsight_base_url,

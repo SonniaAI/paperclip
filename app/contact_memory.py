@@ -37,6 +37,63 @@ HINDSIGHT_DOCUMENT_MAX_CHARS = 24_000
 _EMAIL = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _PHONE = re.compile(r"(?<!\w)(?:\+?\d[\d .()\-]{6,}\d)(?!\w)")
 _WORD = re.compile(r"[a-z0-9]+")
+_NON_RELEVANT_TERMS = frozenset(
+    {
+        "a",
+        "about",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "has",
+        "have",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "me",
+        "my",
+        "of",
+        "on",
+        "or",
+        "our",
+        "please",
+        "said",
+        "say",
+        "she",
+        "should",
+        "that",
+        "the",
+        "their",
+        "them",
+        "they",
+        "this",
+        "to",
+        "us",
+        "was",
+        "we",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+        "would",
+        "you",
+        "your",
+    }
+)
 
 
 class ContactMemoryNotFoundError(LookupError):
@@ -180,23 +237,34 @@ def deterministic_matches(
     *,
     limit: int,
 ) -> tuple[DeterministicMemoryEntry, ...]:
-    """Return deterministic matches without asking Hindsight to rank them."""
+    """Return rows sharing meaningful query terms without asking Hindsight."""
 
-    normalized_query = " ".join(query.lower().split())
+    normalized_query = " ".join(query.casefold().split())
     if not normalized_query:
         raise ValueError("A memory recall query is required")
-    query_words = set(_WORD.findall(normalized_query))
+    query_terms = _meaningful_terms(normalized_query)
+    if not query_terms:
+        return ()
     ranked: list[tuple[int, int, DeterministicMemoryEntry]] = []
     for position, entry in enumerate(entries):
-        text = entry.value.lower()
-        words = set(_WORD.findall(text))
-        overlap = len(query_words & words)
-        if normalized_query not in text and not overlap:
+        text = " ".join(entry.value.casefold().split())
+        overlap = len(query_terms & _meaningful_terms(text))
+        if not overlap:
             continue
-        score = 10_000 if normalized_query in text else overlap
+        score = 10_000 + overlap if normalized_query in text else overlap
         ranked.append((score, -position, entry))
     ranked.sort(reverse=True, key=lambda item: (item[0], item[1]))
     return tuple(item[2] for item in ranked[:limit])
+
+
+def _meaningful_terms(value: str) -> set[str]:
+    """Discard conversational filler before treating token overlap as relevance."""
+
+    return {
+        word
+        for word in _WORD.findall(value.casefold())
+        if len(word) > 1 and word not in _NON_RELEVANT_TERMS
+    }
 
 
 async def deterministic_first_recall(

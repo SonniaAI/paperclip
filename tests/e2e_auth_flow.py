@@ -15,7 +15,8 @@ import importlib
 import os
 import time
 import traceback
-from uuid import uuid4
+from copy import deepcopy
+from uuid import UUID, uuid4
 
 import asyncpg
 from fastapi.testclient import TestClient
@@ -113,6 +114,46 @@ async def _insert_org_b_call() -> str:
             row["department_id"],
             "org-b-test-call",
             "Org B private call",
+        )
+        return str(call_id)
+    finally:
+        connection.terminate()
+
+
+async def _insert_contact_linked_call(
+    *,
+    org_id: str,
+    department_id: str,
+    contact_id: str,
+    external_call_key: str,
+    from_phone: str,
+) -> str:
+    """Create the existing call a cross-tenant duplicate must never use."""
+
+    connection = await asyncpg.connect(
+        os.environ["MANAGER_DATABASE_URL"].replace(
+            "postgresql+asyncpg://manager_app:ignored",
+            "postgresql://postgres:postgres",
+        ),
+        ssl=False,
+        statement_cache_size=0,
+    )
+    try:
+        call_id = uuid4()
+        await connection.execute(
+            """
+            INSERT INTO calls (
+                id, org_id, department_id, contact_id, external_call_key,
+                subject, from_phone_e164
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            call_id,
+            UUID(org_id),
+            UUID(department_id),
+            UUID(contact_id),
+            external_call_key,
+            "Cross-tenant duplicate target",
+            from_phone,
         )
         return str(call_id)
     finally:
@@ -237,6 +278,32 @@ async def _contact_memory_counts(org_id: str, event_id: str) -> tuple[int, int, 
         connection.terminate()
 
 
+async def _transcript_text_for_event(org_id: str, event_id: str) -> str | None:
+    connection = await asyncpg.connect(
+        os.environ["MANAGER_DATABASE_URL"].replace(
+            "postgresql+asyncpg://manager_app:ignored",
+            "postgresql://postgres:postgres",
+        ),
+        ssl=False,
+        statement_cache_size=0,
+    )
+    try:
+        value = await connection.fetchval(
+            """
+            SELECT transcript.raw_text
+            FROM transcripts AS transcript
+            JOIN contact_memory_batches AS batch ON batch.transcript_id = transcript.id
+            WHERE batch.org_id = $1
+              AND batch.idempotency_key = $2
+            """,
+            org_id,
+            f"telnyx-transcript:{hashlib.sha256(event_id.encode('utf-8')).hexdigest()}",
+        )
+        return str(value) if value is not None else None
+    finally:
+        connection.terminate()
+
+
 def _run() -> None:
     with TestClient(main.app, base_url="https://testserver") as client:
         registration = client.post(
@@ -306,6 +373,34 @@ def _run() -> None:
         assert second_registration.status_code == 201, second_registration.text
 
         org_a_id, department_a_id = asyncio.run(_org_scope("org-a"))
+        org_b_id, department_b_id = asyncio.run(_org_scope("org-b"))
+        imported_b = client.post(
+            "/api/contacts/import",
+            json={
+                "filename": "cross-tenant-contact.csv",
+                "columns": ["Name", "Phone"],
+                "rows": [
+                    {
+                        "index": 0,
+                        "values": {"Name": "Bryn Customer", "Phone": "+6512345679"},
+                    }
+                ],
+                "mapping": {"display_name": "Name", "phone": "Phone"},
+            },
+        )
+        assert imported_b.status_code == 201, imported_b.text
+        other_tenant_contact_id = asyncio.run(_contact_id_by_phone(org_b_id, "+6512345679"))
+        other_tenant_call_key = "v3:cross-tenant-duplicate"
+        asyncio.run(
+            _insert_contact_linked_call(
+                org_id=org_b_id,
+                department_id=department_b_id,
+                contact_id=other_tenant_contact_id,
+                external_call_key=other_tenant_call_key,
+                from_phone="+6512345679",
+            )
+        )
+
         client.cookies.clear()
         client.cookies.set("manager_session", owner_a_cookie)
         imported = client.post(
@@ -341,7 +436,7 @@ def _run() -> None:
                     "contact_memory": {
                         "transcript": "Ava mentioned a Tuesday tennis league after work.",
                         "facts": ["Plays in a Tuesday tennis league."],
-                        "preferences": ["Prefers email for status updates."],
+                        "preferences": ["They prefer email."],
                     },
                 },
             }
@@ -384,7 +479,60 @@ def _run() -> None:
         retained_content = str(hindsight.retain_calls[0]["content"])
         assert "Ava mentioned a Tuesday tennis league" in retained_content
         assert "Plays in a Tuesday tennis league." in retained_content
-        assert "Prefers email for status updates." in retained_content
+        assert "They prefer email." in retained_content
+
+        altered_replay = deepcopy(telnyx_payload)
+        altered_transcript = "Untrusted replay says they prefer SMS instead."
+        altered_replay["data"]["payload"]["contact_memory"] = {
+            "transcript": altered_transcript,
+            "facts": ["Untrusted renewal fact."],
+            "preferences": ["They prefer SMS."],
+        }
+        altered_ingest = client.post(
+            "/webhooks/telnyx",
+            headers={
+                "X-Manager-Org-Id": org_a_id,
+                "X-Manager-Department-Id": department_a_id,
+            },
+            json=altered_replay,
+        )
+        assert altered_ingest.status_code == 200, altered_ingest.text
+        assert altered_ingest.json() == {
+            "accepted": True,
+            "duplicate": True,
+            "status": "duplicate",
+        }
+        assert asyncio.run(_transcript_text_for_event(org_a_id, event_id)) == (
+            "Ava mentioned a Tuesday tennis league after work."
+        )
+        assert asyncio.run(_contact_memory_counts(org_a_id, event_id)) == (1, 1, 2, "delivered")
+        assert len(hindsight.retain_calls) == 1
+        assert altered_transcript not in retained_content
+
+        cross_tenant_replay = deepcopy(telnyx_payload)
+        cross_tenant_replay["data"]["payload"].update(
+            {
+                "call_control_id": other_tenant_call_key,
+                "call_session_id": "cross-tenant-session",
+                "from_phone_number": "+6512345679",
+                "contact_memory": {
+                    "transcript": "This was never admitted to Org B's durable inbox.",
+                    "facts": ["Untrusted Org B fact."],
+                    "preferences": ["They prefer untrusted SMS."],
+                },
+            }
+        )
+        cross_tenant_ingest = client.post(
+            "/webhooks/telnyx",
+            headers={
+                "X-Manager-Org-Id": org_b_id,
+                "X-Manager-Department-Id": department_b_id,
+            },
+            json=cross_tenant_replay,
+        )
+        assert cross_tenant_ingest.status_code == 400, cross_tenant_ingest.text
+        assert asyncio.run(_contact_memory_counts(org_b_id, event_id)) == (0, 0, 0, None)
+        assert len(hindsight.retain_calls) == 1
 
         deterministic_memory = client.post(
             f"/api/voice/contacts/{contact_id}/memory-recall",
@@ -396,6 +544,17 @@ def _run() -> None:
         assert deterministic_memory.json()["deterministic"][0]["source"] == "sonnia_crm"
         assert hindsight.recall_calls == []
 
+        unrelated_memory = client.post(
+            f"/api/voice/contacts/{contact_id}/memory-recall",
+            json={"query": "What did they say about renewal?", "limit": 5},
+        )
+        assert unrelated_memory.status_code == 200, unrelated_memory.text
+        assert unrelated_memory.json()["deterministic"] == []
+        assert unrelated_memory.json()["used_hindsight"] is True
+        assert unrelated_memory.json()["hindsight_status"] == "returned"
+        assert unrelated_memory.json()["fuzzy"][0]["source"] == "hindsight"
+        assert len(hindsight.recall_calls) == 1
+
         fuzzy_memory = client.post(
             f"/api/voice/contacts/{contact_id}/memory-recall",
             json={"query": "What did they mention casually?", "limit": 5},
@@ -405,7 +564,7 @@ def _run() -> None:
         assert fuzzy_memory.json()["hindsight_status"] == "returned"
         assert fuzzy_memory.json()["fuzzy"][0]["source"] == "hindsight"
         assert fuzzy_memory.json()["fuzzy"][0]["label"] == "AI-assisted recall; verify before use."
-        assert len(hindsight.recall_calls) == 1
+        assert len(hindsight.recall_calls) == 2
 
         foreign_call_id = asyncio.run(_insert_org_b_call())
         client.cookies.clear()

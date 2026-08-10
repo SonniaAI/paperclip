@@ -135,6 +135,27 @@ async def test_empty_deterministic_match_uses_labeled_hindsight_fallback() -> No
 
 
 @pytest.mark.asyncio
+async def test_stopword_only_overlap_uses_hindsight_fallback() -> None:
+    """An unrelated natural-language question must not suppress fuzzy recall."""
+
+    hindsight = FakeHindsight(hits=(HindsightRecallHit(text="They requested a renewal quote."),))
+
+    result = await deterministic_first_recall(
+        entries=(_entry("preference", "They prefer email."),),
+        query="What did they say about renewal?",
+        bank_id="bank-for-contact",
+        hindsight=hindsight,
+    )
+
+    assert result.deterministic == ()
+    assert result.used_hindsight is True
+    assert result.hindsight_status == "returned"
+    assert hindsight.recall_calls == [
+        ("bank-for-contact", "What did they say about renewal?", 5)
+    ]
+
+
+@pytest.mark.asyncio
 async def test_unavailable_hindsight_does_not_break_the_contact_read() -> None:
     hindsight = FakeHindsight(unavailable=True)
 

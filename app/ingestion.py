@@ -49,6 +49,7 @@ class IngestionResult:
     duplicate: bool = False
     call_id: UUID | None = None
     error: str | None = None
+    canonical_payload: Mapping[str, Any] | None = None
 
 
 def _as_mapping(value: object) -> Mapping[str, Any]:
@@ -167,6 +168,43 @@ def _canonical_json(payload: Mapping[str, Any]) -> tuple[str, str]:
     return raw, hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _decode_stored_payload(value: object) -> Mapping[str, Any] | None:
+    """Return a mapping from PostgreSQL jsonb or its string representation."""
+
+    if isinstance(value, Mapping):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return decoded if isinstance(decoded, Mapping) else None
+
+
+async def _load_canonical_payload(
+    db: AsyncSession,
+    scope: TenantScope,
+    event_id: str,
+) -> Mapping[str, Any]:
+    """Load the tenant-scoped durable inbox body for a duplicate delivery."""
+
+    async with db.begin():
+        await set_tenant_scope(db, scope)
+        raw_payload = (
+            await db.execute(
+                text("SELECT raw_payload FROM telnyx_webhook_events WHERE event_id = :event_id"),
+                {"event_id": event_id},
+            )
+        ).scalar_one_or_none()
+    payload = _decode_stored_payload(raw_payload)
+    if payload is None:
+        # A global event-ID conflict outside this tenant is not a valid replay.
+        # Keep the response generic so it cannot disclose the owning tenant.
+        raise TelnyxPayloadError("Telnyx event conflicts with the durable inbox")
+    return payload
+
+
 async def _mark_event(
     db: AsyncSession,
     scope: TenantScope,
@@ -204,11 +242,20 @@ async def _process_stored_event(
         normalized = normalize_telnyx_call(payload)
     except TelnyxPayloadError as exc:
         await _mark_event(db, scope, event_id, "failed", str(exc))
-        return IngestionResult(event_id=event_id, status="failed", error=str(exc))
+        return IngestionResult(
+            event_id=event_id,
+            status="failed",
+            error=str(exc),
+            canonical_payload=payload,
+        )
 
     if normalized is None:
         await _mark_event(db, scope, event_id, "ignored")
-        return IngestionResult(event_id=event_id, status="ignored")
+        return IngestionResult(
+            event_id=event_id,
+            status="ignored",
+            canonical_payload=payload,
+        )
 
     try:
         async with db.begin():
@@ -312,7 +359,12 @@ async def _process_stored_event(
         await _mark_event(db, scope, event_id, "failed", str(exc)[:2000])
         raise
 
-    return IngestionResult(event_id=event_id, status="processed", call_id=call_id)
+    return IngestionResult(
+        event_id=event_id,
+        status="processed",
+        call_id=call_id,
+        canonical_payload=payload,
+    )
 
 
 async def ingest_telnyx_event(
@@ -328,6 +380,9 @@ async def ingest_telnyx_event(
         raise TelnyxPayloadError("Telnyx payload must be a JSON object")
     event_id = event_id_from_payload(payload)
     raw_payload, payload_sha256 = _canonical_json(payload)
+    canonical_payload = _decode_stored_payload(raw_payload)
+    if canonical_payload is None:  # json.dumps of a Mapping must round-trip to a Mapping.
+        raise TelnyxPayloadError("Telnyx payload must be a JSON object")
     event_type = event_type_from_payload(payload)
 
     async with db.begin():
@@ -360,11 +415,24 @@ async def ingest_telnyx_event(
         ).scalar_one_or_none()
 
     if inserted is None:
-        # Do not reveal whether a provider event belongs to another tenant.
-        # The unique inbox key still makes the operation idempotent globally.
-        return IngestionResult(event_id=event_id, status="duplicate", duplicate=True)
+        # Dispatchers must only see the durable first delivery.  In particular,
+        # an altered same-ID webhook must not overwrite a transcript before an
+        # already-delivered Hindsight batch is reused.
+        stored_payload = await _load_canonical_payload(db, scope, event_id)
+        return IngestionResult(
+            event_id=event_id,
+            status="duplicate",
+            duplicate=True,
+            canonical_payload=stored_payload,
+        )
 
-    return await _process_stored_event(db, scope, event_id, payload, storage=storage)
+    return await _process_stored_event(
+        db,
+        scope,
+        event_id,
+        canonical_payload,
+        storage=storage,
+    )
 
 
 async def replay_telnyx_event(
@@ -384,6 +452,7 @@ async def replay_telnyx_event(
                 {"event_id": event_id},
             )
         ).scalar_one_or_none()
-    if stored is None or not isinstance(stored, Mapping):
+    stored_payload = _decode_stored_payload(stored)
+    if stored_payload is None:
         raise TelnyxPayloadError("stored Telnyx event not found")
-    return await _process_stored_event(db, scope, event_id, stored, storage=storage)
+    return await _process_stored_event(db, scope, event_id, stored_payload, storage=storage)
