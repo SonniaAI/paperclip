@@ -106,10 +106,32 @@ def test_production_requires_live_smtp_configuration() -> None:
             smtp_from_email=None,
         )
 
+    with pytest.raises(ValueError, match="SMTP_USERNAME.*SMTP_PASSWORD"):
+        Settings(
+            environment="production",
+            session_secret="production-signing-secret",
+            public_app_url="https://manager.sonnia.ai",
+            smtp_host="smtp.example.com",
+            smtp_from_email="no-reply@example.com",
+        )
+
+    production_smtp = {
+        "environment": "production",
+        "session_secret": "production-signing-secret",
+        "public_app_url": "https://manager.sonnia.ai",
+        "smtp_host": "smtp.example.com",
+        "smtp_from_email": "no-reply@example.com",
+        "smtp_username": "smtp-user",
+        "smtp_password": "smtp-password",
+    }
+    with pytest.raises(ValueError, match="SMTP_USE_TLS"):
+        Settings(**production_smtp, smtp_use_tls=False)
+    with pytest.raises(ValueError, match="SECURE_COOKIES"):
+        Settings(**production_smtp, secure_cookies=False)
+    with pytest.raises(ValueError, match="PUBLIC_APP_URL.*HTTPS"):
+        Settings(**(production_smtp | {"public_app_url": "http://manager.sonnia.ai"}))
+
     configured = Settings(
-        environment="production",
-        session_secret="production-signing-secret",
-        smtp_host="smtp.example.com",
-        smtp_from_email="no-reply@example.com",
+        **production_smtp,
     )
     assert configured.smtp_host == "smtp.example.com"

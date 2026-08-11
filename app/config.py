@@ -64,12 +64,30 @@ class Settings(BaseSettings):
             raise ValueError("MANAGER_AUTH_LOCKOUT_SECONDS must be positive")
         if self.smtp_host and not self.smtp_from_email:
             raise ValueError("MANAGER_SMTP_FROM_EMAIL is required when SMTP is configured")
-        if self.environment == "production" and (
-            not self.smtp_host or not self.smtp_from_email
-        ):
+        if bool(self.smtp_username) != bool(self.smtp_password):
             raise ValueError(
-                "MANAGER_SMTP_HOST and MANAGER_SMTP_FROM_EMAIL are required in production"
+                "MANAGER_SMTP_USERNAME and MANAGER_SMTP_PASSWORD must be configured together"
             )
+        if self.environment == "production":
+            required_smtp = {
+                "MANAGER_SMTP_HOST": self.smtp_host,
+                "MANAGER_SMTP_FROM_EMAIL": self.smtp_from_email,
+                "MANAGER_SMTP_USERNAME": self.smtp_username,
+                "MANAGER_SMTP_PASSWORD": self.smtp_password,
+            }
+            missing = [
+                name
+                for name, value in required_smtp.items()
+                if not value or not value.strip()
+            ]
+            if missing:
+                raise ValueError(f"{', '.join(missing)} are required in production")
+            if not self.smtp_use_tls:
+                raise ValueError("MANAGER_SMTP_USE_TLS must be true in production")
+            if not self.secure_cookies:
+                raise ValueError("MANAGER_SECURE_COOKIES must be true in production")
+            if not self.public_app_url.lower().startswith("https://"):
+                raise ValueError("MANAGER_PUBLIC_APP_URL must use HTTPS in production")
         if not 0 < self.smtp_timeout_seconds <= 30:
             raise ValueError("MANAGER_SMTP_TIMEOUT_SECONDS must be between 0 and 30")
         return self
