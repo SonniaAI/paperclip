@@ -15,7 +15,9 @@ import importlib
 import os
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from threading import Barrier
 from urllib.parse import unquote
 from uuid import UUID, uuid4
 
@@ -198,6 +200,22 @@ def _token_from_development_url(response: object) -> str:
     return unquote(url.rsplit("/", maxsplit=1)[-1])
 
 
+def _concurrent_posts(
+    client: TestClient, path: str, payload: dict[str, str], *, count: int = 2
+) -> list[object]:
+    """Release identical requests together to exercise database claim races."""
+
+    barrier = Barrier(count)
+
+    def submit() -> object:
+        barrier.wait(timeout=5)
+        return client.post(path, json=payload)
+
+    with ThreadPoolExecutor(max_workers=count) as executor:
+        futures = [executor.submit(submit) for _ in range(count)]
+        return [future.result(timeout=15) for future in futures]
+
+
 async def _ingestion_counts(
     org_id: str, event_id: str, external_call_key: str
 ) -> tuple[int, int, str]:
@@ -344,9 +362,14 @@ def _run() -> None:
         assert unverified.status_code == 403, unverified.text
         assert unverified.json()["detail"]["code"] == "email_unverified"
 
-        verification = client.post(
+        verification_attempts = _concurrent_posts(
+            client,
             "/auth/verify-email",
-            json={"token": verification_token},
+            {"token": verification_token},
+        )
+        assert sorted(response.status_code for response in verification_attempts) == [200, 400]
+        verification = next(
+            response for response in verification_attempts if response.status_code == 200
         )
         assert verification.status_code == 200, verification.text
         assert verification.json()["authenticated"] is True
@@ -355,10 +378,11 @@ def _run() -> None:
         assert "httponly" in set_cookie and "secure" in set_cookie and "samesite=lax" in set_cookie
         owner_a_cookie = client.cookies.get("manager_session")
         assert owner_a_cookie
-        reused_verification = client.post(
-            "/auth/verify-email",
-            json={"token": verification_token},
+        raced_verification = next(
+            response for response in verification_attempts if response.status_code == 400
         )
+        assert raced_verification.json()["detail"]["code"] == "already_used"
+        reused_verification = client.post("/auth/verify-email", json={"token": verification_token})
         assert reused_verification.status_code == 400, reused_verification.text
         assert reused_verification.json()["detail"]["code"] == "already_used"
 
@@ -383,14 +407,27 @@ def _run() -> None:
         assert login_challenge.status_code == 200, login_challenge.text
         assert login_challenge.json()["requires_2fa"] is True
         assert "set-cookie" not in login_challenge.headers
-        completed_login = client.post(
+        completed_login_attempts = _concurrent_posts(
+            client,
+            "/auth/login/2fa",
+            {
+                "challenge_token": login_challenge.json()["challenge_token"],
+                "code": totp_for_test(totp_secret, at_time=int(time.time())),
+            },
+        )
+        assert sorted(response.status_code for response in completed_login_attempts) == [200, 401]
+        completed_login = next(
+            response for response in completed_login_attempts if response.status_code == 200
+        )
+        assert completed_login.status_code == 200, completed_login.text
+        replayed_login = client.post(
             "/auth/login/2fa",
             json={
                 "challenge_token": login_challenge.json()["challenge_token"],
                 "code": totp_for_test(totp_secret, at_time=int(time.time())),
             },
         )
-        assert completed_login.status_code == 200, completed_login.text
+        assert replayed_login.status_code == 401, replayed_login.text
         owner_a_cookie = client.cookies.get("manager_session")
         assert owner_a_cookie
 
@@ -435,15 +472,26 @@ def _run() -> None:
         )
         assert unknown_forgot.status_code == 200, unknown_forgot.text
         assert unknown_forgot.json()["message"] == forgot.json()["message"]
-        reset = client.post(
+        reset_attempts = _concurrent_posts(
+            client,
+            "/auth/reset-password",
+            {
+                "token": reset_token,
+                "new_password": "new-member-password-2026",
+            },
+        )
+        assert sorted(response.status_code for response in reset_attempts) == [200, 400]
+        reset = next(response for response in reset_attempts if response.status_code == 200)
+        assert reset.status_code == 200, reset.text
+        assert reset.json()["authenticated"] is True
+        reused_reset = client.post(
             "/auth/reset-password",
             json={
                 "token": reset_token,
                 "new_password": "new-member-password-2026",
             },
         )
-        assert reset.status_code == 200, reset.text
-        assert reset.json()["authenticated"] is True
+        assert reused_reset.status_code == 400, reused_reset.text
         new_member_cookie = client.cookies.get("manager_session")
         assert new_member_cookie != old_member_cookie
         client.cookies.clear()
@@ -695,7 +743,8 @@ else:
         1,
         (
             b"E2E PASS: company + individual registration, verification, secure session, "
-            b"email-only login, conditional TOTP, password reset, rate limiting, signed invite, "
+            b"email-only login, atomic verification/TOTP/reset replay rejection, rate limiting, "
+            b"signed invite, "
             b"Telnyx transcript memory write/duplicate handling, deterministic-first voice recall, "
             b"Hindsight fallback, and Org A -> Org B 404\n"
         ),

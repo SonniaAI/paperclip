@@ -64,6 +64,12 @@ class Settings(BaseSettings):
             raise ValueError("MANAGER_AUTH_LOCKOUT_SECONDS must be positive")
         if self.smtp_host and not self.smtp_from_email:
             raise ValueError("MANAGER_SMTP_FROM_EMAIL is required when SMTP is configured")
+        if self.environment == "production" and (
+            not self.smtp_host or not self.smtp_from_email
+        ):
+            raise ValueError(
+                "MANAGER_SMTP_HOST and MANAGER_SMTP_FROM_EMAIL are required in production"
+            )
         if not 0 < self.smtp_timeout_seconds <= 30:
             raise ValueError("MANAGER_SMTP_TIMEOUT_SECONDS must be between 0 and 30")
         return self

@@ -190,6 +190,9 @@ def _issue_user_action_token(
             "uid": str(user_id),
             "org": str(scope.org_id),
             "dept": str(scope.department_id),
+            # A random nonce ensures that issuing a replacement within the
+            # same serializer timestamp always revokes a distinct token.
+            "nonce": secrets.token_urlsafe(16),
         }
     )
 
@@ -207,6 +210,9 @@ def _decode_user_action_token(
             value,
             max_age=max_age,
         )
+        nonce = data["nonce"]
+        if not isinstance(nonce, str) or len(nonce) < 16:
+            raise ValueError("invalid token nonce")
         return UserActionClaims(
             user_id=UUID(data["uid"]),
             scope=TenantScope(

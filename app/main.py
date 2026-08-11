@@ -15,7 +15,7 @@ from uuid import UUID, uuid4
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -701,24 +701,37 @@ async def verify_email(payload: VerifyEmailRequest, db: DatabaseSession) -> Resp
     except ValueError as exc:
         raise _invalid_action_token() from exc
 
+    now = datetime.now(UTC)
+    supplied_digest = token_digest(payload.token)
     async with db.begin():
         await set_tenant_scope(db, claims.scope)
-        user = await db.get(AppUser, claims.user_id)
-        if user is None or user.email_verified_at is not None:
-            raise _invalid_action_token("already_used")
-        if (
-            user.email_verification_token_digest is None
-            or user.email_verification_expires_at is None
-            or user.email_verification_expires_at <= datetime.now(UTC)
-            or not hmac.compare_digest(
-                user.email_verification_token_digest,
-                token_digest(payload.token),
+        claimed_user_id = (
+            await db.execute(
+                update(AppUser)
+                .where(
+                    AppUser.id == claims.user_id,
+                    AppUser.is_active.is_(True),
+                    AppUser.email_verified_at.is_(None),
+                    AppUser.email_verification_token_digest == supplied_digest,
+                    AppUser.email_verification_expires_at.is_not(None),
+                    AppUser.email_verification_expires_at > now,
+                )
+                .values(
+                    email_verified_at=now,
+                    email_verification_token_digest=None,
+                    email_verification_expires_at=None,
+                )
+                .returning(AppUser.id)
             )
-        ):
+        ).scalar_one_or_none()
+        if claimed_user_id is None:
+            existing = await db.get(AppUser, claims.user_id)
+            if existing is not None and existing.email_verified_at is not None:
+                raise _invalid_action_token("already_used")
             raise _invalid_action_token()
-        user.email_verified_at = datetime.now(UTC)
-        user.email_verification_token_digest = None
-        user.email_verification_expires_at = None
+        user = await db.get(AppUser, claimed_user_id)
+        if user is None:
+            raise _invalid_action_token()
         session = await _issue_session(db, user=user, scope=claims.scope)
         response_user = await _auth_user_response(db, user=user, scope=claims.scope)
 
@@ -775,6 +788,11 @@ async def login(
                     failed = True
                 else:
                     challenge = issue_two_factor_challenge(user_id=user.id, scope=scope)
+                    user.two_factor_challenge_token_digest = token_digest(challenge)
+                    user.two_factor_challenge_expires_at = datetime.now(UTC) + timedelta(
+                        seconds=settings.two_factor_ttl_seconds
+                    )
+                    await db.flush()
                     await _clear_login_failures(db, email=payload.email, request=request)
             else:
                 session = await _issue_session(db, user=user, scope=scope)
@@ -825,15 +843,45 @@ async def complete_two_factor_login(
             or user.email_verified_at is None
             or not user.totp_enabled
             or not user.totp_secret
+            or user.two_factor_challenge_token_digest is None
+            or user.two_factor_challenge_expires_at is None
+            or user.two_factor_challenge_expires_at <= datetime.now(UTC)
+            or not hmac.compare_digest(
+                user.two_factor_challenge_token_digest,
+                token_digest(payload.challenge_token),
+            )
             or membership is None
             or grant is None
             or not verify_totp(user.totp_secret, payload.code)
         ):
             failed = True
         else:
-            session = await _issue_session(db, user=user, scope=claims.scope)
-            response_user = await _auth_user_response(db, user=user, scope=claims.scope)
-            await _clear_login_failures(db, email=email, request=request)
+            claimed_user_id = (
+                await db.execute(
+                    update(AppUser)
+                    .where(
+                        AppUser.id == user.id,
+                        AppUser.is_active.is_(True),
+                        AppUser.email_verified_at.is_not(None),
+                        AppUser.totp_enabled.is_(True),
+                        AppUser.two_factor_challenge_token_digest
+                        == token_digest(payload.challenge_token),
+                        AppUser.two_factor_challenge_expires_at.is_not(None),
+                        AppUser.two_factor_challenge_expires_at > datetime.now(UTC),
+                    )
+                    .values(
+                        two_factor_challenge_token_digest=None,
+                        two_factor_challenge_expires_at=None,
+                    )
+                    .returning(AppUser.id)
+                )
+            ).scalar_one_or_none()
+            if claimed_user_id is None:
+                failed = True
+            else:
+                session = await _issue_session(db, user=user, scope=claims.scope)
+                response_user = await _auth_user_response(db, user=user, scope=claims.scope)
+                await _clear_login_failures(db, email=email, request=request)
 
     if failed and email is not None:
         await _record_failure_and_raise(db, email=email, request=request)
@@ -915,25 +963,35 @@ async def reset_password(payload: ResetPasswordRequest, db: DatabaseSession) -> 
     except ValueError as exc:
         raise _invalid_action_token() from exc
 
+    password_hash = hash_password(payload.new_password)
+    now = datetime.now(UTC)
+    supplied_digest = token_digest(payload.token)
     async with db.begin():
         await set_tenant_scope(db, claims.scope)
-        user = await db.get(AppUser, claims.user_id)
-        if (
-            user is None
-            or not user.is_active
-            or user.email_verified_at is None
-            or user.password_reset_token_digest is None
-            or user.password_reset_expires_at is None
-            or user.password_reset_expires_at <= datetime.now(UTC)
-            or not hmac.compare_digest(
-                user.password_reset_token_digest,
-                token_digest(payload.token),
+        claimed_user_id = (
+            await db.execute(
+                update(AppUser)
+                .where(
+                    AppUser.id == claims.user_id,
+                    AppUser.is_active.is_(True),
+                    AppUser.email_verified_at.is_not(None),
+                    AppUser.password_reset_token_digest == supplied_digest,
+                    AppUser.password_reset_expires_at.is_not(None),
+                    AppUser.password_reset_expires_at > now,
+                )
+                .values(
+                    password_hash=password_hash,
+                    password_reset_token_digest=None,
+                    password_reset_expires_at=None,
+                )
+                .returning(AppUser.id)
             )
-        ):
+        ).scalar_one_or_none()
+        if claimed_user_id is None:
             raise _invalid_action_token()
-        user.password_hash = hash_password(payload.new_password)
-        user.password_reset_token_digest = None
-        user.password_reset_expires_at = None
+        user = await db.get(AppUser, claimed_user_id)
+        if user is None:
+            raise _invalid_action_token()
         await db.execute(
             text("SELECT app.revoke_user_sessions(:user_id, :org_id)"),
             {"user_id": user.id, "org_id": claims.scope.org_id},

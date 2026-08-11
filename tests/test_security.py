@@ -83,11 +83,33 @@ def test_user_action_tokens_are_purpose_bound_and_tamper_evident(settings: Setti
     )
     reset = issue_password_reset_token(user_id=user_id, scope=scope, settings=settings)
     two_factor = issue_two_factor_challenge(user_id=user_id, scope=scope, settings=settings)
+    replacement_two_factor = issue_two_factor_challenge(
+        user_id=user_id, scope=scope, settings=settings
+    )
 
     assert decode_email_verification_token(verification, settings).user_id == user_id
     assert decode_password_reset_token(reset, settings).scope == scope
     assert decode_two_factor_challenge(two_factor, settings).scope == scope
+    assert replacement_two_factor != two_factor
     with pytest.raises(ValueError):
         decode_password_reset_token(verification, settings)
     with pytest.raises(ValueError):
         decode_email_verification_token(f"{verification}tampered", settings)
+
+
+def test_production_requires_live_smtp_configuration() -> None:
+    with pytest.raises(ValueError, match="SMTP_HOST.*SMTP_FROM_EMAIL"):
+        Settings(
+            environment="production",
+            session_secret="production-signing-secret",
+            smtp_host=None,
+            smtp_from_email=None,
+        )
+
+    configured = Settings(
+        environment="production",
+        session_secret="production-signing-secret",
+        smtp_host="smtp.example.com",
+        smtp_from_email="no-reply@example.com",
+    )
+    assert configured.smtp_host == "smtp.example.com"

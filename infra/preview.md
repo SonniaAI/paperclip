@@ -42,8 +42,9 @@ MANAGER_SMTP_USE_TLS=true
 ```
 
 When SMTP is absent in development, verification and reset URLs are logged and
-returned only for the explicit development banner. A production release must
-provide SMTP settings to make account verification usable by customers.
+returned only for the explicit development banner. Production configuration
+validation requires both `MANAGER_SMTP_HOST` and `MANAGER_SMTP_FROM_EMAIL`, so
+the service exits before accepting traffic if live email is not configured.
 
 ## CI and billing affordance
 

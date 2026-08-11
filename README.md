@@ -116,8 +116,9 @@ membership in the runtime role and cannot run arbitrary statements.
 Transactional email uses standard SMTP when `MANAGER_SMTP_HOST` and
 `MANAGER_SMTP_FROM_EMAIL` are configured. Without SMTP, development logs the
 verification/reset URL and the frontend shows an explicitly development-only
-banner. Production should configure SMTP; it never exposes fallback URLs in a
-browser response.
+banner. Production refuses to start without both SMTP settings, so it cannot
+silently expose an account flow whose verification email will never arrive.
+Development fallback URLs are never exposed in a production browser response.
 
 ## Layout
 
@@ -135,6 +136,8 @@ browser response.
 - `alembic/versions/20260811_auth_flow.sql` — email-first identity lookup,
   verification/reset state, global email uniqueness, and hashed login-rate
   limits.
+- `alembic/versions/20260811_auth_claims.sql` — persisted, expiring 2FA
+  challenge digests for atomic single-use completion under concurrent replay.
 - `app/` — FastAPI, async SQLAlchemy, ingestion, private storage, CRM seam,
   sessions, TOTP, invites, and the SON-419 service layer (`app/son419.py`)
   and routes (`/api/instructions`, `/api/tasks`, `/api/task-lists`,
