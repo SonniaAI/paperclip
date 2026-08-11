@@ -29,10 +29,21 @@ Configure the preview with:
 ```text
 MANAGER_ENVIRONMENT=production
 MANAGER_SESSION_SECRET=<random value stored outside source control>
+MANAGER_PUBLIC_APP_URL=https://manager.sonnia.ai
 MANAGER_STORAGE_BUCKET=<private bucket name>
 MANAGER_STORAGE_REGION=us-east-1
 MANAGER_RECORDING_SIGNED_URL_TTL_SECONDS=300
+MANAGER_SMTP_HOST=<transactional SMTP host>
+MANAGER_SMTP_PORT=587
+MANAGER_SMTP_USERNAME=<SMTP username>
+MANAGER_SMTP_PASSWORD=<secret value stored outside source control>
+MANAGER_SMTP_FROM_EMAIL=<verified sender address>
+MANAGER_SMTP_USE_TLS=true
 ```
+
+When SMTP is absent in development, verification and reset URLs are logged and
+returned only for the explicit development banner. A production release must
+provide SMTP settings to make account verification usable by customers.
 
 ## CI and billing affordance
 

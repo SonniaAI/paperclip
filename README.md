@@ -10,19 +10,26 @@ then layers the §15 product model and Telnyx ingestion on top of it.
   `app.department_id` settings; a route never appends an untrusted tenant
   filter to make access safe.
 - Every application table has `org_id` and `department_id`. `organizations`
-  uses its own ID as `org_id`; a new organization receives a silent default
+  uses its own ID as `org_id`; a new organisation receives a silent default
   department atomically.
 - Department shapes are `silent`, `shared`, and `private`. Visibility is
   granted by membership department, including for Owners.
-- Do-not-contact rows and active-dial keys are organization-wide. The active
+- Do-not-contact rows and active-dial keys are organisation-wide. The active
   dial policy defaults to `warn` and can later be changed to `block` or
   `allow`.
 - Sessions are signed, `HttpOnly`, `Secure`, and `SameSite=Lax`; TOTP uses a
   standards-compatible HMAC-SHA1 30-second implementation; invite URLs are
   signed and expiry-limited.
-- Customer-facing auth inputs use organization/department slugs, not database
-  identifiers. The one fixed-query pre-auth resolver returns scope only to the
-  server, then normal RLS starts immediately.
+- Customer-facing sign-in accepts email and password only. Email is globally
+  unique; a fixed-query pre-auth resolver returns only the user's primary scope
+  and ID, then normal RLS starts immediately. Organisation and department slugs
+  remain internal routing data and are never customer-entered credentials.
+- Registration creates an individual or business organisation, silent default
+  department, Owner membership, and 24-hour single-use verification token in
+  one transaction. Password-reset tokens last 1 hour, reset revokes all prior
+  sessions, and login locks an email/IP hash pair for 15 minutes after five
+  consecutive failures. TOTP is requested only after a correct password for an
+  account that has it enabled.
 - `20260809_feature_data` adds the complete §15 feature model: companies,
   contacts and contact methods, recordings, transcripts/segments, call
   intelligence, tasks, campaigns/materials/claims, spend/balance, test
@@ -73,16 +80,18 @@ npm run test:telnyx-ingestion
 npm run test:e2e
 ```
 
-`npm run test:rls` creates both organization rows and then switches to a
+`npm run test:rls` creates both organisation rows and then switches to a
 non-owner database role. It proves that, with Org A's transaction context, a
 lookup of Org B's call returns zero rows. The FastAPI call route translates
-that absence into a 404 without querying by organization in application code.
+that absence into a 404 without querying by organisation in application code.
 
 `npm run test:e2e` starts an ephemeral PostgreSQL-WASM wire server and verifies
-registration, the `Secure`/`HttpOnly` session cookie, TOTP enrollment,
-tokenized invite acceptance, login, a real Telnyx transcript-memory write,
-idempotent duplicate handling, deterministic-first voice recall with a labeled
-Hindsight fallback, and Org A receiving a 404 for Org B's call.
+business and individual registration, single-use email verification, the
+`Secure`/`HttpOnly` session cookie, conditional TOTP, invite acceptance,
+email-only login, password reset with session invalidation, five-attempt rate
+limiting, a real Telnyx transcript-memory write, idempotent duplicate handling,
+deterministic-first voice recall with a labelled Hindsight fallback, and Org A
+receiving a 404 for Org B's call.
 
 `npm run test:feature-data` applies Gate 0 plus the feature migration to
 PostgreSQL-WASM and verifies all 30 new tables carry both tenant keys, forced
@@ -100,9 +109,15 @@ uses `postgresql+asyncpg://...`. Then run
 `infra/runtime-role.sql` as a database administrator and configure the app to
 connect as the non-superuser, `NOBYPASSRLS` `manager_app` role. The migration
 role must not be used for HTTP traffic. The script also creates a `NOLOGIN`
-`manager_auth_resolver` function owner with `BYPASSRLS`, constrained to a
-fixed-query, two-column pre-auth slug resolver; it has no login, no membership
-in the runtime role, and no access to user, call, invite, or session tables.
+`manager_auth_resolver` function owner with `BYPASSRLS`, constrained to fixed
+email-to-scope lookup and all-session-revocation functions. It has no login or
+membership in the runtime role and cannot run arbitrary statements.
+
+Transactional email uses standard SMTP when `MANAGER_SMTP_HOST` and
+`MANAGER_SMTP_FROM_EMAIL` are configured. Without SMTP, development logs the
+verification/reset URL and the frontend shows an explicitly development-only
+banner. Production should configure SMTP; it never exposes fallback URLs in a
+browser response.
 
 ## Layout
 
@@ -117,6 +132,9 @@ in the runtime role, and no access to user, call, invite, or session tables.
   state.
 - `alembic/versions/20260810_hindsight_memory.sql` — tenant-scoped
   deterministic contact-memory batches/entries and retryable Hindsight outbox.
+- `alembic/versions/20260811_auth_flow.sql` — email-first identity lookup,
+  verification/reset state, global email uniqueness, and hashed login-rate
+  limits.
 - `app/` — FastAPI, async SQLAlchemy, ingestion, private storage, CRM seam,
   sessions, TOTP, invites, and the SON-419 service layer (`app/son419.py`)
   and routes (`/api/instructions`, `/api/tasks`, `/api/task-lists`,

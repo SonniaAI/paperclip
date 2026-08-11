@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import os
 import traceback
+from urllib.parse import unquote
 
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -45,14 +46,22 @@ def _run() -> None:
         reg = client.post(
             "/auth/register",
             json={
-                "organization_name": "Sonnia 419 Demo",
-                "organization_slug": "son419-demo",
-                "display_name": "Owner 419",
+                "account_type": "business",
+                "full_name": "Owner 419",
                 "email": "owner-419@example.com",
                 "password": "correct-horse-battery-staple",
+                "company_name": "Sonnia 419 Demo",
+                "country": "United Kingdom",
             },
         )
         assert reg.status_code == 201, reg.text
+        verification_url = reg.json()["development_url"]
+        assert verification_url
+        verified = client.post(
+            "/auth/verify-email",
+            json={"token": unquote(verification_url.rsplit("/", maxsplit=1)[-1])},
+        )
+        assert verified.status_code == 200, verified.text
 
         # /instructions: create + edit -> version history + in-effect-since.
         created = client.post(

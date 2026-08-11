@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.models import Role
 
@@ -16,35 +16,57 @@ def _normalise_email(value: str) -> str:
     return email
 
 
-def _normalise_slug(value: str) -> str:
-    slug = value.strip().lower()
-    allowed_characters = "abcdefghijklmnopqrstuvwxyz0123456789-"
-    if not slug or any(character not in allowed_characters for character in slug):
-        raise ValueError("slug may contain lowercase letters, numbers, and hyphens only")
-    return slug
-
-
 class RegisterRequest(BaseModel):
-    organization_name: str = Field(min_length=2, max_length=160)
-    organization_slug: str = Field(min_length=2, max_length=80)
-    display_name: str = Field(min_length=1, max_length=160)
+    account_type: Literal["individual", "business"]
+    full_name: str = Field(min_length=1, max_length=160)
     email: str
-    password: str = Field(min_length=12, max_length=512)
+    password: str = Field(min_length=10, max_length=512)
+    company_name: str | None = Field(default=None, min_length=2, max_length=160)
+    country: str | None = Field(default=None, min_length=2, max_length=80)
 
     _validate_email = field_validator("email")(_normalise_email)
-    _validate_slug = field_validator("organization_slug")(_normalise_slug)
+
+    @model_validator(mode="after")
+    def validate_account_fields(self) -> RegisterRequest:
+        self.full_name = self.full_name.strip()
+        if self.account_type == "business":
+            if not self.company_name or not self.company_name.strip():
+                raise ValueError("company name is required for a business account")
+            if not self.country or not self.country.strip():
+                raise ValueError("country is required for a business account")
+            self.company_name = self.company_name.strip()
+            self.country = self.country.strip()
+        else:
+            self.company_name = None
+            self.country = None
+        return self
 
 
 class LoginRequest(BaseModel):
-    organization_slug: str = Field(min_length=2, max_length=80)
-    department_slug: str = Field(default="default", min_length=2, max_length=80)
     email: str
     password: str = Field(min_length=1, max_length=512)
-    totp_code: str | None = Field(default=None, min_length=6, max_length=6)
 
     _validate_email = field_validator("email")(_normalise_email)
-    _validate_organization_slug = field_validator("organization_slug")(_normalise_slug)
-    _validate_department_slug = field_validator("department_slug")(_normalise_slug)
+
+
+class TwoFactorLoginRequest(BaseModel):
+    challenge_token: str = Field(min_length=20)
+    code: str = Field(pattern=r"^\d{6}$")
+
+
+class EmailAddressRequest(BaseModel):
+    email: str
+
+    _validate_email = field_validator("email")(_normalise_email)
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=20)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=20)
+    new_password: str = Field(min_length=10, max_length=512)
 
 
 class InviteCreateRequest(BaseModel):
@@ -64,8 +86,34 @@ class TotpVerifyRequest(BaseModel):
     code: str = Field(min_length=6, max_length=6)
 
 
+class AuthUserResponse(BaseModel):
+    name: str
+    email: str
+    company: str
+    department: str
+
+
 class AuthResponse(BaseModel):
     authenticated: bool = True
+    requires_2fa: bool = False
+    user: AuthUserResponse | None = None
+    redirect_to: str = "/"
+
+
+class LoginChallengeResponse(BaseModel):
+    authenticated: bool = False
+    requires_2fa: bool = True
+    challenge_token: str
+
+
+class EmailDeliveryResponse(BaseModel):
+    message: str
+    delivery: Literal["smtp", "development", "failed"]
+    development_url: str | None = None
+
+
+class RegisterResponse(EmailDeliveryResponse):
+    email: str
 
 
 class TotpEnrollmentResponse(BaseModel):

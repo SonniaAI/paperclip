@@ -16,6 +16,7 @@ import os
 import time
 import traceback
 from copy import deepcopy
+from urllib.parse import unquote
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -96,10 +97,12 @@ async def _insert_org_b_call() -> str:
     try:
         row = await connection.fetchrow(
             """
-            SELECT organization.id AS org_id, department.id AS department_id
-            FROM organizations AS organization
-            JOIN departments AS department ON department.org_id = organization.id
-            WHERE organization.login_slug = 'org-b' AND department.login_slug = 'default'
+            SELECT account.org_id, department.id AS department_id
+            FROM app_users AS account
+            JOIN departments AS department
+              ON department.org_id = account.org_id
+             AND department.id = account.department_id
+            WHERE account.email = 'owner-b@example.com'
             """
         )
         assert row is not None
@@ -160,7 +163,7 @@ async def _insert_contact_linked_call(
         connection.terminate()
 
 
-async def _org_scope(login_slug: str) -> tuple[str, str]:
+async def _org_scope(email: str) -> tuple[str, str]:
     connection = await asyncpg.connect(
         os.environ["MANAGER_DATABASE_URL"].replace(
             "postgresql+asyncpg://manager_app:ignored",
@@ -172,17 +175,27 @@ async def _org_scope(login_slug: str) -> tuple[str, str]:
     try:
         row = await connection.fetchrow(
             """
-            SELECT organization.id AS org_id, department.id AS department_id
-            FROM organizations AS organization
-            JOIN departments AS department ON department.org_id = organization.id
-            WHERE organization.login_slug = $1 AND department.login_slug = 'default'
+            SELECT account.org_id, department.id AS department_id
+            FROM app_users AS account
+            JOIN departments AS department
+              ON department.org_id = account.org_id
+             AND department.id = account.department_id
+            WHERE account.email = $1
             """,
-            login_slug,
+            email,
         )
         assert row is not None
         return str(row["org_id"]), str(row["department_id"])
     finally:
         connection.terminate()
+
+
+def _token_from_development_url(response: object) -> str:
+    payload = response.json()  # type: ignore[attr-defined]
+    assert payload["delivery"] == "development", payload
+    url = payload["development_url"]
+    assert url
+    return unquote(url.rsplit("/", maxsplit=1)[-1])
 
 
 async def _ingestion_counts(
@@ -309,26 +322,77 @@ def _run() -> None:
         registration = client.post(
             "/auth/register",
             json={
-                "organization_name": "Org A Solar",
-                "organization_slug": "org-a",
-                "display_name": "Owner A",
+                "account_type": "business",
+                "full_name": "Owner A",
+                "email": "owner-a@example.com",
+                "password": "correct-horse-battery-staple",
+                "company_name": "Org A Solar",
+                "country": "Singapore",
+            },
+        )
+        assert registration.status_code == 201, registration.text
+        assert "set-cookie" not in registration.headers
+        verification_token = _token_from_development_url(registration)
+
+        unverified = client.post(
+            "/auth/login",
+            json={
                 "email": "owner-a@example.com",
                 "password": "correct-horse-battery-staple",
             },
         )
-        assert registration.status_code == 201, registration.text
-        set_cookie = registration.headers["set-cookie"].lower()
+        assert unverified.status_code == 403, unverified.text
+        assert unverified.json()["detail"]["code"] == "email_unverified"
+
+        verification = client.post(
+            "/auth/verify-email",
+            json={"token": verification_token},
+        )
+        assert verification.status_code == 200, verification.text
+        assert verification.json()["authenticated"] is True
+        assert verification.json()["user"]["company"] == "Org A Solar"
+        set_cookie = verification.headers["set-cookie"].lower()
         assert "httponly" in set_cookie and "secure" in set_cookie and "samesite=lax" in set_cookie
         owner_a_cookie = client.cookies.get("manager_session")
         assert owner_a_cookie
+        reused_verification = client.post(
+            "/auth/verify-email",
+            json={"token": verification_token},
+        )
+        assert reused_verification.status_code == 400, reused_verification.text
+        assert reused_verification.json()["detail"]["code"] == "already_used"
 
         enrolled = client.post("/auth/totp/enroll")
         assert enrolled.status_code == 200, enrolled.text
+        totp_secret = enrolled.json()["secret"]
         verified = client.post(
             "/auth/totp/verify",
-            json={"code": totp_for_test(enrolled.json()["secret"], at_time=int(time.time()))},
+            json={"code": totp_for_test(totp_secret, at_time=int(time.time()))},
         )
         assert verified.status_code == 204, verified.text
+
+        signed_out = client.post("/auth/logout")
+        assert signed_out.status_code == 204, signed_out.text
+        login_challenge = client.post(
+            "/auth/login",
+            json={
+                "email": "owner-a@example.com",
+                "password": "correct-horse-battery-staple",
+            },
+        )
+        assert login_challenge.status_code == 200, login_challenge.text
+        assert login_challenge.json()["requires_2fa"] is True
+        assert "set-cookie" not in login_challenge.headers
+        completed_login = client.post(
+            "/auth/login/2fa",
+            json={
+                "challenge_token": login_challenge.json()["challenge_token"],
+                "code": totp_for_test(totp_secret, at_time=int(time.time())),
+            },
+        )
+        assert completed_login.status_code == 200, completed_login.text
+        owner_a_cookie = client.cookies.get("manager_session")
+        assert owner_a_cookie
 
         invite = client.post(
             "/auth/invites",
@@ -351,29 +415,62 @@ def _run() -> None:
         logged_in = client.post(
             "/auth/login",
             json={
-                "organization_slug": "org-a",
-                "department_slug": "default",
                 "email": "member-a@example.com",
                 "password": "another-correct-horse-battery",
             },
         )
         assert logged_in.status_code == 200, logged_in.text
+        assert logged_in.json()["user"]["department"] == "default"
+
+        old_member_cookie = client.cookies.get("manager_session")
+        forgot = client.post(
+            "/auth/forgot-password",
+            json={"email": "member-a@example.com"},
+        )
+        assert forgot.status_code == 200, forgot.text
+        reset_token = _token_from_development_url(forgot)
+        unknown_forgot = client.post(
+            "/auth/forgot-password",
+            json={"email": "unknown@example.com"},
+        )
+        assert unknown_forgot.status_code == 200, unknown_forgot.text
+        assert unknown_forgot.json()["message"] == forgot.json()["message"]
+        reset = client.post(
+            "/auth/reset-password",
+            json={
+                "token": reset_token,
+                "new_password": "new-member-password-2026",
+            },
+        )
+        assert reset.status_code == 200, reset.text
+        assert reset.json()["authenticated"] is True
+        new_member_cookie = client.cookies.get("manager_session")
+        assert new_member_cookie != old_member_cookie
+        client.cookies.clear()
+        client.cookies.set("manager_session", old_member_cookie)
+        assert client.get("/auth/me").status_code == 401
+        client.cookies.clear()
+        client.cookies.set("manager_session", new_member_cookie)
 
         client.cookies.clear()
         second_registration = client.post(
             "/auth/register",
             json={
-                "organization_name": "Org B Solar",
-                "organization_slug": "org-b",
-                "display_name": "Owner B",
+                "account_type": "individual",
+                "full_name": "Owner B",
                 "email": "owner-b@example.com",
                 "password": "correct-horse-battery-staple",
             },
         )
         assert second_registration.status_code == 201, second_registration.text
+        second_verification = client.post(
+            "/auth/verify-email",
+            json={"token": _token_from_development_url(second_registration)},
+        )
+        assert second_verification.status_code == 200, second_verification.text
 
-        org_a_id, department_a_id = asyncio.run(_org_scope("org-a"))
-        org_b_id, department_b_id = asyncio.run(_org_scope("org-b"))
+        org_a_id, department_a_id = asyncio.run(_org_scope("owner-a@example.com"))
+        org_b_id, department_b_id = asyncio.run(_org_scope("owner-b@example.com"))
         imported_b = client.post(
             "/api/contacts/import",
             json={
@@ -573,6 +670,20 @@ def _run() -> None:
         assert hidden.status_code == 404, hidden.text
         assert hidden.json() == {"detail": "Call not found"}
 
+        client.cookies.clear()
+        for _ in range(4):
+            failed_login = client.post(
+                "/auth/login",
+                json={"email": "rate-limit@example.com", "password": "incorrect-password"},
+            )
+            assert failed_login.status_code == 401, failed_login.text
+        limited_login = client.post(
+            "/auth/login",
+            json={"email": "rate-limit@example.com", "password": "incorrect-password"},
+        )
+        assert limited_login.status_code == 429, limited_login.text
+        assert limited_login.headers["retry-after"] == str(main.settings.auth_lockout_seconds)
+
 
 try:
     _run()
@@ -583,7 +694,8 @@ else:
     os.write(
         1,
         (
-            b"E2E PASS: registration, secure session, TOTP, signed invite, login, "
+            b"E2E PASS: company + individual registration, verification, secure session, "
+            b"email-only login, conditional TOTP, password reset, rate limiting, signed invite, "
             b"Telnyx transcript memory write/duplicate handling, deterministic-first voice recall, "
             b"Hindsight fallback, and Org A -> Org B 404\n"
         ),

@@ -109,6 +109,12 @@ class InviteClaims:
     email: str
 
 
+@dataclass(frozen=True)
+class UserActionClaims:
+    user_id: UUID
+    scope: TenantScope
+
+
 def _serializer(settings: Settings | None = None, *, purpose: str) -> URLSafeTimedSerializer:
     configured = settings or get_settings()
     return URLSafeTimedSerializer(configured.session_secret, salt=f"manager.{purpose}.v1")
@@ -170,6 +176,102 @@ def decode_invite_token(value: str, settings: Settings | None = None) -> InviteC
         )
     except (BadData, KeyError, ValueError, TypeError) as exc:
         raise ValueError("invalid or expired invite") from exc
+
+
+def _issue_user_action_token(
+    *,
+    purpose: str,
+    user_id: UUID,
+    scope: TenantScope,
+    settings: Settings | None = None,
+) -> str:
+    return _serializer(settings, purpose=purpose).dumps(
+        {
+            "uid": str(user_id),
+            "org": str(scope.org_id),
+            "dept": str(scope.department_id),
+        }
+    )
+
+
+def _decode_user_action_token(
+    value: str,
+    *,
+    purpose: str,
+    max_age: int,
+    settings: Settings | None = None,
+) -> UserActionClaims:
+    configured = settings or get_settings()
+    try:
+        data: dict[str, Any] = _serializer(configured, purpose=purpose).loads(
+            value,
+            max_age=max_age,
+        )
+        return UserActionClaims(
+            user_id=UUID(data["uid"]),
+            scope=TenantScope(
+                org_id=UUID(data["org"]),
+                department_id=UUID(data["dept"]),
+            ),
+        )
+    except (BadData, KeyError, ValueError, TypeError) as exc:
+        raise ValueError("invalid or expired token") from exc
+
+
+def issue_email_verification_token(
+    *, user_id: UUID, scope: TenantScope, settings: Settings | None = None
+) -> str:
+    return _issue_user_action_token(
+        purpose="verify-email", user_id=user_id, scope=scope, settings=settings
+    )
+
+
+def decode_email_verification_token(
+    value: str, settings: Settings | None = None
+) -> UserActionClaims:
+    configured = settings or get_settings()
+    return _decode_user_action_token(
+        value,
+        purpose="verify-email",
+        max_age=configured.email_verification_ttl_seconds,
+        settings=configured,
+    )
+
+
+def issue_password_reset_token(
+    *, user_id: UUID, scope: TenantScope, settings: Settings | None = None
+) -> str:
+    return _issue_user_action_token(
+        purpose="reset-password", user_id=user_id, scope=scope, settings=settings
+    )
+
+
+def decode_password_reset_token(value: str, settings: Settings | None = None) -> UserActionClaims:
+    configured = settings or get_settings()
+    return _decode_user_action_token(
+        value,
+        purpose="reset-password",
+        max_age=configured.password_reset_ttl_seconds,
+        settings=configured,
+    )
+
+
+def issue_two_factor_challenge(
+    *, user_id: UUID, scope: TenantScope, settings: Settings | None = None
+) -> str:
+    return _issue_user_action_token(
+        purpose="two-factor", user_id=user_id, scope=scope, settings=settings
+    )
+
+
+def decode_two_factor_challenge(value: str, settings: Settings | None = None) -> UserActionClaims:
+    configured = settings or get_settings()
+    return _decode_user_action_token(
+        value,
+        purpose="two-factor",
+        max_age=configured.two_factor_ttl_seconds,
+        settings=configured,
+    )
 
 
 def session_expiry(settings: Settings | None = None) -> datetime:

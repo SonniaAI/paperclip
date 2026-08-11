@@ -73,6 +73,10 @@ class Organization(Base, TenantScoped):
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     name: Mapped[str] = mapped_column(Text)
     login_slug: Mapped[str] = mapped_column(Text, unique=True)
+    account_type: Mapped[str] = mapped_column(
+        String(10), default="business", server_default="business"
+    )
+    country: Mapped[str | None] = mapped_column(Text, nullable=True)
     duplicate_call_protection: Mapped[DuplicateCallProtection] = mapped_column(
         DUPLICATE_CALL_PROTECTION_ENUM,
         default=DuplicateCallProtection.WARN,
@@ -169,6 +173,17 @@ class AppUser(Base, TenantScoped):
     email: Mapped[str] = mapped_column(Text)
     display_name: Mapped[str] = mapped_column(Text)
     password_hash: Mapped[str] = mapped_column(Text)
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    email_verification_token_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    email_verification_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    password_reset_token_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    password_reset_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     totp_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)

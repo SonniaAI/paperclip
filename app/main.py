@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import re
+import unicodedata
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
@@ -14,6 +17,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
 from app.contact_memory import (
@@ -22,6 +26,7 @@ from app.contact_memory import (
     recall_contact_memory,
 )
 from app.database import TenantScope, get_session, set_tenant_scope
+from app.email_delivery import EmailDeliveryResult, deliver_action_email
 from app.hindsight import configured_hindsight_client
 from app.ingestion import TelnyxPayloadError, ingest_telnyx_event
 from app.materials import (
@@ -57,6 +62,7 @@ from app.schemas import (
     ActivityFeedEntry,
     ActivityFeedResponse,
     AuthResponse,
+    AuthUserResponse,
     BillingSettingsResponse,
     BillingTopUpPlaceholderResponse,
     CallResponse,
@@ -68,6 +74,8 @@ from app.schemas import (
     ContactImportPreviewResponse,
     ContactImportPreviewRow,
     ContactImportSummaryResponse,
+    EmailAddressRequest,
+    EmailDeliveryResponse,
     InstructionCreateRequest,
     InstructionListResponse,
     InstructionResponse,
@@ -76,12 +84,15 @@ from app.schemas import (
     InviteAcceptRequest,
     InviteCreateRequest,
     InviteResponse,
+    LoginChallengeResponse,
     LoginRequest,
     OnboardingProgressRequest,
     OnboardingStateResponse,
     ProfileSettingsResponse,
     ProfileUpdateRequest,
     RegisterRequest,
+    RegisterResponse,
+    ResetPasswordRequest,
     SecurityEventResponse,
     TaskCreateRequest,
     TaskListCreateRequest,
@@ -92,18 +103,26 @@ from app.schemas import (
     TeamMemberResponse,
     TotpEnrollmentResponse,
     TotpVerifyRequest,
+    TwoFactorLoginRequest,
     UserSessionResponse,
+    VerifyEmailRequest,
     VoiceMemoryRecallHitResponse,
     VoiceMemoryRecallRequest,
     VoiceMemoryRecallResponse,
 )
 from app.security import (
+    decode_email_verification_token,
     decode_invite_token,
+    decode_password_reset_token,
     decode_session_cookie,
+    decode_two_factor_challenge,
     hash_password,
     invite_expiry,
+    issue_email_verification_token,
     issue_invite_token,
+    issue_password_reset_token,
     issue_session_cookie,
+    issue_two_factor_challenge,
     new_totp_secret,
     session_expiry,
     token_digest,
@@ -174,6 +193,236 @@ async def _issue_session(db: AsyncSession, *, user: AppUser, scope: TenantScope)
     return session
 
 
+def _slug_from_name(name: str, *, suffix: UUID) -> str:
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    base = re.sub(r"[^a-z0-9]+", "-", ascii_name.lower()).strip("-") or "workspace"
+    return f"{base[:60].rstrip('-')}-{str(suffix)[:8]}"
+
+
+def _auth_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _request_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",", maxsplit=1)[0].strip()
+    if forwarded:
+        return forwarded
+    return request.client.host if request.client else "unknown"
+
+
+def _invalid_credentials() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={
+            "code": "invalid_credentials",
+            "message": "We could not sign you in. Check your details and try again.",
+        },
+    )
+
+
+def _invalid_action_token(code: str = "invalid_or_expired") -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "code": code,
+            "message": "This link is invalid, expired, or has already been used.",
+        },
+    )
+
+
+async def _resolve_auth_scope(db: AsyncSession, email: str) -> tuple[TenantScope, UUID] | None:
+    row = (
+        (
+            await db.execute(
+                text(
+                    """
+                    SELECT org_id, department_id, user_id
+                    FROM app.resolve_auth_scope(:email)
+                    """
+                ),
+                {"email": email},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    return (
+        TenantScope(org_id=row["org_id"], department_id=row["department_id"]),
+        row["user_id"],
+    )
+
+
+async def _ensure_login_allowed(db: AsyncSession, *, email: str, request: Request) -> None:
+    email_hash = _auth_hash(email)
+    ip_hash = _auth_hash(_request_ip(request))
+    row = (
+        (
+            await db.execute(
+                text(
+                    """
+                    SELECT blocked_until
+                    FROM app.auth_login_attempts
+                    WHERE email_hash = :email_hash AND ip_hash = :ip_hash
+                    """
+                ),
+                {"email_hash": email_hash, "ip_hash": ip_hash},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row and row["blocked_until"] and row["blocked_until"] > datetime.now(UTC):
+        retry_after = max(1, int((row["blocked_until"] - datetime.now(UTC)).total_seconds()))
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "code": "rate_limited",
+                "message": "Too many sign-in attempts. Try again later.",
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+async def _record_login_failure(db: AsyncSession, *, email: str, request: Request) -> bool:
+    email_hash = _auth_hash(email)
+    ip_hash = _auth_hash(_request_ip(request))
+    now = datetime.now(UTC)
+    row = (
+        (
+            await db.execute(
+                text(
+                    """
+                    SELECT failure_count, last_failed_at, blocked_until
+                    FROM app.auth_login_attempts
+                    WHERE email_hash = :email_hash AND ip_hash = :ip_hash
+                    FOR UPDATE
+                    """
+                ),
+                {"email_hash": email_hash, "ip_hash": ip_hash},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    reset_before = now - timedelta(seconds=settings.auth_lockout_seconds)
+    failure_count = 1
+    if row and row["last_failed_at"] >= reset_before:
+        failure_count = int(row["failure_count"]) + 1
+    blocked_until = None
+    if failure_count >= settings.auth_max_failures:
+        blocked_until = now + timedelta(seconds=settings.auth_lockout_seconds)
+    await db.execute(
+        text(
+            """
+            INSERT INTO app.auth_login_attempts (
+                email_hash, ip_hash, failure_count, last_failed_at, blocked_until
+            ) VALUES (
+                :email_hash, :ip_hash, :failure_count, :last_failed_at, :blocked_until
+            )
+            ON CONFLICT (email_hash, ip_hash) DO UPDATE SET
+                failure_count = EXCLUDED.failure_count,
+                last_failed_at = EXCLUDED.last_failed_at,
+                blocked_until = EXCLUDED.blocked_until
+            """
+        ),
+        {
+            "email_hash": email_hash,
+            "ip_hash": ip_hash,
+            "failure_count": failure_count,
+            "last_failed_at": now,
+            "blocked_until": blocked_until,
+        },
+    )
+    return blocked_until is not None
+
+
+async def _clear_login_failures(db: AsyncSession, *, email: str, request: Request) -> None:
+    await db.execute(
+        text(
+            """
+            DELETE FROM app.auth_login_attempts
+            WHERE email_hash = :email_hash AND ip_hash = :ip_hash
+            """
+        ),
+        {"email_hash": _auth_hash(email), "ip_hash": _auth_hash(_request_ip(request))},
+    )
+
+
+async def _record_failure_and_raise(db: AsyncSession, *, email: str, request: Request) -> None:
+    async with db.begin():
+        blocked = await _record_login_failure(db, email=email, request=request)
+    if blocked:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "code": "rate_limited",
+                "message": "Too many sign-in attempts. Try again later.",
+            },
+            headers={"Retry-After": str(settings.auth_lockout_seconds)},
+        )
+    raise _invalid_credentials()
+
+
+async def _auth_user_response(
+    db: AsyncSession, *, user: AppUser, scope: TenantScope
+) -> AuthUserResponse:
+    organization = await db.get(Organization, scope.org_id)
+    department = await db.get(Department, scope.department_id)
+    if organization is None or department is None:
+        raise _unauthorized()
+    return AuthUserResponse(
+        name=user.display_name,
+        email=user.email,
+        company=organization.name,
+        department=department.login_slug,
+    )
+
+
+def _auth_response(user: AuthUserResponse) -> AuthResponse:
+    return AuthResponse(user=user, redirect_to="/")
+
+
+def _public_action_url(path: str, token: str) -> str:
+    return f"{settings.public_app_url.rstrip('/')}{path}/{quote(token, safe='')}"
+
+
+async def _deliver_email(
+    *,
+    recipient: str,
+    subject: str,
+    heading: str,
+    action_label: str,
+    action_url: str,
+    expiry_text: str,
+) -> EmailDeliveryResult:
+    return await run_in_threadpool(
+        deliver_action_email,
+        settings=settings,
+        recipient=recipient,
+        subject=subject,
+        heading=heading,
+        action_label=action_label,
+        action_url=action_url,
+        expiry_text=expiry_text,
+    )
+
+
+def _browser_development_url(delivery: EmailDeliveryResult) -> str | None:
+    if settings.environment != "development":
+        return None
+    return delivery.development_url
+
+
+def _delivery_response(delivery: EmailDeliveryResult, *, message: str) -> EmailDeliveryResponse:
+    return EmailDeliveryResponse(
+        message=message,
+        delivery=delivery.mode,
+        development_url=_browser_development_url(delivery),
+    )
+
+
 async def authenticated_context(
     request: Request,
     db: DatabaseSession,
@@ -199,7 +448,7 @@ async def authenticated_context(
         ):
             raise _unauthorized()
         user = await db.get(AppUser, claims.user_id)
-        if user is None or not user.is_active:
+        if user is None or not user.is_active or user.email_verified_at is None:
             raise _unauthorized()
         yield AuthenticatedContext(
             session=db,
@@ -299,15 +548,35 @@ async def telnyx_webhook(request: Request, db: DatabaseSession) -> JSONResponse:
     )
 
 
-@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
-async def register(payload: RegisterRequest, db: DatabaseSession) -> Response:
-    """Create an organization, its silent department, and its first Owner atomically."""
+@app.post(
+    "/auth/register",
+    response_model=RegisterResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def register(payload: RegisterRequest, db: DatabaseSession) -> RegisterResponse:
+    """Create the account graph atomically, then send a one-use verification link."""
+
+    async with db.begin():
+        if await _resolve_auth_scope(db, payload.email) is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "account_exists",
+                    "message": "An account already exists for this email address.",
+                },
+            )
 
     org_id = uuid4()
     department_id = uuid4()
     user_id = uuid4()
     membership_id = uuid4()
     scope = TenantScope(org_id=org_id, department_id=department_id)
+    organization_name = (
+        payload.company_name
+        if payload.account_type == "business"
+        else f"{payload.full_name}'s workspace"
+    )
+    verification_token = issue_email_verification_token(user_id=user_id, scope=scope)
 
     async with db.begin():
         await set_tenant_scope(db, scope)
@@ -316,8 +585,10 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> Response:
             id=org_id,
             org_id=org_id,
             department_id=department_id,
-            name=payload.organization_name,
-            login_slug=payload.organization_slug,
+            name=organization_name,
+            login_slug=_slug_from_name(organization_name, suffix=org_id),
+            account_type=payload.account_type,
+            country=payload.country,
         )
         department = Department(
             id=department_id,
@@ -333,8 +604,12 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> Response:
             org_id=org_id,
             department_id=department_id,
             email=payload.email,
-            display_name=payload.display_name,
+            display_name=payload.full_name,
             password_hash=hash_password(payload.password),
+            email_verified_at=None,
+            email_verification_token_digest=token_digest(verification_token),
+            email_verification_expires_at=datetime.now(UTC)
+            + timedelta(seconds=settings.email_verification_ttl_seconds),
         )
         membership = Membership(
             id=membership_id,
@@ -349,7 +624,7 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> Response:
             department_id=department_id,
             membership_id=membership_id,
         )
-        # The organization/default-department FKs are mutually deferred, but
+        # The organisation/default-department FKs are mutually deferred, but
         # user and membership FKs remain immediate. Flush each boundary so the
         # database, not SQLAlchemy insertion order, defines safe creation.
         db.add_all([organization, department])
@@ -360,71 +635,313 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> Response:
         await db.flush()
         db.add(membership_department)
         await db.flush()
-        session = await _issue_session(db, user=user, scope=scope)
 
-    return _response_with_session(
-        AuthResponse(),
-        session,
-        scope,
-        status_code=status.HTTP_201_CREATED,
+    verification_url = _public_action_url("/verify-email", verification_token)
+    delivery = await _deliver_email(
+        recipient=payload.email,
+        subject="Verify your Sonnia account",
+        heading="Verify your email address",
+        action_label="Verify email address",
+        action_url=verification_url,
+        expiry_text="24 hours",
+    )
+    return RegisterResponse(
+        email=payload.email,
+        message="Check your email to verify your account.",
+        delivery=delivery.mode,
+        development_url=_browser_development_url(delivery),
     )
 
 
-@app.post("/auth/login")
-async def login(payload: LoginRequest, db: DatabaseSession) -> Response:
-    """Authenticate into one explicitly granted department.
+@app.post("/auth/resend-verification", response_model=EmailDeliveryResponse)
+async def resend_verification(
+    payload: EmailAddressRequest, db: DatabaseSession
+) -> EmailDeliveryResponse:
+    token: str | None = None
+    recipient: str | None = None
+    async with db.begin():
+        resolved = await _resolve_auth_scope(db, payload.email)
+        if resolved is not None:
+            scope, user_id = resolved
+            await set_tenant_scope(db, scope)
+            user = await db.get(AppUser, user_id)
+            if user is not None and user.is_active and user.email_verified_at is None:
+                token = issue_email_verification_token(user_id=user.id, scope=scope)
+                user.email_verification_token_digest = token_digest(token)
+                user.email_verification_expires_at = datetime.now(UTC) + timedelta(
+                    seconds=settings.email_verification_ttl_seconds
+                )
+                recipient = user.email
+                await db.flush()
 
-    A user may hold grants for more than one department, but each session is
-    intentionally scoped to one grant. Owners do not bypass that boundary.
-    """
+    default_mode = "smtp" if settings.smtp_host else "development"
+    if token is None or recipient is None:
+        return EmailDeliveryResponse(
+            message="If the account still needs verification, a new link has been sent.",
+            delivery=default_mode,
+        )
+    delivery = await _deliver_email(
+        recipient=recipient,
+        subject="Your new Sonnia verification link",
+        heading="Verify your email address",
+        action_label="Verify email address",
+        action_url=_public_action_url("/verify-email", token),
+        expiry_text="24 hours",
+    )
+    return _delivery_response(
+        delivery,
+        message="If the account still needs verification, a new link has been sent.",
+    )
+
+
+@app.post("/auth/verify-email")
+async def verify_email(payload: VerifyEmailRequest, db: DatabaseSession) -> Response:
+    try:
+        claims = decode_email_verification_token(payload.token)
+    except ValueError as exc:
+        raise _invalid_action_token() from exc
 
     async with db.begin():
-        scope_row = (
-            (
-                await db.execute(
-                    text(
-                        """
-                    SELECT org_id, department_id
-                    FROM app.resolve_login_scope(:organization_slug, :department_slug)
-                    """
-                    ),
-                    {
-                        "organization_slug": payload.organization_slug,
-                        "department_slug": payload.department_slug,
+        await set_tenant_scope(db, claims.scope)
+        user = await db.get(AppUser, claims.user_id)
+        if user is None or user.email_verified_at is not None:
+            raise _invalid_action_token("already_used")
+        if (
+            user.email_verification_token_digest is None
+            or user.email_verification_expires_at is None
+            or user.email_verification_expires_at <= datetime.now(UTC)
+            or not hmac.compare_digest(
+                user.email_verification_token_digest,
+                token_digest(payload.token),
+            )
+        ):
+            raise _invalid_action_token()
+        user.email_verified_at = datetime.now(UTC)
+        user.email_verification_token_digest = None
+        user.email_verification_expires_at = None
+        session = await _issue_session(db, user=user, scope=claims.scope)
+        response_user = await _auth_user_response(db, user=user, scope=claims.scope)
+
+    return _response_with_session(_auth_response(response_user), session, claims.scope)
+
+
+@app.post("/auth/login", response_model=None)
+async def login(
+    payload: LoginRequest, request: Request, db: DatabaseSession
+) -> Response | LoginChallengeResponse:
+    """Authenticate by email and silently select the account's primary department."""
+
+    failed = False
+    session: UserSession | None = None
+    response_user: AuthUserResponse | None = None
+    challenge: str | None = None
+    resolved: tuple[TenantScope, UUID] | None = None
+    async with db.begin():
+        await _ensure_login_allowed(db, email=payload.email, request=request)
+        resolved = await _resolve_auth_scope(db, payload.email)
+        if resolved is None:
+            failed = True
+        else:
+            scope, user_id = resolved
+            await set_tenant_scope(db, scope)
+            user = await db.get(AppUser, user_id)
+            membership = await db.scalar(select(Membership).where(Membership.user_id == user_id))
+            grant = None
+            if membership is not None:
+                grant = await db.scalar(
+                    select(MembershipDepartment).where(
+                        MembershipDepartment.membership_id == membership.id,
+                        MembershipDepartment.department_id == scope.department_id,
+                    )
+                )
+            if (
+                user is None
+                or not user.is_active
+                or membership is None
+                or grant is None
+                or not verify_password(payload.password, user.password_hash)
+            ):
+                failed = True
+            elif user.email_verified_at is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "code": "email_unverified",
+                        "message": "Verify your email address before signing in.",
                     },
                 )
+            elif user.totp_enabled:
+                if not user.totp_secret:
+                    failed = True
+                else:
+                    challenge = issue_two_factor_challenge(user_id=user.id, scope=scope)
+                    await _clear_login_failures(db, email=payload.email, request=request)
+            else:
+                session = await _issue_session(db, user=user, scope=scope)
+                response_user = await _auth_user_response(db, user=user, scope=scope)
+                await _clear_login_failures(db, email=payload.email, request=request)
+
+    if failed:
+        await _record_failure_and_raise(db, email=payload.email, request=request)
+    if challenge is not None:
+        return LoginChallengeResponse(challenge_token=challenge)
+    if session is None or response_user is None or resolved is None:
+        raise _invalid_credentials()
+    scope, _ = resolved
+    return _response_with_session(_auth_response(response_user), session, scope)
+
+
+@app.post("/auth/login/2fa")
+async def complete_two_factor_login(
+    payload: TwoFactorLoginRequest, request: Request, db: DatabaseSession
+) -> Response:
+    try:
+        claims = decode_two_factor_challenge(payload.challenge_token)
+    except ValueError as exc:
+        raise _invalid_credentials() from exc
+
+    failed = False
+    email: str | None = None
+    session: UserSession | None = None
+    response_user: AuthUserResponse | None = None
+    async with db.begin():
+        await set_tenant_scope(db, claims.scope)
+        user = await db.get(AppUser, claims.user_id)
+        if user is None:
+            raise _invalid_credentials()
+        email = user.email
+        await _ensure_login_allowed(db, email=email, request=request)
+        membership = await db.scalar(select(Membership).where(Membership.user_id == user.id))
+        grant = None
+        if membership is not None:
+            grant = await db.scalar(
+                select(MembershipDepartment).where(
+                    MembershipDepartment.membership_id == membership.id,
+                    MembershipDepartment.department_id == claims.scope.department_id,
+                )
             )
-            .mappings()
-            .one_or_none()
-        )
-        if scope_row is None:
-            raise _unauthorized()
-        scope = TenantScope(
-            org_id=scope_row["org_id"],
-            department_id=scope_row["department_id"],
-        )
-        await set_tenant_scope(db, scope)
-        user = await db.scalar(select(AppUser).where(AppUser.email == payload.email))
+        if (
+            not user.is_active
+            or user.email_verified_at is None
+            or not user.totp_enabled
+            or not user.totp_secret
+            or membership is None
+            or grant is None
+            or not verify_totp(user.totp_secret, payload.code)
+        ):
+            failed = True
+        else:
+            session = await _issue_session(db, user=user, scope=claims.scope)
+            response_user = await _auth_user_response(db, user=user, scope=claims.scope)
+            await _clear_login_failures(db, email=email, request=request)
+
+    if failed and email is not None:
+        await _record_failure_and_raise(db, email=email, request=request)
+    if failed:
+        raise _invalid_credentials()
+    if session is None or response_user is None:
+        raise _invalid_credentials()
+    return _response_with_session(_auth_response(response_user), session, claims.scope)
+
+
+@app.get("/auth/me", response_model=AuthResponse)
+async def auth_me(context: CurrentContext) -> AuthResponse:
+    user = await _auth_user_response(
+        context.session,
+        user=context.user,
+        scope=context.scope,
+    )
+    return _auth_response(user)
+
+
+@app.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(context: CurrentContext) -> Response:
+    if context.session_id is not None:
+        persisted = await context.session.get(UserSession, context.session_id)
+        if persisted is not None:
+            persisted.revoked_at = datetime.now(UTC)
+            await context.session.flush()
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    response.delete_cookie(
+        settings.session_cookie_name,
+        path="/",
+        secure=settings.secure_cookies,
+        httponly=True,
+        samesite="lax",
+    )
+    return response
+
+
+@app.post("/auth/forgot-password", response_model=EmailDeliveryResponse)
+async def forgot_password(
+    payload: EmailAddressRequest, db: DatabaseSession
+) -> EmailDeliveryResponse:
+    token: str | None = None
+    recipient: str | None = None
+    async with db.begin():
+        resolved = await _resolve_auth_scope(db, payload.email)
+        if resolved is not None:
+            scope, user_id = resolved
+            await set_tenant_scope(db, scope)
+            user = await db.get(AppUser, user_id)
+            if user is not None and user.is_active and user.email_verified_at is not None:
+                token = issue_password_reset_token(user_id=user.id, scope=scope)
+                user.password_reset_token_digest = token_digest(token)
+                user.password_reset_expires_at = datetime.now(UTC) + timedelta(
+                    seconds=settings.password_reset_ttl_seconds
+                )
+                recipient = user.email
+                await db.flush()
+
+    confirmation = "If an account exists for that email, a reset link has been sent."
+    default_mode = "smtp" if settings.smtp_host else "development"
+    if token is None or recipient is None:
+        return EmailDeliveryResponse(message=confirmation, delivery=default_mode)
+    delivery = await _deliver_email(
+        recipient=recipient,
+        subject="Reset your Sonnia password",
+        heading="Reset your password",
+        action_label="Reset password",
+        action_url=_public_action_url("/reset-password", token),
+        expiry_text="1 hour",
+    )
+    return _delivery_response(delivery, message=confirmation)
+
+
+@app.post("/auth/reset-password")
+async def reset_password(payload: ResetPasswordRequest, db: DatabaseSession) -> Response:
+    try:
+        claims = decode_password_reset_token(payload.token)
+    except ValueError as exc:
+        raise _invalid_action_token() from exc
+
+    async with db.begin():
+        await set_tenant_scope(db, claims.scope)
+        user = await db.get(AppUser, claims.user_id)
         if (
             user is None
             or not user.is_active
-            or not verify_password(payload.password, user.password_hash)
+            or user.email_verified_at is None
+            or user.password_reset_token_digest is None
+            or user.password_reset_expires_at is None
+            or user.password_reset_expires_at <= datetime.now(UTC)
+            or not hmac.compare_digest(
+                user.password_reset_token_digest,
+                token_digest(payload.token),
+            )
         ):
-            raise _unauthorized()
-        membership = await db.scalar(select(Membership).where(Membership.user_id == user.id))
-        if membership is None:
-            raise _unauthorized()
-        if user.totp_enabled and (not payload.totp_code or not user.totp_secret):
-            raise _unauthorized()
-        if user.totp_enabled and not verify_totp(user.totp_secret, payload.totp_code or ""):
-            raise _unauthorized()
-        session = await _issue_session(db, user=user, scope=scope)
+            raise _invalid_action_token()
+        user.password_hash = hash_password(payload.new_password)
+        user.password_reset_token_digest = None
+        user.password_reset_expires_at = None
+        await db.execute(
+            text("SELECT app.revoke_user_sessions(:user_id, :org_id)"),
+            {"user_id": user.id, "org_id": claims.scope.org_id},
+        )
+        session = await _issue_session(db, user=user, scope=claims.scope)
+        response_user = await _auth_user_response(db, user=user, scope=claims.scope)
 
-    return _response_with_session(
-        AuthResponse(),
-        session,
-        scope,
-    )
+    return _response_with_session(_auth_response(response_user), session, claims.scope)
 
 
 @app.post("/auth/totp/enroll", response_model=TotpEnrollmentResponse)
@@ -506,6 +1023,7 @@ async def accept_invite(payload: InviteAcceptRequest, db: DatabaseSession) -> Re
             email=invite.email,
             display_name=payload.display_name,
             password_hash=hash_password(payload.password),
+            email_verified_at=datetime.now(UTC),
         )
         membership = Membership(
             id=uuid4(),
@@ -1334,7 +1852,7 @@ async def company_settings(
 ) -> CompanySettingsResponse:
     org = await context.session.get(Organization, context.scope.org_id)
     if org is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organisation not found")
     departments = (
         (
             await context.session.execute(
@@ -1362,7 +1880,7 @@ async def update_company_settings(
     await _require_admin(context)
     org = await context.session.get(Organization, context.scope.org_id)
     if org is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organisation not found")
     if payload.name is not None:
         org.name = payload.name
     if payload.duplicate_call_protection is not None:
@@ -1623,7 +2141,7 @@ async def set_onboarding_state(
 ) -> OnboardingStateResponse:
     org = await context.session.get(Organization, context.scope.org_id)
     if org is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organisation not found")
     org.onboarding_state = payload.state
     await context.session.flush()
     return OnboardingStateResponse(

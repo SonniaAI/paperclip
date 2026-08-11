@@ -22,6 +22,10 @@ const hindsightSchema = await readFile(
   join(here, '..', 'alembic', 'versions', '20260810_hindsight_memory.sql'),
   'utf8',
 )
+const authFlowSchema = await readFile(
+  join(here, '..', 'alembic', 'versions', '20260811_auth_flow.sql'),
+  'utf8',
+)
 
 const db = new PGlite()
 const server = new PGLiteSocketServer({ db, host: '127.0.0.1', port: 0, maxConnections: 10 })
@@ -54,15 +58,22 @@ try {
   await db.exec(featureSchema)
   await db.exec(son419Schema)
   await db.exec(hindsightSchema)
+  await db.exec(authFlowSchema)
   await db.exec(`
     CREATE ROLE manager_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
     CREATE ROLE manager_auth_resolver NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS;
     GRANT USAGE ON SCHEMA public, app TO manager_app;
     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO manager_app;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE app.auth_login_attempts TO manager_app;
     GRANT EXECUTE ON FUNCTION app.resolve_login_scope(text, text) TO manager_app;
+    GRANT EXECUTE ON FUNCTION app.resolve_auth_scope(text) TO manager_app;
+    GRANT EXECUTE ON FUNCTION app.revoke_user_sessions(uuid, uuid) TO manager_app;
     GRANT USAGE ON SCHEMA public, app TO manager_auth_resolver;
-    GRANT SELECT ON TABLE organizations, departments TO manager_auth_resolver;
+    GRANT SELECT ON TABLE organizations, departments, app_users, user_sessions TO manager_auth_resolver;
+    GRANT UPDATE ON TABLE user_sessions TO manager_auth_resolver;
     ALTER FUNCTION app.resolve_login_scope(text, text) OWNER TO manager_auth_resolver;
+    ALTER FUNCTION app.resolve_auth_scope(text) OWNER TO manager_auth_resolver;
+    ALTER FUNCTION app.revoke_user_sessions(uuid, uuid) OWNER TO manager_auth_resolver;
   `)
   await server.start()
   const databaseUrl = `postgresql+asyncpg://manager_app:ignored@${server.getServerConn()}/postgres`

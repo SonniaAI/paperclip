@@ -7,11 +7,17 @@ import pytest
 from app.config import Settings
 from app.database import TenantScope
 from app.security import (
+    decode_email_verification_token,
     decode_invite_token,
+    decode_password_reset_token,
     decode_session_cookie,
+    decode_two_factor_challenge,
     hash_password,
+    issue_email_verification_token,
     issue_invite_token,
+    issue_password_reset_token,
     issue_session_cookie,
+    issue_two_factor_challenge,
     new_totp_secret,
     totp_for_test,
     verify_password,
@@ -65,3 +71,23 @@ def test_signed_invite_carries_only_its_own_tenant_scope(settings: Settings) -> 
     claims = decode_invite_token(token, settings)
     assert claims.scope == scope
     assert claims.email == "member@example.com"
+
+
+def test_user_action_tokens_are_purpose_bound_and_tamper_evident(settings: Settings) -> None:
+    scope = TenantScope(org_id=uuid4(), department_id=uuid4())
+    user_id = uuid4()
+    verification = issue_email_verification_token(
+        user_id=user_id,
+        scope=scope,
+        settings=settings,
+    )
+    reset = issue_password_reset_token(user_id=user_id, scope=scope, settings=settings)
+    two_factor = issue_two_factor_challenge(user_id=user_id, scope=scope, settings=settings)
+
+    assert decode_email_verification_token(verification, settings).user_id == user_id
+    assert decode_password_reset_token(reset, settings).scope == scope
+    assert decode_two_factor_challenge(two_factor, settings).scope == scope
+    with pytest.raises(ValueError):
+        decode_password_reset_token(verification, settings)
+    with pytest.raises(ValueError):
+        decode_email_verification_token(f"{verification}tampered", settings)
