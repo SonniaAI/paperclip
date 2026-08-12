@@ -37,6 +37,8 @@ class TranscriptMemoryPayload:
     facts: tuple[str, ...]
     preferences: tuple[str, ...]
     language_code: str | None
+    speaker: str | None
+    extraction_provenance: str | None
 
     @property
     def has_memory(self) -> bool:
@@ -78,11 +80,27 @@ def extract_transcript_memory(payload: Mapping[str, Any]) -> TranscriptMemoryPay
     )
     language = contact_memory.get("language_code") or body.get("language_code")
     language_code = str(language).strip()[:20] if language else None
+    speaker = _first_text(
+        contact_memory.get("speaker"),
+        contact_memory.get("actor"),
+        body.get("speaker"),
+        body.get("actor"),
+    )
+    extraction_provenance = _first_text(
+        contact_memory.get("extraction_provenance"),
+        contact_memory.get("provenance"),
+        body.get("extraction_provenance"),
+        body.get("provenance"),
+    )
     return TranscriptMemoryPayload(
         transcript_text=transcript_text,
         facts=facts,
         preferences=preferences,
         language_code=language_code or None,
+        # Contact-memory payloads represent caller-attributed source material
+        # unless an upstream transcript processor explicitly says otherwise.
+        speaker=speaker or "caller",
+        extraction_provenance=extraction_provenance or "telnyx.contact_memory.v1",
     )
 
 
@@ -131,6 +149,9 @@ async def dispatch_transcript_memory(
                 call_id=call.id,
                 transcript_id=transcript.id if transcript is not None else None,
                 occurred_at=call.ended_at or call.started_at,
+                source_event_id=event_id,
+                speaker=memory.speaker,
+                extraction_provenance=memory.extraction_provenance,
             ),
         )
 

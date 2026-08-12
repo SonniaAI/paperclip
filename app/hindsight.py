@@ -36,6 +36,7 @@ class HindsightMemoryClient(Protocol):
         document_id: str,
         content: str,
         metadata: Mapping[str, str],
+        tags: Sequence[str] = (),
     ) -> None: ...
 
     async def recall(
@@ -44,7 +45,10 @@ class HindsightMemoryClient(Protocol):
         bank_id: str,
         query: str,
         limit: int,
+        tags: Sequence[str] = (),
     ) -> Sequence[HindsightRecallHit]: ...
+
+    async def delete_bank(self, *, bank_id: str) -> None: ...
 
 
 class HindsightDisabledClient:
@@ -57,8 +61,9 @@ class HindsightDisabledClient:
         document_id: str,
         content: str,
         metadata: Mapping[str, str],
+        tags: Sequence[str] = (),
     ) -> None:
-        del bank_id, document_id, content, metadata
+        del bank_id, document_id, content, metadata, tags
         raise HindsightUnavailableError("Hindsight is not configured")
 
     async def recall(
@@ -67,8 +72,13 @@ class HindsightDisabledClient:
         bank_id: str,
         query: str,
         limit: int,
+        tags: Sequence[str] = (),
     ) -> Sequence[HindsightRecallHit]:
-        del bank_id, query, limit
+        del bank_id, query, limit, tags
+        raise HindsightUnavailableError("Hindsight is not configured")
+
+    async def delete_bank(self, *, bank_id: str) -> None:
+        del bank_id
         raise HindsightUnavailableError("Hindsight is not configured")
 
 
@@ -107,6 +117,7 @@ class HindsightSDKClient:
         document_id: str,
         content: str,
         metadata: Mapping[str, str],
+        tags: Sequence[str] = (),
     ) -> None:
         try:
             await self._client.aretain(
@@ -115,6 +126,7 @@ class HindsightSDKClient:
                 context="Sonnia CRM contact-memory copy",
                 document_id=document_id,
                 metadata=dict(metadata),
+                tags=list(tags),
                 # Hindsight's stable document ID alone is not an overwrite
                 # guarantee.  Explicit replacement makes a delivery retry a
                 # true provider-side upsert rather than another memory copy.
@@ -129,9 +141,17 @@ class HindsightSDKClient:
         bank_id: str,
         query: str,
         limit: int,
+        tags: Sequence[str] = (),
     ) -> Sequence[HindsightRecallHit]:
         try:
-            response = await self._client.arecall(bank_id=bank_id, query=query)
+            options: dict[str, Any] = {"bank_id": bank_id, "query": query}
+            if tags:
+                # The bank is already per-contact.  Strict tags add a second
+                # provider-side boundary so an untagged document cannot be
+                # returned even if a bank were populated incorrectly.
+                options["tags"] = list(tags)
+                options["tags_match"] = "all_strict"
+            response = await self._client.arecall(**options)
         except Exception as exc:  # The caller turns this into a labeled unavailable result.
             raise HindsightUnavailableError("Hindsight recall failed") from exc
 
@@ -155,6 +175,14 @@ class HindsightSDKClient:
             if len(hits) >= limit:
                 break
         return hits
+
+    async def delete_bank(self, *, bank_id: str) -> None:
+        """Erase one contact-only bank without touching deterministic CRM rows."""
+
+        try:
+            await self._client.adelete_bank(bank_id=bank_id)
+        except Exception as exc:
+            raise HindsightUnavailableError("Hindsight customer-memory deletion failed") from exc
 
 
 def configured_hindsight_client(

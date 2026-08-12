@@ -27,7 +27,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app import database
-from app.hindsight import HindsightRecallHit
+from app.hindsight import HindsightRecallHit, HindsightUnavailableError
 
 database.engine = create_async_engine(
     os.environ["MANAGER_DATABASE_URL"],
@@ -60,9 +60,13 @@ class RuntimeHindsight:
 
     def __init__(self) -> None:
         self.retain_calls: list[dict[str, object]] = []
-        self.recall_calls: list[tuple[str, str, int]] = []
+        self.recall_calls: list[tuple[str, str, int, tuple[str, ...]]] = []
+        self.deleted_banks: list[str] = []
+        self.unavailable = False
 
     async def retain(self, **kwargs: object) -> None:
+        if self.unavailable:
+            raise HindsightUnavailableError("synthetic Hindsight outage")
         self.retain_calls.append(kwargs)
 
     async def recall(
@@ -71,16 +75,35 @@ class RuntimeHindsight:
         bank_id: str,
         query: str,
         limit: int,
+        tags: tuple[str, ...] = (),
     ) -> tuple[HindsightRecallHit, ...]:
-        self.recall_calls.append((bank_id, query, limit))
+        if self.unavailable:
+            raise HindsightUnavailableError("synthetic Hindsight outage")
+        self.recall_calls.append((bank_id, query, limit, tags))
+        retained = next(
+            (
+                row
+                for row in reversed(self.retain_calls)
+                if row["bank_id"] == bank_id
+            ),
+            None,
+        )
+        if retained is None:
+            return ()
         return (
             HindsightRecallHit(
-                text="They mentioned a Tuesday tennis league.",
+                text=str(retained["content"]),
                 memory_id="runtime-fuzzy-memory",
-                document_id="runtime-fuzzy-document",
+                document_id=str(retained["document_id"]),
                 confidence=0.81,
             ),
         )
+
+    async def delete_bank(self, *, bank_id: str) -> None:
+        if self.unavailable:
+            raise HindsightUnavailableError("synthetic Hindsight outage")
+        self.deleted_banks.append(bank_id)
+        self.retain_calls = [row for row in self.retain_calls if row["bank_id"] != bank_id]
 
 
 hindsight = RuntimeHindsight()
@@ -297,6 +320,46 @@ async def _contact_memory_counts(org_id: str, event_id: str) -> tuple[int, int, 
             """,
             org_id,
             f"telnyx-transcript:{hashlib.sha256(event_id.encode('utf-8')).hexdigest()}",
+        )
+        assert row is not None
+        return (
+            row["transcript_count"],
+            row["batch_count"],
+            row["entry_count"],
+            row["sync_status"],
+        )
+    finally:
+        connection.terminate()
+
+
+async def _contact_memory_counts_for_source_event(
+    org_id: str, event_id: str
+) -> tuple[int, int, int, str | None]:
+    """Count one attributed memory batch instead of all earlier demo calls."""
+
+    connection = await asyncpg.connect(
+        os.environ["MANAGER_DATABASE_URL"].replace(
+            "postgresql+asyncpg://manager_app:ignored",
+            "postgresql://postgres:postgres",
+        ),
+        ssl=False,
+        statement_cache_size=0,
+    )
+    try:
+        row = await connection.fetchrow(
+            """
+            SELECT
+              count(DISTINCT batch.id)::int AS batch_count,
+              count(DISTINCT batch.transcript_id)::int AS transcript_count,
+              count(entry.id)::int AS entry_count,
+              max(job.status) AS sync_status
+            FROM contact_memory_batches AS batch
+            LEFT JOIN contact_memory_entries AS entry ON entry.batch_id = batch.id
+            LEFT JOIN hindsight_sync_jobs AS job ON job.batch_id = batch.id
+            WHERE batch.org_id = $1 AND batch.source_event_id = $2
+            """,
+            org_id,
+            event_id,
         )
         assert row is not None
         return (
@@ -579,6 +642,8 @@ def _run() -> None:
             json={"token": _token_from_development_url(second_registration)},
         )
         assert second_verification.status_code == 200, second_verification.text
+        owner_b_cookie = client.cookies.get("manager_session")
+        assert owner_b_cookie
 
         org_a_id, department_a_id = asyncio.run(_org_scope("owner-a@example.com"))
         org_b_id, department_b_id = asyncio.run(_org_scope("owner-b@example.com"))
@@ -761,6 +826,14 @@ def _run() -> None:
         assert unrelated_memory.json()["used_hindsight"] is True
         assert unrelated_memory.json()["hindsight_status"] == "returned"
         assert unrelated_memory.json()["fuzzy"][0]["source"] == "hindsight"
+        assert unrelated_memory.json()["fuzzy"][0]["source_event_id"] == event_id
+        assert unrelated_memory.json()["fuzzy"][0]["source_occurred_at"].startswith(
+            "2026-08-09T19:05:00"
+        )
+        assert unrelated_memory.json()["fuzzy"][0]["speaker"] == "caller"
+        assert unrelated_memory.json()["fuzzy"][0]["extraction_provenance"] == (
+            "telnyx.contact_memory.v1"
+        )
         assert len(hindsight.recall_calls) == 1
 
         fuzzy_memory = client.post(
@@ -773,6 +846,160 @@ def _run() -> None:
         assert fuzzy_memory.json()["fuzzy"][0]["source"] == "hindsight"
         assert fuzzy_memory.json()["fuzzy"][0]["label"] == "AI-assisted recall; verify before use."
         assert len(hindsight.recall_calls) == 2
+
+        # SON-551 controlled two-call proof.  Call A stores two distinctive
+        # caller statements.  Call B gets a fuzzy recall with its real source
+        # call/date, while another caller in this org and another org get no
+        # result from the controlled contact's bank.
+        controlled_phone = "+6512345680"
+        second_same_org_phone = "+6512345681"
+        client.post(
+            "/api/contacts/import",
+            json={
+                "filename": "controlled-memory-demo.csv",
+                "columns": ["Name", "Phone"],
+                "rows": [
+                    {
+                        "index": 0,
+                        "values": {"Name": "Controlled Demo Caller", "Phone": controlled_phone},
+                    },
+                    {
+                        "index": 1,
+                        "values": {"Name": "Same Org Other Caller", "Phone": second_same_org_phone},
+                    },
+                ],
+                "mapping": {"display_name": "Name", "phone": "Phone"},
+            },
+        )
+        controlled_contact_id = asyncio.run(_contact_id_by_phone(org_a_id, controlled_phone))
+        same_org_other_contact_id = asyncio.run(
+            _contact_id_by_phone(org_a_id, second_same_org_phone)
+        )
+        controlled_event_id = "evt-son551-controlled-call-a"
+        controlled_call_key = "v3:son551-controlled-call-a"
+        controlled_payload = {
+            "data": {
+                "id": controlled_event_id,
+                "event_type": "call.hangup",
+                "payload": {
+                    "call_control_id": controlled_call_key,
+                    "call_session_id": "son551-controlled-session-a",
+                    "direction": "incoming",
+                    "from_phone_number": controlled_phone,
+                    "to_phone_number": "+6587654321",
+                    "start_time": "2026-08-12T12:00:00Z",
+                    "end_time": "2026-08-12T12:04:00Z",
+                    "contact_memory": {
+                        "transcript": (
+                            "Caller: I prefer calls after 3pm, and our installation launch is "
+                            "in September."
+                        ),
+                        "preferences": ["I prefer calls after 3pm."],
+                        "facts": ["Our installation launch is in September."],
+                        "speaker": "caller",
+                        "extraction_provenance": "controlled-demo-transcript-v1",
+                    },
+                },
+            }
+        }
+        controlled_ingest = client.post(
+            "/webhooks/telnyx",
+            headers={
+                "X-Manager-Org-Id": org_a_id,
+                "X-Manager-Department-Id": department_a_id,
+            },
+            json=controlled_payload,
+        )
+        assert controlled_ingest.status_code == 202, controlled_ingest.text
+        controlled_memory_counts = asyncio.run(
+            _contact_memory_counts_for_source_event(org_a_id, controlled_event_id)
+        )
+        assert controlled_memory_counts == (
+            1,
+            1,
+            2,
+            "delivered",
+        )
+
+        # Use wording with no deterministic token overlap to exercise the
+        # customer-scoped Hindsight prefetch path for follow-up Call B.
+        call_b_recall = client.post(
+            f"/api/voice/contacts/{controlled_contact_id}/memory-recall",
+            json={"query": "When should I ring them?", "limit": 3},
+        )
+        assert call_b_recall.status_code == 200, call_b_recall.text
+        call_b_payload = call_b_recall.json()
+        assert call_b_payload["deterministic"] == []
+        assert call_b_payload["hindsight_status"] == "returned"
+        assert "prefer calls after 3pm" in call_b_payload["fuzzy"][0]["text"].lower()
+        assert call_b_payload["fuzzy"][0]["source_event_id"] == controlled_event_id
+        assert call_b_payload["fuzzy"][0]["source_occurred_at"].startswith(
+            "2026-08-12T12:04:00"
+        )
+        controlled_bank = hindsight.recall_calls[-1][0]
+        assert str(controlled_contact_id) in controlled_bank
+        assert all(
+            tag.startswith("sonnia:") for tag in hindsight.recall_calls[-1][3]
+        )
+
+        same_org_negative = client.post(
+            f"/api/voice/contacts/{same_org_other_contact_id}/memory-recall",
+            json={"query": "When should I ring them?", "limit": 3},
+        )
+        assert same_org_negative.status_code == 200, same_org_negative.text
+        assert same_org_negative.json()["fuzzy"] == []
+        assert same_org_negative.json()["hindsight_status"] == "returned"
+        assert hindsight.recall_calls[-1][0] != controlled_bank
+
+        client.cookies.clear()
+        client.cookies.set("manager_session", owner_b_cookie)
+        cross_org_negative = client.post(
+            f"/api/voice/contacts/{controlled_contact_id}/memory-recall",
+            json={"query": "When should I ring them?", "limit": 3},
+        )
+        assert cross_org_negative.status_code == 404, cross_org_negative.text
+
+        client.cookies.clear()
+        client.cookies.set("manager_session", owner_a_cookie)
+        hindsight.unavailable = True
+        fallback = client.post(
+            f"/api/voice/contacts/{controlled_contact_id}/memory-recall",
+            json={"query": "When should I ring them?", "limit": 3},
+        )
+        assert fallback.status_code == 200, fallback.text
+        assert fallback.json()["fuzzy"] == []
+        assert fallback.json()["hindsight_status"] == "unavailable"
+        # A deterministic CRM query remains healthy during the same outage.
+        deterministic_fallback = client.post(
+            f"/api/voice/contacts/{controlled_contact_id}/memory-recall",
+            json={"query": "September launch", "limit": 3},
+        )
+        assert deterministic_fallback.status_code == 200, deterministic_fallback.text
+        assert deterministic_fallback.json()["deterministic"][0]["source"] == "sonnia_crm"
+        hindsight.unavailable = False
+
+        erased = client.delete(f"/api/contacts/{controlled_contact_id}/memory")
+        assert erased.status_code == 200, erased.text
+        assert erased.json()["deterministic_entries_removed"] == 2
+        assert erased.json()["source_batches_removed"] == 1
+        assert erased.json()["fuzzy_status"] == "deleted"
+        assert controlled_bank in hindsight.deleted_banks
+        repeat_erasure = client.delete(f"/api/contacts/{controlled_contact_id}/memory")
+        assert repeat_erasure.status_code == 200, repeat_erasure.text
+        assert repeat_erasure.json() == {
+            "deterministic_entries_removed": 0,
+            "source_batches_removed": 0,
+            "fuzzy_status": "already_deleted",
+            "attempts": 1,
+        }
+        assert hindsight.deleted_banks.count(controlled_bank) == 1
+        after_erasure = client.post(
+            f"/api/voice/contacts/{controlled_contact_id}/memory-recall",
+            json={"query": "When should I ring them?", "limit": 3},
+        )
+        assert after_erasure.status_code == 200, after_erasure.text
+        assert after_erasure.json()["deterministic"] == []
+        assert after_erasure.json()["fuzzy"] == []
 
         foreign_call_id = asyncio.run(_insert_org_b_call())
         client.cookies.clear()

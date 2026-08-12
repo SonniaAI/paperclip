@@ -133,6 +133,8 @@ Development fallback URLs are never exposed in a production browser response.
   state.
 - `alembic/versions/20260810_hindsight_memory.sql` — tenant-scoped
   deterministic contact-memory batches/entries and retryable Hindsight outbox.
+- `alembic/versions/20260812_son551_customer_memory.sql` — source-event
+  provenance and tenant-scoped contact-only Hindsight deletion jobs.
 - `alembic/versions/20260811_auth_flow.sql` — email-first identity lookup,
   verification/reset state, global email uniqueness, and hashed login-rate
   limits.
@@ -146,6 +148,8 @@ Development fallback URLs are never exposed in a production browser response.
   dispatch, redaction, and voice-agent recall seam; `app/transcript_memory.py`
   is the post-commit Telnyx transcript dispatcher; `app/hindsight.py` wraps the
   optional maintained Hindsight SDK.
+- `docs/hindsight-memory-contract.md` — customer-scoped bank/tag design,
+  deletion semantics, response contract, and browser memory-view behavior.
 - `tests/rls_isolation.mjs`, `tests/feature_data.mjs`,
   `tests/telnyx_ingestion.mjs` — database-level and wire proofs.
 - `tests/son419_migration.mjs` — full-chain migration proof for the SON-419

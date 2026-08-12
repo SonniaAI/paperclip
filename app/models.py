@@ -481,6 +481,12 @@ class ContactMemoryBatch(Base, TenantScoped):
     source_kind: Mapped[str] = mapped_column(String(20), default="manual")
     idempotency_key: Mapped[str] = mapped_column(String(200))
     hindsight_document_id: Mapped[str] = mapped_column(String(200))
+    source_event_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    source_occurred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    speaker: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    extraction_provenance: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_by_user_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
     )
@@ -542,6 +548,46 @@ class HindsightSyncJob(Base, TenantScoped):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ContactMemoryDeletion(Base, TenantScoped):
+    """One contact-only fuzzy-bank erasure request and its durable outcome.
+
+    Deterministic CRM rows are removed in the same transaction that records
+    this job.  Until the provider confirms the bank deletion, recall refuses
+    to ask Hindsight for that contact so stale fuzzy text can never reappear.
+    """
+
+    __tablename__ = "contact_memory_deletions"
+    __table_args__ = (
+        UniqueConstraint(
+            "org_id", "contact_id", name="contact_memory_deletions_contact_key"
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'failed', 'delivered')",
+            name="contact_memory_deletions_status_check",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    org_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("organizations.id"), index=True
+    )
+    contact_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("contacts.id"))
+    hindsight_bank_id: Mapped[str] = mapped_column(String(300))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    attempts: Mapped[int] = mapped_column(default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requested_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
+    )
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

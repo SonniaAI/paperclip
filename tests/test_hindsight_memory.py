@@ -16,6 +16,7 @@ from app.contact_memory import (
     build_hindsight_document,
     deterministic_first_recall,
     hindsight_bank_id,
+    hindsight_scope_tags,
 )
 from app.database import TenantScope
 from app.hindsight import HindsightRecallHit, HindsightSDKClient, HindsightUnavailableError
@@ -25,6 +26,12 @@ MIGRATION_SQL = (ROOT / "alembic/versions/20260810_hindsight_memory.sql").read_t
     encoding="utf-8"
 )
 MIGRATION_PY = (ROOT / "alembic/versions/20260810_hindsight_memory.py").read_text(encoding="utf-8")
+CUSTOMER_MEMORY_SQL = (
+    ROOT / "alembic/versions/20260812_son551_customer_memory.sql"
+).read_text(encoding="utf-8")
+CUSTOMER_MEMORY_PY = (
+    ROOT / "alembic/versions/20260812_son551_customer_memory.py"
+).read_text(encoding="utf-8")
 
 
 class FakeHindsight:
@@ -37,7 +44,7 @@ class FakeHindsight:
         self.hits = hits
         self.unavailable = unavailable
         self.recall_calls: list[tuple[str, str, int]] = []
-        self.retain_calls: list[tuple[str, str, str, dict[str, str]]] = []
+        self.retain_calls: list[tuple[str, str, str, dict[str, str], tuple[str, ...]]] = []
 
     async def retain(
         self,
@@ -46,10 +53,11 @@ class FakeHindsight:
         document_id: str,
         content: str,
         metadata: dict[str, str],
+        tags: tuple[str, ...] = (),
     ) -> None:
         if self.unavailable:
             raise HindsightUnavailableError("provider unavailable")
-        self.retain_calls.append((bank_id, document_id, content, metadata))
+        self.retain_calls.append((bank_id, document_id, content, metadata, tags))
 
     async def recall(
         self,
@@ -57,11 +65,16 @@ class FakeHindsight:
         bank_id: str,
         query: str,
         limit: int,
+        tags: tuple[str, ...] = (),
     ) -> tuple[HindsightRecallHit, ...]:
         self.recall_calls.append((bank_id, query, limit))
         if self.unavailable:
             raise HindsightUnavailableError("provider unavailable")
         return self.hits
+
+    async def delete_bank(self, *, bank_id: str) -> None:
+        if self.unavailable:
+            raise HindsightUnavailableError("provider unavailable")
 
 
 class FakeHindsightSDK:
@@ -72,6 +85,18 @@ class FakeHindsightSDK:
 
     async def aretain(self, **kwargs: object) -> None:
         self.aretain_calls.append(kwargs)
+
+
+class FakeRecallHindsightSDK:
+    def __init__(self, *, timeout: bool = False) -> None:
+        self.timeout = timeout
+        self.arecall_calls: list[dict[str, object]] = []
+
+    async def arecall(self, **kwargs: object) -> list[object]:
+        self.arecall_calls.append(kwargs)
+        if self.timeout:
+            raise TimeoutError("controlled provider timeout")
+        return []
 
 
 def _scope() -> TenantScope:
@@ -199,12 +224,14 @@ async def test_retries_keep_one_stable_hindsight_document_id() -> None:
         document_id=document.document_id,
         content=document.content,
         metadata=document.metadata,
+        tags=document.tags,
     )
     await hindsight.retain(
         bank_id=retry.bank_id,
         document_id=retry.document_id,
         content=retry.content,
         metadata=retry.metadata,
+        tags=retry.tags,
     )
 
     assert document.document_id == retry.document_id
@@ -226,6 +253,7 @@ async def test_sdk_retain_uses_hindsight_replace_mode_for_retry_safe_upserts() -
         document_id="stable-document-id",
         content="redacted contact memory",
         metadata={"contact_id": "contact-1"},
+        tags=("sonnia:contact:contact-1",),
     )
 
     assert sdk.aretain_calls == [
@@ -235,9 +263,57 @@ async def test_sdk_retain_uses_hindsight_replace_mode_for_retry_safe_upserts() -
             "context": "Sonnia CRM contact-memory copy",
             "document_id": "stable-document-id",
             "metadata": {"contact_id": "contact-1"},
+            "tags": ["sonnia:contact:contact-1"],
             "update_mode": "replace",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_sdk_recall_requires_strict_contact_scope_tags() -> None:
+    sdk = FakeRecallHindsightSDK()
+    client = HindsightSDKClient(
+        base_url="https://hindsight.example.test",
+        api_key="test-key",
+        timeout_seconds=10,
+        sdk_client=sdk,
+    )
+
+    result = await client.recall(
+        bank_id="contact-only-bank",
+        query="When should I ring them?",
+        limit=3,
+        tags=("sonnia:org:one", "sonnia:contact:two"),
+    )
+
+    assert result == []
+    assert sdk.arecall_calls == [
+        {
+            "bank_id": "contact-only-bank",
+            "query": "When should I ring them?",
+            "tags": ["sonnia:org:one", "sonnia:contact:two"],
+            "tags_match": "all_strict",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sdk_timeout_becomes_a_safe_unavailable_result() -> None:
+    sdk = FakeRecallHindsightSDK(timeout=True)
+    client = HindsightSDKClient(
+        base_url="https://hindsight.example.test",
+        api_key="test-key",
+        timeout_seconds=10,
+        sdk_client=sdk,
+    )
+
+    with pytest.raises(HindsightUnavailableError, match="Hindsight recall failed"):
+        await client.recall(
+            bank_id="contact-only-bank",
+            query="When should I ring them?",
+            limit=3,
+            tags=("sonnia:contact:two",),
+        )
 
 
 def test_installed_hindsight_sdk_exposes_the_replace_contract() -> None:
@@ -249,9 +325,11 @@ def test_installed_hindsight_sdk_exposes_the_replace_contract() -> None:
 
 
 def test_hindsight_document_includes_memory_and_redacts_direct_contact_data() -> None:
+    scope = _scope()
+    contact_id = uuid4()
     document = build_hindsight_document(
-        scope=_scope(),
-        contact_id=uuid4(),
+        scope=scope,
+        contact_id=contact_id,
         batch_id=uuid4(),
         transcript_text=(
             "Customer: Reach me at alice@example.com or +65 9000 0001. I prefer quarterly calls."
@@ -269,6 +347,8 @@ def test_hindsight_document_includes_memory_and_redacts_direct_contact_data() ->
     assert "+65 9000 0001" not in document.content
     assert document.content.count("[redacted-email]") == 2
     assert document.content.count("[redacted-phone]") == 2
+    assert document.tags == hindsight_scope_tags(scope, contact_id)
+    assert document.tags[-1] == f"sonnia:contact:{contact_id}"
 
 
 @pytest.mark.asyncio
@@ -307,3 +387,22 @@ def test_migration_makes_memory_rows_tenant_scoped_idempotent_and_retryable() ->
     assert "UNIQUE (org_id, batch_id)" in MIGRATION_SQL
     assert "Hindsight unavailable; retry is safe." not in MIGRATION_SQL
     assert 'down_revision = ("20260809_demo_seed", "20260809_son419")' in MIGRATION_PY
+
+
+def test_customer_memory_migration_adds_tenant_scoped_erasure_and_provenance() -> None:
+    definition = CUSTOMER_MEMORY_SQL.split("CREATE TABLE contact_memory_deletions (", 1)[1].split(
+        ");", 1
+    )[0]
+    assert "org_id uuid NOT NULL" in definition
+    assert "department_id uuid NOT NULL" in definition
+    assert "UNIQUE (org_id, contact_id)" in definition
+    assert "ALTER TABLE contact_memory_deletions ENABLE ROW LEVEL SECURITY;" in CUSTOMER_MEMORY_SQL
+    assert "ALTER TABLE contact_memory_deletions FORCE ROW LEVEL SECURITY;" in CUSTOMER_MEMORY_SQL
+    for column in (
+        "source_event_id varchar(200)",
+        "source_occurred_at timestamptz",
+        "speaker varchar(100)",
+        "extraction_provenance varchar(200)",
+    ):
+        assert column in CUSTOMER_MEMORY_SQL
+    assert 'down_revision = "20260811_auth_claims"' in CUSTOMER_MEMORY_PY

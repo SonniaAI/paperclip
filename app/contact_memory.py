@@ -9,21 +9,27 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import TenantScope
-from app.hindsight import HindsightMemoryClient, HindsightRecallHit, HindsightUnavailableError
+from app.hindsight import (
+    HindsightDisabledClient,
+    HindsightMemoryClient,
+    HindsightRecallHit,
+    HindsightUnavailableError,
+)
 from app.models import (
     Call,
     Contact,
     ContactMemoryBatch,
+    ContactMemoryDeletion,
     ContactMemoryEntry,
     HindsightSyncJob,
     Transcript,
@@ -110,6 +116,9 @@ class ContactMemoryWrite:
     call_id: UUID | None = None
     transcript_id: UUID | None = None
     occurred_at: datetime | None = None
+    source_event_id: str | None = None
+    speaker: str | None = None
+    extraction_provenance: str | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +127,11 @@ class DeterministicMemoryEntry:
     kind: MemoryKind
     value: str
     created_at: datetime | None = None
+    source_call_id: UUID | None = None
+    source_event_id: str | None = None
+    source_occurred_at: datetime | None = None
+    speaker: str | None = None
+    extraction_provenance: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +140,7 @@ class HindsightDocument:
     document_id: str
     content: str
     metadata: dict[str, str]
+    tags: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -145,6 +160,21 @@ class HindsightSyncResult:
 
 
 @dataclass(frozen=True)
+class StagedContactMemoryDeletion:
+    deletion_id: UUID
+    deterministic_entries_removed: int
+    source_batches_removed: int
+    hindsight_bank_id: str
+
+
+@dataclass(frozen=True)
+class HindsightDeletionResult:
+    deletion_id: UUID
+    status: Literal["deleted", "failed", "already_deleted"]
+    attempts: int
+
+
+@dataclass(frozen=True)
 class ContactMemoryRecallHit:
     text: str
     source: RecallSource
@@ -154,6 +184,11 @@ class ContactMemoryRecallHit:
     memory_id: str | None = None
     document_id: str | None = None
     confidence: float | None = None
+    source_call_id: UUID | None = None
+    source_event_id: str | None = None
+    source_occurred_at: datetime | None = None
+    speaker: str | None = None
+    extraction_provenance: str | None = None
 
 
 @dataclass(frozen=True)
@@ -180,6 +215,21 @@ def hindsight_bank_id(scope: TenantScope, contact_id: UUID) -> str:
     return f"sonnia-crm-{scope.org_id}-{scope.department_id}-{contact_id}"
 
 
+def hindsight_scope_tags(scope: TenantScope, contact_id: UUID) -> tuple[str, ...]:
+    """Provider-side scope assertions in addition to the contact-only bank.
+
+    These opaque UUID tags contain no direct customer data.  Retain and recall
+    both require all of them, and local document matching below is a final
+    guard against a malformed provider response.
+    """
+
+    return (
+        f"sonnia:org:{scope.org_id}",
+        f"sonnia:department:{scope.department_id}",
+        f"sonnia:contact:{contact_id}",
+    )
+
+
 def hindsight_document_id(batch_id: UUID) -> str:
     """Stable document IDs make post-commit retries safe provider upserts."""
 
@@ -199,6 +249,10 @@ def build_hindsight_document(
     batch_id: UUID,
     transcript_text: str | None,
     entries: Sequence[DeterministicMemoryEntry],
+    source_event_id: str | None = None,
+    source_occurred_at: datetime | None = None,
+    speaker: str | None = None,
+    extraction_provenance: str | None = None,
 ) -> HindsightDocument:
     """Create the redacted provider copy from deterministic source rows."""
 
@@ -219,15 +273,25 @@ def build_hindsight_document(
     content = "\n".join(sections)
     if len(content) > HINDSIGHT_DOCUMENT_MAX_CHARS:
         content = content[: HINDSIGHT_DOCUMENT_MAX_CHARS - 12] + "\n[truncated]"
+    metadata = {
+        "source": "sonnia_crm",
+        "contact_id": str(contact_id),
+        "batch_id": str(batch_id),
+    }
+    if source_event_id:
+        metadata["source_event_id"] = source_event_id
+    if source_occurred_at:
+        metadata["source_occurred_at"] = source_occurred_at.isoformat()
+    if speaker:
+        metadata["speaker"] = speaker
+    if extraction_provenance:
+        metadata["extraction_provenance"] = extraction_provenance
     return HindsightDocument(
         bank_id=hindsight_bank_id(scope, contact_id),
         document_id=hindsight_document_id(batch_id),
         content=content,
-        metadata={
-            "source": "sonnia_crm",
-            "contact_id": str(contact_id),
-            "batch_id": str(batch_id),
-        },
+        metadata=metadata,
+        tags=hindsight_scope_tags(scope, contact_id),
     )
 
 
@@ -274,6 +338,7 @@ async def deterministic_first_recall(
     bank_id: str,
     hindsight: HindsightMemoryClient,
     limit: int = 5,
+    tags: Sequence[str] = (),
 ) -> ContactMemoryRecall:
     """Use Hindsight only when deterministic rows have no relevant answer."""
 
@@ -289,6 +354,11 @@ async def deterministic_first_recall(
                     label="Deterministic CRM record",
                     kind=entry.kind,
                     entry_id=entry.id,
+                    source_call_id=entry.source_call_id,
+                    source_event_id=entry.source_event_id,
+                    source_occurred_at=entry.source_occurred_at,
+                    speaker=entry.speaker,
+                    extraction_provenance=entry.extraction_provenance,
                 )
                 for entry in deterministic
             ),
@@ -297,7 +367,12 @@ async def deterministic_first_recall(
             hindsight_status="not_needed",
         )
     try:
-        fuzzy_hits = await hindsight.recall(bank_id=bank_id, query=query, limit=limit)
+        fuzzy_hits = await hindsight.recall(
+            bank_id=bank_id,
+            query=query,
+            limit=limit,
+            tags=tags,
+        )
     except HindsightUnavailableError:
         return ContactMemoryRecall(
             deterministic=(),
@@ -336,6 +411,17 @@ async def stage_contact_memory(
     if len(facts) + len(preferences) > 50:
         raise ValueError("A contact-memory write may contain at most 50 entries")
     idempotency_key = _normalise_idempotency_key(write.idempotency_key)
+    source_event_id = _normalise_optional_text(
+        write.source_event_id,
+        field="source event ID",
+        max_length=200,
+    )
+    speaker = _normalise_optional_text(write.speaker, field="speaker", max_length=100)
+    extraction_provenance = _normalise_optional_text(
+        write.extraction_provenance,
+        field="extraction provenance",
+        max_length=200,
+    )
 
     if await session.get(Contact, contact_id) is None:
         raise ContactMemoryNotFoundError("Contact not found")
@@ -385,6 +471,10 @@ async def stage_contact_memory(
         source_kind="call_transcript" if transcript_id else "manual",
         idempotency_key=idempotency_key,
         hindsight_document_id=hindsight_document_id(batch_id),
+        source_event_id=source_event_id,
+        source_occurred_at=write.occurred_at,
+        speaker=speaker,
+        extraction_provenance=extraction_provenance,
         created_by_user_id=created_by_user_id,
     )
     job = HindsightSyncJob(
@@ -438,6 +528,16 @@ async def sync_hindsight_batch(
     if job.status == "delivered":
         return HindsightSyncResult(job.id, "already_delivered", job.attempts)
 
+    deletion = await _contact_memory_deletion(session, batch.contact_id)
+    if deletion is not None and deletion.status != "delivered":
+        # A local erasure has committed but the provider has not confirmed it.
+        # Do not re-populate a bank that might still contain the deleted copy.
+        job.attempts += 1
+        job.status = "failed"
+        job.last_error = "Customer-memory deletion is incomplete; retry is safe."
+        await session.flush()
+        return HindsightSyncResult(job.id, "failed", job.attempts)
+
     rows = await session.scalars(
         select(ContactMemoryEntry)
         .where(ContactMemoryEntry.batch_id == batch_id)
@@ -462,6 +562,10 @@ async def sync_hindsight_batch(
         batch_id=batch.id,
         transcript_text=transcript_text,
         entries=entries,
+        source_event_id=batch.source_event_id,
+        source_occurred_at=batch.source_occurred_at,
+        speaker=batch.speaker,
+        extraction_provenance=batch.extraction_provenance,
     )
     try:
         await hindsight.retain(
@@ -469,6 +573,7 @@ async def sync_hindsight_batch(
             document_id=document.document_id,
             content=document.content,
             metadata=document.metadata,
+            tags=document.tags,
         )
     except HindsightUnavailableError:
         job.attempts += 1
@@ -498,27 +603,175 @@ async def recall_contact_memory(
 
     if await session.get(Contact, contact_id) is None:
         raise ContactMemoryNotFoundError("Contact not found")
-    rows = await session.scalars(
-        select(ContactMemoryEntry)
-        .where(ContactMemoryEntry.contact_id == contact_id)
-        .order_by(ContactMemoryEntry.created_at.desc(), ContactMemoryEntry.id.desc())
-    )
+    rows = (
+        await session.execute(
+            select(ContactMemoryEntry, ContactMemoryBatch)
+            .join(ContactMemoryBatch, ContactMemoryEntry.batch_id == ContactMemoryBatch.id)
+            .where(ContactMemoryEntry.contact_id == contact_id)
+            .order_by(ContactMemoryEntry.created_at.desc(), ContactMemoryEntry.id.desc())
+        )
+    ).all()
     entries = tuple(
         DeterministicMemoryEntry(
-            id=row.id,
-            kind=row.kind,
-            value=row.value,
-            created_at=row.created_at,
+            id=entry.id,
+            kind=entry.kind,
+            value=entry.value,
+            created_at=entry.created_at,
+            source_call_id=batch.call_id,
+            source_event_id=batch.source_event_id,
+            source_occurred_at=entry.occurred_at or batch.source_occurred_at,
+            speaker=batch.speaker,
+            extraction_provenance=batch.extraction_provenance,
         )
-        for row in rows
+        for entry, batch in rows
     )
-    return await deterministic_first_recall(
+    deletion = await _contact_memory_deletion(session, contact_id)
+    # A provider erase that has not been acknowledged is an explicit fuzzy
+    # outage for this contact. This prevents stale results from reappearing.
+    recall_client: HindsightMemoryClient = (
+        hindsight
+        if deletion is None or deletion.status == "delivered"
+        else HindsightDisabledClient()
+    )
+    recall = await deterministic_first_recall(
         entries=entries,
         query=query,
         bank_id=hindsight_bank_id(scope, contact_id),
-        hindsight=hindsight,
+        hindsight=recall_client,
         limit=limit,
+        tags=hindsight_scope_tags(scope, contact_id),
     )
+    if not recall.fuzzy:
+        return recall
+
+    # A provider response is eligible only when it names a local document for
+    # this exact contact under the active RLS scope. Bank IDs and tags are both
+    # required at the provider boundary; this is the final local backstop.
+    document_ids = {hit.document_id for hit in recall.fuzzy if hit.document_id}
+    batches: tuple[ContactMemoryBatch, ...] = ()
+    if document_ids:
+        batches = tuple(
+            await session.scalars(
+                select(ContactMemoryBatch).where(
+                    ContactMemoryBatch.contact_id == contact_id,
+                    ContactMemoryBatch.hindsight_document_id.in_(document_ids),
+                )
+            )
+        )
+    provenance_by_document = {batch.hindsight_document_id: batch for batch in batches}
+    fuzzy = tuple(
+        _fuzzy_hit_with_provenance(hit, provenance_by_document[hit.document_id])
+        for hit in recall.fuzzy
+        if hit.document_id is not None and hit.document_id in provenance_by_document
+    )
+    return replace(recall, fuzzy=fuzzy)
+
+
+async def stage_contact_memory_deletion(
+    session: AsyncSession,
+    *,
+    scope: TenantScope,
+    contact_id: UUID,
+    requested_by_user_id: UUID | None = None,
+) -> StagedContactMemoryDeletion:
+    """Delete derived CRM memory and queue the corresponding fuzzy-bank erase.
+
+    Calls, transcripts, and the contact itself remain authoritative CRM data.
+    Until the provider confirms the contact-only bank is gone, fuzzy recall is
+    explicitly unavailable for this contact rather than risking stale text.
+    """
+
+    if await session.get(Contact, contact_id) is None:
+        raise ContactMemoryNotFoundError("Contact not found")
+    deterministic_entries_removed = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(ContactMemoryEntry)
+            .where(ContactMemoryEntry.contact_id == contact_id)
+        )
+        or 0
+    )
+    source_batches_removed = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(ContactMemoryBatch)
+            .where(ContactMemoryBatch.contact_id == contact_id)
+        )
+        or 0
+    )
+    await session.execute(
+        delete(ContactMemoryBatch).where(ContactMemoryBatch.contact_id == contact_id)
+    )
+    bank_id = hindsight_bank_id(scope, contact_id)
+    deletion = await _contact_memory_deletion(session, contact_id)
+    if deletion is None:
+        deletion = ContactMemoryDeletion(
+            id=uuid4(),
+            org_id=scope.org_id,
+            department_id=scope.department_id,
+            contact_id=contact_id,
+            hindsight_bank_id=bank_id,
+            status="pending",
+            requested_by_user_id=requested_by_user_id,
+        )
+        session.add(deletion)
+    else:
+        if deletion.status == "delivered" and source_batches_removed == 0:
+            # A repeated customer erase is idempotent. Do not turn a confirmed
+            # provider deletion back into a failing request just to delete an
+            # already-empty bank. New source batches do re-open the deletion.
+            return StagedContactMemoryDeletion(
+                deletion_id=deletion.id,
+                deterministic_entries_removed=0,
+                source_batches_removed=0,
+                hindsight_bank_id=bank_id,
+            )
+        deletion.hindsight_bank_id = bank_id
+        deletion.status = "pending"
+        deletion.attempts = 0
+        deletion.last_error = None
+        deletion.requested_by_user_id = requested_by_user_id
+        deletion.requested_at = datetime.now(UTC)
+        deletion.delivered_at = None
+    await session.flush()
+    return StagedContactMemoryDeletion(
+        deletion_id=deletion.id,
+        deterministic_entries_removed=deterministic_entries_removed,
+        source_batches_removed=source_batches_removed,
+        hindsight_bank_id=bank_id,
+    )
+
+
+async def sync_hindsight_deletion(
+    session: AsyncSession,
+    *,
+    scope: TenantScope,
+    deletion_id: UUID,
+    hindsight: HindsightMemoryClient,
+) -> HindsightDeletionResult:
+    """Deliver a contact-only fuzzy-bank erase after its CRM deletion commits."""
+
+    deletion = await session.get(ContactMemoryDeletion, deletion_id)
+    if deletion is None:
+        raise ContactMemoryNotFoundError("Contact-memory deletion not found")
+    if deletion.org_id != scope.org_id or deletion.department_id != scope.department_id:
+        raise ContactMemoryNotFoundError("Contact-memory deletion not found")
+    if deletion.status == "delivered":
+        return HindsightDeletionResult(deletion.id, "already_deleted", deletion.attempts)
+    try:
+        await hindsight.delete_bank(bank_id=deletion.hindsight_bank_id)
+    except HindsightUnavailableError:
+        deletion.attempts += 1
+        deletion.status = "failed"
+        deletion.last_error = "Hindsight deletion unavailable; retry is safe."
+        await session.flush()
+        return HindsightDeletionResult(deletion.id, "failed", deletion.attempts)
+    deletion.attempts += 1
+    deletion.status = "delivered"
+    deletion.last_error = None
+    deletion.delivered_at = datetime.now(UTC)
+    await session.flush()
+    return HindsightDeletionResult(deletion.id, "deleted", deletion.attempts)
 
 
 def _fuzzy_hit(hit: HindsightRecallHit) -> ContactMemoryRecallHit:
@@ -532,10 +785,35 @@ def _fuzzy_hit(hit: HindsightRecallHit) -> ContactMemoryRecallHit:
     )
 
 
+def _fuzzy_hit_with_provenance(
+    hit: ContactMemoryRecallHit,
+    batch: ContactMemoryBatch,
+) -> ContactMemoryRecallHit:
+    """Attach only locally verified source provenance to a fuzzy suggestion."""
+
+    return replace(
+        hit,
+        source_call_id=batch.call_id,
+        source_event_id=batch.source_event_id,
+        source_occurred_at=batch.source_occurred_at,
+        speaker=batch.speaker,
+        extraction_provenance=batch.extraction_provenance,
+    )
+
+
 def _safe_fuzzy_text(value: str) -> str:
     """Bound and redact provider output before it reaches a voice/UI consumer."""
 
     return redact_for_hindsight(" ".join(value.split()))[:2_000]
+
+
+async def _contact_memory_deletion(
+    session: AsyncSession,
+    contact_id: UUID,
+) -> ContactMemoryDeletion | None:
+    return await session.scalar(
+        select(ContactMemoryDeletion).where(ContactMemoryDeletion.contact_id == contact_id)
+    )
 
 
 async def _existing_batch(
@@ -625,3 +903,14 @@ def _normalise_idempotency_key(value: str) -> str:
     if len(key) > 200:
         raise ValueError("An idempotency key may not exceed 200 characters")
     return key
+
+
+def _normalise_optional_text(value: str | None, *, field: str, max_length: int) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(value.split())
+    if not normalized:
+        return None
+    if len(normalized) > max_length:
+        raise ValueError(f"{field.capitalize()} may not exceed {max_length} characters")
+    return normalized

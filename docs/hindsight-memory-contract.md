@@ -35,8 +35,18 @@ committed and the job is marked `failed` with a safe retry message.  No source
 text is stored in the outbox or error field.
 
 Each Hindsight bank is scoped to one `(organization, department, contact)`
-combination.  PostgreSQL RLS authorizes the contact before either a write or a
-fallback query is allowed.
+combination; it is never the shared company-agent bank. Every retain also has
+three opaque UUID tags (`org`, `department`, and `contact`). Recall requires
+all three tags strictly, and then admits a fuzzy result only if its document ID
+matches a locally visible batch for that exact contact. PostgreSQL RLS
+authorizes the contact before either a write or a fallback query is allowed.
+An untagged provider result, a document from another contact, and a
+cross-organization contact ID are therefore not displayable by construction.
+
+Each source batch preserves the provider event ID, source call, event time,
+speaker/actor, and extraction-provenance label alongside its deterministic
+rows. Those values are returned as source metadata; fuzzy text is never
+promoted into an exact CRM field.
 
 ## Read path for the voice agent
 
@@ -55,6 +65,55 @@ session's tenant scope and known contact ID:
    back into PostgreSQL.
 4. If Hindsight is unavailable, the result is explicitly `unavailable` rather
    than a fabricated answer or a failed CRM request.
+
+The browser shell exposes this result on `/?view=memory&contact=<UUID>`. It
+renders **CRM memory / Deterministic CRM record** separately from
+**Conversation recall / AI-assisted recall; verify before use.** Each displayed
+hit includes its local source date and source call when present. If the fuzzy
+provider cannot answer, the panel explicitly says that recall is unavailable
+while leaving CRM memory visible.
+
+## Customer-memory deletion
+
+An authenticated Owner or Admin can call
+`DELETE /api/contacts/{contact_id}/memory`. It deletes only derived
+`contact_memory_*` CRM rows for that tenant-scoped contact; the contact, call,
+and transcript source records are not changed. In the same transaction it
+records a durable `contact_memory_deletions` job for that contact-only
+Hindsight bank. The post-commit delivery calls `adelete_bank()`.
+
+If Hindsight is down, local deletion remains complete and the response says
+`fuzzy_status=unavailable`. Recall for that contact refuses any Hindsight
+lookup until the bank erase succeeds, so a stale fuzzy result cannot surface.
+When the provider confirms deletion, a later new call may create a new,
+separately attributed memory batch.
+
+## Public API contract
+
+`POST /api/voice/contacts/{contact_id}/memory-recall`
+
+```json
+{"query":"When should I ring them?","limit":3}
+```
+
+returns separate `deterministic` and `fuzzy` arrays. Every hit has `source`,
+`label`, optional provider IDs, and locally verified `source_call_id`,
+`source_event_id`, `source_occurred_at`, `speaker`, and
+`extraction_provenance`. `hindsight_status` is one of `not_needed`, `returned`,
+or `unavailable`.
+
+`DELETE /api/contacts/{contact_id}/memory` returns count-only deletion receipt:
+
+```json
+{
+  "deterministic_entries_removed": 2,
+  "source_batches_removed": 1,
+  "fuzzy_status": "deleted",
+  "attempts": 1
+}
+```
+
+The receipt deliberately includes no deleted source text.
 
 ## Runtime configuration
 

@@ -19,11 +19,14 @@ from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
+from app import database
 from app.config import get_settings
 from app.contact_memory import (
     ContactMemoryNotFoundError,
     ContactMemoryRecallHit,
     recall_contact_memory,
+    stage_contact_memory_deletion,
+    sync_hindsight_deletion,
 )
 from app.database import TenantScope, get_session, set_tenant_scope
 from app.email_delivery import EmailDeliveryResult, deliver_action_email
@@ -75,6 +78,7 @@ from app.schemas import (
     ContactImportPreviewResponse,
     ContactImportPreviewRow,
     ContactImportSummaryResponse,
+    ContactMemoryDeleteResponse,
     EmailAddressRequest,
     EmailDeliveryResponse,
     InstructionCreateRequest,
@@ -1485,6 +1489,63 @@ def _voice_memory_hit(hit: ContactMemoryRecallHit) -> VoiceMemoryRecallHitRespon
         memory_id=hit.memory_id,
         document_id=hit.document_id,
         confidence=hit.confidence,
+        source_call_id=hit.source_call_id,
+        source_event_id=hit.source_event_id,
+        source_occurred_at=hit.source_occurred_at,
+        speaker=hit.speaker,
+        extraction_provenance=hit.extraction_provenance,
+    )
+
+
+@app.delete(
+    "/api/contacts/{contact_id}/memory",
+    response_model=ContactMemoryDeleteResponse,
+)
+async def delete_contact_memory(
+    contact_id: UUID,
+    context: CurrentContext,
+) -> ContactMemoryDeleteResponse:
+    """Erase one customer's derived CRM memory and its contact-only fuzzy bank.
+
+    An owner or admin is required because this is an irreversible privacy
+    action. The authenticated request transaction stays separate from the
+    post-commit provider call, so no fuzzy deletion can run before the local
+    CRM erase is durable.
+    """
+
+    await _require_admin(context)
+    async with database.SessionFactory() as deletion_session, deletion_session.begin():
+        await set_tenant_scope(deletion_session, context.scope)
+        try:
+            staged = await stage_contact_memory_deletion(
+                deletion_session,
+                scope=context.scope,
+                contact_id=contact_id,
+                requested_by_user_id=context.user.id,
+            )
+        except ContactMemoryNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Contact not found",
+            ) from exc
+    async with database.SessionFactory() as sync_session, sync_session.begin():
+        await set_tenant_scope(sync_session, context.scope)
+        deletion = await sync_hindsight_deletion(
+            sync_session,
+            scope=context.scope,
+            deletion_id=staged.deletion_id,
+            hindsight=configured_hindsight_client(
+                base_url=settings.hindsight_base_url,
+                api_key=settings.hindsight_api_key,
+                timeout_seconds=settings.hindsight_timeout_seconds,
+            ),
+        )
+    fuzzy_status = "unavailable" if deletion.status == "failed" else deletion.status
+    return ContactMemoryDeleteResponse(
+        deterministic_entries_removed=staged.deterministic_entries_removed,
+        source_batches_removed=staged.source_batches_removed,
+        fuzzy_status=fuzzy_status,
+        attempts=deletion.attempts,
     )
 
 

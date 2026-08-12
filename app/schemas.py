@@ -147,6 +147,11 @@ class VoiceMemoryRecallHitResponse(BaseModel):
     memory_id: str | None = None
     document_id: str | None = None
     confidence: float | None = None
+    source_call_id: UUID | None = None
+    source_event_id: str | None = None
+    source_occurred_at: datetime | None = None
+    speaker: str | None = None
+    extraction_provenance: str | None = None
 
 
 class VoiceMemoryRecallResponse(BaseModel):
@@ -154,6 +159,15 @@ class VoiceMemoryRecallResponse(BaseModel):
     fuzzy: list[VoiceMemoryRecallHitResponse] = Field(default_factory=list)
     used_hindsight: bool
     hindsight_status: Literal["not_needed", "returned", "unavailable"]
+
+
+class ContactMemoryDeleteResponse(BaseModel):
+    """A customer-requested erase result without exposing deleted source text."""
+
+    deterministic_entries_removed: int
+    source_batches_removed: int
+    fuzzy_status: Literal["deleted", "unavailable", "already_deleted"]
+    attempts: int
 
 
 class BillingTopUpPlaceholderResponse(BaseModel):

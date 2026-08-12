@@ -24,7 +24,7 @@
           #10251e;
       }
       main {
-        width: min(42rem, calc(100% - 3rem));
+        width: min(56rem, calc(100% - 2rem));
         padding: clamp(2rem, 6vw, 4.5rem);
         border: 1px solid rgba(236, 247, 239, .18);
         border-radius: 1.5rem;
@@ -84,10 +84,126 @@
         color: #90ad9b;
         font-size: .84rem;
       }
+      .memory-view {
+        display: none;
+      }
+      body[data-view="memory"] .landing {
+        display: none;
+      }
+      body[data-view="memory"] .memory-view {
+        display: block;
+      }
+      .back-link {
+        display: inline-block;
+        margin-bottom: 1.5rem;
+        color: #9ee1ba;
+        font-size: .9rem;
+      }
+      .memory-intro {
+        max-width: 48rem;
+        margin: .9rem 0 1.5rem;
+      }
+      .memory-form {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: .7rem;
+        margin: 1.5rem 0;
+      }
+      .memory-form label {
+        display: grid;
+        gap: .4rem;
+        color: #b6d4bf;
+        font-size: .82rem;
+        font-weight: 700;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+      }
+      .memory-form .query-label {
+        grid-column: 1 / -1;
+      }
+      input, button {
+        min-height: 2.8rem;
+        border: 1px solid rgba(236, 247, 239, .22);
+        border-radius: .65rem;
+        font: inherit;
+      }
+      input {
+        width: 100%;
+        padding: .65rem .75rem;
+        color: #f1fff5;
+        background: rgba(8, 28, 20, .76);
+      }
+      button {
+        align-self: end;
+        padding: .65rem 1rem;
+        border-color: #9ee1ba;
+        color: #10251e;
+        background: #9ee1ba;
+        font-weight: 750;
+        cursor: pointer;
+      }
+      button:disabled { cursor: wait; opacity: .7; }
+      .memory-status {
+        min-height: 1.5rem;
+        margin: .2rem 0 1rem;
+        color: #b6d4bf;
+      }
+      .memory-status[data-state="error"] { color: #ffb7b7; }
+      .memory-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem;
+      }
+      .memory-column {
+        min-height: 12rem;
+        padding: 1rem;
+        border: 1px solid rgba(236, 247, 239, .16);
+        border-radius: .9rem;
+        background: rgba(8, 28, 20, .48);
+      }
+      .memory-column h2 {
+        margin: 0 0 .3rem;
+        font-size: 1rem;
+      }
+      .memory-column .label {
+        margin: 0 0 .9rem;
+        color: #9ee1ba;
+        font-size: .75rem;
+        font-weight: 700;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+      }
+      .memory-list {
+        display: grid;
+        gap: .7rem;
+        padding: 0;
+        margin: 0;
+        list-style: none;
+      }
+      .memory-item {
+        padding: .75rem;
+        border-left: 2px solid #9ee1ba;
+        background: rgba(158, 225, 186, .06);
+      }
+      .memory-item p { margin: 0; color: #ecf7ef; font-size: .96rem; line-height: 1.45; }
+      .memory-source { margin-top: .55rem !important; color: #a6c4af !important; font-size: .78rem !important; }
+      .memory-empty { color: #a6c4af; font-size: .92rem; }
+      .memory-unavailable {
+        padding: .75rem;
+        border-left: 2px solid #f7d478;
+        color: #ffe7a4;
+        background: rgba(247, 212, 120, .08);
+        font-size: .92rem;
+        line-height: 1.45;
+      }
+      @media (max-width: 620px) {
+        .memory-form, .memory-grid { grid-template-columns: 1fr; }
+        button { width: 100%; }
+      }
     </style>
   </head>
   <body>
-    <main>
+    <main class="landing">
       <p class="eyebrow">manager.sonnia.ai</p>
       <h1>Phase 1 is online.</h1>
       <p>
@@ -100,19 +216,169 @@
       </div>
       <footer>Recordings and transcripts remain private and are never served from this static site.</footer>
     </main>
+    <main class="memory-view" aria-labelledby="memory-heading">
+      <a class="back-link" href="/">← manager.sonnia.ai</a>
+      <p class="eyebrow">caller memory</p>
+      <h1 id="memory-heading">What we know, kept separate.</h1>
+      <p class="memory-intro">
+        Review a deterministically identified caller before a follow-up conversation. CRM facts
+        remain authoritative; AI-assisted recall is a separate suggestion and must be verified.
+      </p>
+      <form class="memory-form" id="memory-form">
+        <label>
+          Contact ID
+          <input id="contact-id" name="contact" autocomplete="off" required
+            placeholder="Controlled caller UUID" pattern="[0-9a-fA-F-]{36}" />
+        </label>
+        <label class="query-label">
+          Follow-up question
+          <input id="memory-query" name="query" required maxlength="500"
+            value="What should we remember for this caller?" />
+        </label>
+        <button id="memory-submit" type="submit">Check memory</button>
+      </form>
+      <p class="memory-status" id="memory-status" role="status" aria-live="polite">
+        Enter a deterministically identified contact to check their scoped memory.
+      </p>
+      <section class="memory-grid" aria-label="Customer memory results">
+        <article class="memory-column" aria-labelledby="crm-memory-heading">
+          <h2 id="crm-memory-heading">CRM memory</h2>
+          <p class="label">Deterministic CRM record</p>
+          <ul class="memory-list" id="deterministic-memory">
+            <li class="memory-empty">No deterministic result yet.</li>
+          </ul>
+        </article>
+        <article class="memory-column" aria-labelledby="recall-memory-heading">
+          <h2 id="recall-memory-heading">Conversation recall</h2>
+          <p class="label">AI-assisted recall; verify before use.</p>
+          <div id="fuzzy-memory" class="memory-empty">
+            No AI-assisted result requested yet.
+          </div>
+        </article>
+      </section>
+      <footer>
+        Conversation recall is restricted to this caller’s contact-scoped memory bank. It never
+        changes CRM records automatically.
+      </footer>
+    </main>
     <script>
-      (async () => {
-        const status = document.getElementById("api-status");
-        const label = status.querySelector("span:last-child");
-        try {
-          const response = await fetch("/healthz", { cache: "no-store" });
-          if (!response.ok) throw new Error("health check failed");
-          status.dataset.state = "online";
-          label.textContent = "Service online";
-        } catch {
-          status.dataset.state = "offline";
-          label.textContent = "Service temporarily unavailable";
+      (() => {
+        const params = new URLSearchParams(window.location.search);
+        const contactFromUrl = params.get("contact");
+        if (params.get("view") === "memory" || contactFromUrl) {
+          document.body.dataset.view = "memory";
         }
+
+        const status = document.getElementById("api-status");
+        if (status) {
+          const label = status.querySelector("span:last-child");
+          fetch("/healthz", { cache: "no-store" })
+            .then((response) => {
+              if (!response.ok) throw new Error("health check failed");
+              status.dataset.state = "online";
+              label.textContent = "Service online";
+            })
+            .catch(() => {
+              status.dataset.state = "offline";
+              label.textContent = "Service temporarily unavailable";
+            });
+        }
+
+        const form = document.getElementById("memory-form");
+        if (!form) return;
+        const contactInput = document.getElementById("contact-id");
+        const queryInput = document.getElementById("memory-query");
+        const submit = document.getElementById("memory-submit");
+        const memoryStatus = document.getElementById("memory-status");
+        const deterministic = document.getElementById("deterministic-memory");
+        const fuzzy = document.getElementById("fuzzy-memory");
+        if (contactFromUrl) contactInput.value = contactFromUrl;
+
+        const sourceLine = (hit) => {
+          const pieces = [];
+          if (hit.source_occurred_at) {
+            pieces.push(`Source date: ${new Date(hit.source_occurred_at).toLocaleDateString()}`);
+          }
+          if (hit.source_call_id) pieces.push(`Source call: ${hit.source_call_id}`);
+          if (hit.speaker) pieces.push(`Speaker: ${hit.speaker}`);
+          return pieces.join(" · ");
+        };
+        const item = (hit) => {
+          const row = document.createElement("li");
+          row.className = "memory-item";
+          const text = document.createElement("p");
+          text.textContent = hit.text;
+          row.append(text);
+          const source = sourceLine(hit);
+          if (source) {
+            const provenance = document.createElement("p");
+            provenance.className = "memory-source";
+            provenance.textContent = source;
+            row.append(provenance);
+          }
+          return row;
+        };
+        const empty = (node, message) => {
+          node.replaceChildren();
+          const messageNode = document.createElement(node.tagName === "UL" ? "li" : "p");
+          messageNode.className = "memory-empty";
+          messageNode.textContent = message;
+          node.append(messageNode);
+        };
+
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const contactId = contactInput.value.trim();
+          const query = queryInput.value.trim();
+          if (!contactId || !query) return;
+          submit.disabled = true;
+          memoryStatus.dataset.state = "loading";
+          memoryStatus.textContent = "Checking this caller’s scoped memory…";
+          try {
+            const response = await fetch(
+              `/api/voice/contacts/${encodeURIComponent(contactId)}/memory-recall`,
+              {
+                method: "POST",
+                credentials: "same-origin",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ query, limit: 5 }),
+              },
+            );
+            if (response.status === 404) {
+              throw new Error("That contact is unavailable in this workspace.");
+            }
+            if (!response.ok) throw new Error("Memory could not be checked right now.");
+            const result = await response.json();
+            deterministic.replaceChildren();
+            if (result.deterministic.length) {
+              result.deterministic.forEach((hit) => deterministic.append(item(hit)));
+            } else {
+              empty(deterministic, "No matching deterministic CRM record.");
+            }
+            fuzzy.replaceChildren();
+            if (result.hindsight_status === "unavailable") {
+              const unavailable = document.createElement("p");
+              unavailable.className = "memory-unavailable";
+              unavailable.textContent =
+                "AI-assisted recall is unavailable. CRM records are still available above.";
+              fuzzy.append(unavailable);
+            } else if (result.fuzzy.length) {
+              const list = document.createElement("ul");
+              list.className = "memory-list";
+              result.fuzzy.forEach((hit) => list.append(item(hit)));
+              fuzzy.append(list);
+            } else {
+              empty(fuzzy, "No AI-assisted recall found for this caller.");
+            }
+            memoryStatus.dataset.state = "ready";
+            memoryStatus.textContent = "Customer-scoped memory checked.";
+          } catch (error) {
+            memoryStatus.dataset.state = "error";
+            memoryStatus.textContent = error.message;
+          } finally {
+            submit.disabled = false;
+          }
+        });
       })();
     </script>
   </body>
