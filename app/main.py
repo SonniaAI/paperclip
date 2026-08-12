@@ -58,6 +58,7 @@ from app.models import (
     TaskList,
     UserSession,
 )
+from app.phase1_contracts import build_router, preview_contact_csv_upload
 from app.schemas import (
     ActivityFeedEntry,
     ActivityFeedResponse,
@@ -2017,12 +2018,23 @@ async def integrations(
 # -- CSV import ------------------------------------------------------------
 
 
-@app.post("/api/contacts/import/preview", response_model=ContactImportPreviewResponse)
+@app.post("/api/contacts/import/preview", response_model=None)
 async def contact_import_preview(
-    payload: ContactImportPreviewRequest,
+    request: Request,
     context: CurrentContext,
-) -> ContactImportPreviewResponse:
-    """Column mapping inference + dedupe preview without persisting anything."""
+) -> ContactImportPreviewResponse | dict[str, object]:
+    """Preview either the legacy mapped-row payload or the Phase 1 CSV upload."""
+
+    if request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+        return await preview_contact_csv_upload(request, context)
+
+    try:
+        payload = ContactImportPreviewRequest.model_validate(await request.json())
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid contact import preview payload",
+        ) from exc
 
     del context
     row_models = [
@@ -2215,3 +2227,11 @@ def _onboarding_next(state: str) -> str | None:
         "invite": "complete",
         "complete": None,
     }.get(state)
+
+
+# Attach the additive Phase 1 routes after all production routes are declared.
+# The shared preview path stays on the combined handler above so both the
+# deployed JSON contract and the new multipart CSV contract remain available.
+app.include_router(
+    build_router(authenticated_context, include_contact_import_preview=False)
+)

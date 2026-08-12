@@ -30,6 +30,10 @@ const authClaimsSchema = await readFile(
   join(here, '..', 'alembic', 'versions', '20260811_auth_claims.sql'),
   'utf8',
 )
+const phase1ContractSchema = await readFile(
+  join(here, '..', 'alembic', 'versions', '20260811_phase1_campaign_imports.sql'),
+  'utf8',
+)
 
 const db = new PGlite()
 const server = new PGLiteSocketServer({ db, host: '127.0.0.1', port: 0, maxConnections: 10 })
@@ -64,6 +68,7 @@ try {
   await db.exec(hindsightSchema)
   await db.exec(authFlowSchema)
   await db.exec(authClaimsSchema)
+  await db.exec(phase1ContractSchema)
   await db.exec(`
     CREATE ROLE manager_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
     CREATE ROLE manager_auth_resolver NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS;

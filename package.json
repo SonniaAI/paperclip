@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "test:rls": "node tests/rls_isolation.mjs",
+    "test:migration": "node tests/alembic_migration.mjs",
     "test:feature-data": "node tests/feature_data.mjs",
     "test:son419-migration": "node tests/son419_migration.mjs",
     "test:telnyx-ingestion": "node tests/telnyx_ingestion.mjs",

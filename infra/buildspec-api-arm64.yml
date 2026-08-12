@@ -1,0 +1,14 @@
+version: 0.2
+
+# Runs in an ARM CodeBuild container so the public image matches the home
+# Kubernetes nodes. Lambda uses the separate x86 bridge buildspec.
+phases:
+  pre_build:
+    commands:
+      - aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+  build:
+    commands:
+      - docker build --tag "$MANAGER_API_IMAGE:$IMAGE_TAG" .
+  post_build:
+    commands:
+      - docker push "$MANAGER_API_IMAGE:$IMAGE_TAG"

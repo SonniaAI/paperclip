@@ -431,6 +431,69 @@ def _run() -> None:
         owner_a_cookie = client.cookies.get("manager_session")
         assert owner_a_cookie
 
+        # The Phase 1 multipart customer-list and campaign contracts coexist
+        # with the deployed SON-419 JSON import contract on the same app.
+        contact_csv = (
+            b"name,phone,email,company\n"
+            b"Ava Tan,+14155550101,ava@example.test,Northwind Solar\n"
+            b"Broken Row,not-a-phone,broken@example.test,Northwind Solar\n"
+        )
+        preview = client.post(
+            "/api/contacts/import/preview",
+            files={"file": ("contacts.csv", contact_csv, "text/csv")},
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["created"] == 1
+        assert preview.json()["skipped"] == 1
+
+        imported_phase1 = client.post(
+            "/api/imports",
+            files={"file": ("contacts.csv", contact_csv, "text/csv")},
+        )
+        assert imported_phase1.status_code == 201, imported_phase1.text
+        phase1_import_id = imported_phase1.json()["id"]
+        imported_contacts = client.get(f"/api/imports/{phase1_import_id}/contacts")
+        assert imported_contacts.status_code == 200, imported_contacts.text
+        assert len(imported_contacts.json()) == 1
+        phase1_contact_id = imported_contacts.json()[0]["id"]
+
+        campaign = client.post(
+            "/api/campaigns",
+            json={
+                "name": "Northwind introduction",
+                "objective": "Introduce the new service and offer a demonstration.",
+                "target_ids": [phase1_contact_id],
+            },
+        )
+        assert campaign.status_code == 201, campaign.text
+        campaign_id = campaign.json()["id"]
+        assert client.post(f"/api/campaigns/{campaign_id}/launch").status_code == 200
+        assert client.post(f"/api/campaigns/{campaign_id}/pause").status_code == 200
+        assert client.post(f"/api/campaigns/{campaign_id}/pause").status_code == 409
+
+        client.cookies.clear()
+        phase1_tenant_b = client.post(
+            "/auth/register",
+            json={
+                "account_type": "individual",
+                "full_name": "Phase 1 Tenant B",
+                "email": "phase1-tenant-b@example.com",
+                "password": "correct-horse-battery-staple",
+            },
+        )
+        assert phase1_tenant_b.status_code == 201, phase1_tenant_b.text
+        phase1_tenant_b_verification = client.post(
+            "/auth/verify-email",
+            json={"token": _token_from_development_url(phase1_tenant_b)},
+        )
+        assert phase1_tenant_b_verification.status_code == 200
+        assert client.get("/api/imports").json()["total"] == 0
+        assert client.get(f"/api/imports/{phase1_import_id}/contacts").status_code == 404
+        assert client.get(f"/api/campaigns/{campaign_id}").status_code == 404
+
+        client.cookies.clear()
+        client.cookies.set("manager_session", owner_a_cookie)
+
         invite = client.post(
             "/auth/invites",
             json={"email": "member-a@example.com", "role": "member"},
