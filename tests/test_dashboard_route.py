@@ -19,7 +19,7 @@ def test_dashboard_overview_route_registered_with_auth_dependency() -> None:
 
     from app.main import app
 
-    paths = [r.path for r in app.routes]
+    paths = [r.path for r in app.routes if hasattr(r, "path")]
     assert "/api/dashboard/overview" in paths
 
     with TestClient(app, base_url="https://testserver") as client:
