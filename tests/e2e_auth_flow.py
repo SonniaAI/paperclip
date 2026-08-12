@@ -408,12 +408,17 @@ def _run() -> None:
                 "email": "owner-a@example.com",
                 "password": "correct-horse-battery-staple",
                 "company_name": "Org A Solar",
+                "company_size": "2_10",
                 "country": "Singapore",
                 "phone": "+6581234567",
                 "date_of_birth": "1988-05-18",
                 "gender": "prefer_not_to_say",
-                "role": "Founder",
-                "industry": "Solar energy",
+                "role": "owner_founder",
+                "industry": "solar_renewable_energy",
+                "company_website": "https://example.com",
+                "referral_source": "word_of_mouth",
+                "terms_version": "2026-08-12",
+                "marketing_consent": True,
             },
         )
         assert registration.status_code == 201, registration.text
@@ -451,8 +456,15 @@ def _run() -> None:
         assert profile.json()["phone"] == "+6581234567"
         assert profile.json()["date_of_birth"] == "1988-05-18"
         assert profile.json()["gender"] == "prefer_not_to_say"
-        assert profile.json()["role"] == "Founder"
-        assert profile.json()["industry"] == "Solar energy"
+        assert profile.json()["role"] == "owner_founder"
+        assert profile.json()["industry"] == "solar_renewable_energy"
+        assert profile.json()["country"] == "Singapore"
+        assert profile.json()["company_size"] == "2_10"
+        assert profile.json()["company_website"] == "https://example.com"
+        assert profile.json()["referral_source"] == "word_of_mouth"
+        assert profile.json()["terms_version"] == "2026-08-12"
+        assert profile.json()["terms_accepted_at"] is not None
+        assert profile.json()["marketing_consent"] is True
         raced_verification = next(
             response for response in verification_attempts if response.status_code == 400
         )
@@ -554,11 +566,13 @@ def _run() -> None:
                 "full_name": "Phase 1 Tenant B",
                 "email": "phase1-tenant-b@example.com",
                 "password": "correct-horse-battery-staple",
+                "country": "United Kingdom",
                 "phone": "+6580000001",
                 "date_of_birth": "1991-01-02",
-                "gender": "prefer_not_to_say",
-                "role": "Operations manager",
-                "industry": "Professional services",
+                "role": "operations",
+                "industry": "professional_services",
+                "terms_version": "2026-08-12",
+                "marketing_consent": False,
             },
         )
         assert phase1_tenant_b.status_code == 201, phase1_tenant_b.text
@@ -651,11 +665,14 @@ def _run() -> None:
                 "full_name": "Owner B",
                 "email": "owner-b@example.com",
                 "password": "correct-horse-battery-staple",
+                "country": "United Kingdom",
                 "phone": "+447700900123",
                 "date_of_birth": "1990-08-14",
-                "gender": "woman",
-                "role": "Consultant",
-                "industry": "Professional services",
+                "gender": "female",
+                "role": "other",
+                "industry": "professional_services",
+                "terms_version": "2026-08-12",
+                "marketing_consent": False,
             },
         )
         assert second_registration.status_code == 201, second_registration.text

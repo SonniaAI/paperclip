@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime
 from typing import Literal
+from urllib.parse import urlparse
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -18,6 +19,27 @@ def _normalise_email(value: str) -> str:
 
 
 _E164_PHONE = re.compile(r"^\+[1-9]\d{7,14}$")
+
+RegistrationGender = Literal["female", "male", "other", "prefer_not_to_say"]
+RegistrationRole = Literal[
+    "owner_founder", "director_c_level", "sales_manager", "salesperson",
+    "marketing", "operations", "customer_service", "administrator", "other",
+]
+RegistrationIndustry = Literal[
+    "automotive", "beauty_wellness", "construction_trades", "education_training",
+    "energy_utilities", "financial_services", "healthcare_medical",
+    "hospitality_events", "insurance", "legal", "logistics_transport",
+    "manufacturing", "marketing_advertising", "non_profit",
+    "professional_services", "property_real_estate", "recruitment_staffing",
+    "retail_ecommerce", "software_technology", "solar_renewable_energy",
+    "telecommunications", "travel_tourism", "other",
+]
+RegistrationCompanySize = Literal[
+    "just_me", "2_10", "11_50", "51_200", "201_500", "500_plus"
+]
+RegistrationReferralSource = Literal[
+    "search", "social_media", "word_of_mouth", "event", "press", "other"
+]
 
 
 def _normalise_required_text(value: str) -> str:
@@ -40,40 +62,60 @@ class RegisterRequest(BaseModel):
     email: str
     password: str = Field(min_length=10, max_length=512)
     company_name: str | None = Field(default=None, min_length=2, max_length=160)
-    country: str | None = Field(default=None, min_length=2, max_length=80)
+    country: str = Field(min_length=2, max_length=80)
     phone: str = Field(min_length=8, max_length=32)
     date_of_birth: date
-    gender: str = Field(min_length=1, max_length=80)
-    role: str = Field(min_length=1, max_length=120)
-    industry: str = Field(min_length=1, max_length=120)
+    gender: RegistrationGender | None = None
+    role: RegistrationRole
+    industry: RegistrationIndustry
+    company_size: RegistrationCompanySize | None = None
+    company_website: str | None = Field(default=None, max_length=2048)
+    referral_source: RegistrationReferralSource | None = None
+    terms_version: str = Field(min_length=1, max_length=40)
+    marketing_consent: bool
 
     _validate_email = field_validator("email")(_normalise_email)
     _validate_full_name = field_validator("full_name")(_normalise_required_text)
     _validate_phone = field_validator("phone")(_normalise_phone)
-    _validate_gender = field_validator("gender")(_normalise_required_text)
-    _validate_role = field_validator("role")(_normalise_required_text)
-    _validate_industry = field_validator("industry")(_normalise_required_text)
+    _validate_country = field_validator("country")(_normalise_required_text)
+    _validate_terms_version = field_validator("terms_version")(_normalise_required_text)
 
     @field_validator("date_of_birth")
     @classmethod
     def validate_date_of_birth(cls, value: date) -> date:
-        if value >= date.today():
-            raise ValueError("date of birth must be in the past")
+        today = date.today()
+        eighteenth_birthday = value.replace(year=value.year + 18)
+        if eighteenth_birthday > today:
+            raise ValueError("you must be 18 or over to create an account")
         return value
+
+    @field_validator("company_website")
+    @classmethod
+    def validate_company_website(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalised = value.strip()
+        if not normalised:
+            return None
+        parsed = urlparse(normalised)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("company website must be a valid http or https URL")
+        return normalised
 
     @model_validator(mode="after")
     def validate_account_fields(self) -> RegisterRequest:
         self.full_name = self.full_name.strip()
+        self.country = self.country.strip()
+        self.terms_version = self.terms_version.strip()
         if self.account_type == "business":
             if not self.company_name or not self.company_name.strip():
                 raise ValueError("company name is required for a business account")
-            if not self.country or not self.country.strip():
-                raise ValueError("country is required for a business account")
+            if not self.company_size:
+                raise ValueError("company size is required for a business account")
             self.company_name = self.company_name.strip()
-            self.country = self.country.strip()
         else:
             self.company_name = None
-            self.country = None
+            self.company_size = None
         return self
 
 
@@ -392,6 +434,13 @@ class ProfileSettingsResponse(BaseModel):
     gender: str | None = None
     role: str | None = None
     industry: str | None = None
+    country: str | None = None
+    company_size: str | None = None
+    company_website: str | None = None
+    referral_source: str | None = None
+    terms_version: str | None = None
+    terms_accepted_at: datetime | None = None
+    marketing_consent: bool = False
 
 
 class ProfileUpdateRequest(BaseModel):

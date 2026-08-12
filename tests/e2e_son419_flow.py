@@ -51,7 +51,14 @@ def _run() -> None:
                 "email": "owner-419@example.com",
                 "password": "correct-horse-battery-staple",
                 "company_name": "Sonnia 419 Demo",
+                "company_size": "2_10",
                 "country": "United Kingdom",
+                "phone": "+447700900321",
+                "date_of_birth": "1990-01-01",
+                "role": "owner_founder",
+                "industry": "professional_services",
+                "terms_version": "2026-08-12",
+                "marketing_consent": False,
             },
         )
         assert reg.status_code == 201, reg.text

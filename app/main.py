@@ -606,6 +606,9 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> RegisterRes
             login_slug=_slug_from_name(organization_name, suffix=org_id),
             account_type=payload.account_type,
             country=payload.country,
+            company_size=payload.company_size,
+            company_website=payload.company_website,
+            referral_source=payload.referral_source,
         )
         department = Department(
             id=department_id,
@@ -627,6 +630,9 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> RegisterRes
             gender=payload.gender,
             profile_role=payload.role,
             industry=payload.industry,
+            terms_version=payload.terms_version,
+            terms_accepted_at=datetime.now(UTC),
+            marketing_consent=payload.marketing_consent,
             password_hash=hash_password(payload.password),
             email_verified_at=None,
             email_verification_token_digest=token_digest(verification_token),
@@ -2149,6 +2155,13 @@ async def profile_settings(
         gender=context.user.gender,
         role=context.user.profile_role,
         industry=context.user.industry,
+        country=org.country if org else None,
+        company_size=org.company_size if org else None,
+        company_website=org.company_website if org else None,
+        referral_source=org.referral_source if org else None,
+        terms_version=context.user.terms_version,
+        terms_accepted_at=context.user.terms_accepted_at,
+        marketing_consent=context.user.marketing_consent,
     )
 
 

@@ -78,6 +78,9 @@ class Organization(Base, TenantScoped):
         String(10), default="business", server_default="business"
     )
     country: Mapped[str | None] = mapped_column(Text, nullable=True)
+    company_size: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    company_website: Mapped[str | None] = mapped_column(Text, nullable=True)
+    referral_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
     duplicate_call_protection: Mapped[DuplicateCallProtection] = mapped_column(
         DUPLICATE_CALL_PROTECTION_ENUM,
         default=DuplicateCallProtection.WARN,
@@ -178,6 +181,13 @@ class AppUser(Base, TenantScoped):
     gender: Mapped[str | None] = mapped_column(String(80), nullable=True)
     profile_role: Mapped[str | None] = mapped_column(String(120), nullable=True)
     industry: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    terms_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    terms_accepted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    marketing_consent: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     password_hash: Mapped[str] = mapped_column(Text)
     email_verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

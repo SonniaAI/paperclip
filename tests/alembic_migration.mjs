@@ -140,15 +140,34 @@ try {
     SELECT column_name, is_nullable
     FROM information_schema.columns
     WHERE table_name = 'app_users'
-      AND column_name IN ('phone', 'date_of_birth', 'gender', 'profile_role', 'industry')
+      AND column_name IN (
+        'phone', 'date_of_birth', 'gender', 'profile_role', 'industry',
+        'terms_version', 'terms_accepted_at', 'marketing_consent'
+      )
     ORDER BY column_name
   `)
   assert.deepEqual(registrationColumns.rows, [
     { column_name: 'date_of_birth', is_nullable: 'YES' },
     { column_name: 'gender', is_nullable: 'YES' },
     { column_name: 'industry', is_nullable: 'YES' },
+    { column_name: 'marketing_consent', is_nullable: 'NO' },
     { column_name: 'phone', is_nullable: 'YES' },
     { column_name: 'profile_role', is_nullable: 'YES' },
+    { column_name: 'terms_accepted_at', is_nullable: 'YES' },
+    { column_name: 'terms_version', is_nullable: 'YES' },
+  ])
+
+  const organizationColumns = await db.query(`
+    SELECT column_name, is_nullable
+    FROM information_schema.columns
+    WHERE table_name = 'organizations'
+      AND column_name IN ('company_size', 'company_website', 'referral_source')
+    ORDER BY column_name
+  `)
+  assert.deepEqual(organizationColumns.rows, [
+    { column_name: 'company_size', is_nullable: 'YES' },
+    { column_name: 'company_website', is_nullable: 'YES' },
+    { column_name: 'referral_source', is_nullable: 'YES' },
   ])
 
   const authStateAfter = await db.query(`
@@ -182,7 +201,7 @@ try {
   console.log(
     'PASS: Alembic upgraded a populated 20260811_auth_claims PostgreSQL-wire state through ' +
       'the merged campaign/customer-memory lineage to registration v2, preserved historical ' +
-      'data and auth state, created all five nullable profile columns, and reran cleanly.',
+      'data and auth state, created the registration profile/consent columns, and reran cleanly.',
   )
 } finally {
   await server.stop()
