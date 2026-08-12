@@ -19,7 +19,6 @@ from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from app import database
 from app.config import get_settings
 from app.contact_memory import (
     ContactMemoryNotFoundError,
@@ -606,6 +605,9 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> RegisterRes
             login_slug=_slug_from_name(organization_name, suffix=org_id),
             account_type=payload.account_type,
             country=payload.country,
+            company_size=payload.company_size,
+            company_website=payload.company_website,
+            referral_source=payload.referral_source,
         )
         department = Department(
             id=department_id,
@@ -627,6 +629,9 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> RegisterRes
             gender=payload.gender,
             profile_role=payload.role,
             industry=payload.industry,
+            terms_version=payload.terms_version,
+            terms_accepted_at=datetime.now(UTC),
+            marketing_consent=payload.marketing_consent,
             password_hash=hash_password(payload.password),
             email_verified_at=None,
             email_verification_token_digest=token_digest(verification_token),
@@ -1513,38 +1518,34 @@ async def delete_contact_memory(
     """Erase one customer's derived CRM memory and its contact-only fuzzy bank.
 
     An owner or admin is required because this is an irreversible privacy
-    action. The authenticated request transaction stays separate from the
-    post-commit provider call, so no fuzzy deletion can run before the local
-    CRM erase is durable.
+    action. The authenticated request transaction is the durable unit for both
+    the local CRM erase and its provider-deletion receipt.
     """
 
     await _require_admin(context)
-    async with database.SessionFactory() as deletion_session, deletion_session.begin():
-        await set_tenant_scope(deletion_session, context.scope)
-        try:
-            staged = await stage_contact_memory_deletion(
-                deletion_session,
-                scope=context.scope,
-                contact_id=contact_id,
-                requested_by_user_id=context.user.id,
-            )
-        except ContactMemoryNotFoundError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Contact not found",
-            ) from exc
-    async with database.SessionFactory() as sync_session, sync_session.begin():
-        await set_tenant_scope(sync_session, context.scope)
-        deletion = await sync_hindsight_deletion(
-            sync_session,
+    try:
+        staged = await stage_contact_memory_deletion(
+            context.session,
             scope=context.scope,
-            deletion_id=staged.deletion_id,
-            hindsight=configured_hindsight_client(
-                base_url=settings.hindsight_base_url,
-                api_key=settings.hindsight_api_key,
-                timeout_seconds=settings.hindsight_timeout_seconds,
-            ),
+            contact_id=contact_id,
+            requested_by_user_id=context.user.id,
         )
+    except ContactMemoryNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Contact not found",
+        ) from exc
+    await context.session.flush()
+    deletion = await sync_hindsight_deletion(
+        context.session,
+        scope=context.scope,
+        deletion_id=staged.deletion_id,
+        hindsight=configured_hindsight_client(
+            base_url=settings.hindsight_base_url,
+            api_key=settings.hindsight_api_key,
+            timeout_seconds=settings.hindsight_timeout_seconds,
+        ),
+    )
     fuzzy_status = "unavailable" if deletion.status == "failed" else deletion.status
     return ContactMemoryDeleteResponse(
         deterministic_entries_removed=staged.deterministic_entries_removed,
@@ -2149,6 +2150,13 @@ async def profile_settings(
         gender=context.user.gender,
         role=context.user.profile_role,
         industry=context.user.industry,
+        country=org.country if org else None,
+        company_size=org.company_size if org else None,
+        company_website=org.company_website if org else None,
+        referral_source=org.referral_source if org else None,
+        terms_version=context.user.terms_version,
+        terms_accepted_at=context.user.terms_accepted_at,
+        marketing_consent=context.user.marketing_consent,
     )
 
 

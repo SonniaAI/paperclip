@@ -38,6 +38,10 @@ const customerMemorySchema = await readFile(
   join(here, '..', 'alembic', 'versions', '20260812_son551_customer_memory.sql'),
   'utf8',
 )
+const registrationV2Schema = await readFile(
+  join(here, '..', 'alembic', 'versions', '20260812_registration_v2.sql'),
+  'utf8',
+)
 
 const db = new PGlite()
 const server = new PGLiteSocketServer({ db, host: '127.0.0.1', port: 0, maxConnections: 10 })
@@ -74,6 +78,7 @@ try {
   await db.exec(authClaimsSchema)
   await db.exec(phase1ContractSchema)
   await db.exec(customerMemorySchema)
+  await db.exec(registrationV2Schema)
   await db.exec(`
     CREATE ROLE manager_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
     CREATE ROLE manager_auth_resolver NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS;

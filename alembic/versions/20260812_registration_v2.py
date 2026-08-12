@@ -1,7 +1,7 @@
 """Persist the v2 registration profile fields.
 
 Revision ID: 20260812_registration_v2
-Revises: 20260812_son551_customer_memory
+Revises: 20260812_merge_son551_campaigns
 Create Date: 2026-08-12
 """
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from alembic import context, op
 
 revision = "20260812_registration_v2"
-down_revision = "20260812_son551_customer_memory"
+down_revision = "20260812_merge_son551_campaigns"
 branch_labels = None
 depends_on = None
 
@@ -28,11 +28,18 @@ def upgrade() -> None:
 def downgrade() -> None:
     sql = """
         ALTER TABLE app_users
+            DROP COLUMN IF EXISTS marketing_consent,
+            DROP COLUMN IF EXISTS terms_accepted_at,
+            DROP COLUMN IF EXISTS terms_version,
             DROP COLUMN IF EXISTS industry,
             DROP COLUMN IF EXISTS profile_role,
             DROP COLUMN IF EXISTS gender,
             DROP COLUMN IF EXISTS date_of_birth,
             DROP COLUMN IF EXISTS phone;
+        ALTER TABLE organizations
+            DROP COLUMN IF EXISTS referral_source,
+            DROP COLUMN IF EXISTS company_website,
+            DROP COLUMN IF EXISTS company_size;
     """
     if context.is_offline_mode():
         op.execute(sql.rstrip().removesuffix(";"))

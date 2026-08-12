@@ -127,7 +127,7 @@ try {
 
   await runAlembic(databaseUrl)
   versions = await db.query('SELECT version_num FROM alembic_version ORDER BY version_num')
-  assert.deepEqual(versions.rows, [{ version_num: '20260812_merge_son551_campaigns' }])
+  assert.deepEqual(versions.rows, [{ version_num: '20260812_registration_v2' }])
 
   const historicalImportAfter = await db.query(`
     SELECT filename, column_count, row_count, created_count, merged_count, skipped_count
@@ -135,6 +135,40 @@ try {
     WHERE id = '00000000-0000-0000-0000-0000000000b5'
   `)
   assert.deepEqual(historicalImportAfter.rows, historicalImportBefore.rows)
+
+  const registrationColumns = await db.query(`
+    SELECT column_name, is_nullable
+    FROM information_schema.columns
+    WHERE table_name = 'app_users'
+      AND column_name IN (
+        'phone', 'date_of_birth', 'gender', 'profile_role', 'industry',
+        'terms_version', 'terms_accepted_at', 'marketing_consent'
+      )
+    ORDER BY column_name
+  `)
+  assert.deepEqual(registrationColumns.rows, [
+    { column_name: 'date_of_birth', is_nullable: 'YES' },
+    { column_name: 'gender', is_nullable: 'YES' },
+    { column_name: 'industry', is_nullable: 'YES' },
+    { column_name: 'marketing_consent', is_nullable: 'NO' },
+    { column_name: 'phone', is_nullable: 'YES' },
+    { column_name: 'profile_role', is_nullable: 'YES' },
+    { column_name: 'terms_accepted_at', is_nullable: 'YES' },
+    { column_name: 'terms_version', is_nullable: 'YES' },
+  ])
+
+  const organizationColumns = await db.query(`
+    SELECT column_name, is_nullable
+    FROM information_schema.columns
+    WHERE table_name = 'organizations'
+      AND column_name IN ('company_size', 'company_website', 'referral_source')
+    ORDER BY column_name
+  `)
+  assert.deepEqual(organizationColumns.rows, [
+    { column_name: 'company_size', is_nullable: 'YES' },
+    { column_name: 'company_website', is_nullable: 'YES' },
+    { column_name: 'referral_source', is_nullable: 'YES' },
+  ])
 
   const authStateAfter = await db.query(`
     SELECT
@@ -163,11 +197,11 @@ try {
   // A second head run is a no-op, matching the managed migration Job retry.
   await runAlembic(databaseUrl)
   versions = await db.query('SELECT version_num FROM alembic_version ORDER BY version_num')
-  assert.deepEqual(versions.rows, [{ version_num: '20260812_merge_son551_campaigns' }])
+  assert.deepEqual(versions.rows, [{ version_num: '20260812_registration_v2' }])
   console.log(
-    'PASS: Alembic upgraded a populated 20260811_auth_claims PostgreSQL-wire state to ' +
-      'the merged campaign/customer-memory head, preserved historical data and auth state, and ' +
-      'reran cleanly.',
+    'PASS: Alembic upgraded a populated 20260811_auth_claims PostgreSQL-wire state through ' +
+      'the merged campaign/customer-memory lineage to registration v2, preserved historical ' +
+      'data and auth state, created the registration profile/consent columns, and reran cleanly.',
   )
 } finally {
   await server.stop()
