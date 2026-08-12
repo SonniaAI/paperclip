@@ -7,8 +7,8 @@ import re
 import unicodedata
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from datetime import UTC, date, datetime, timedelta
+from typing import Annotated, Any
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -158,6 +158,18 @@ def _unauthorized() -> HTTPException:
 
 def _forbidden() -> HTTPException:
     return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not permitted")
+
+
+def _sentiment_score(value: str | None) -> float | None:
+    return {"positive": 0.55, "neutral": 0.0, "negative": -0.55}.get(value or "")
+
+
+def _duration_label(seconds: int | float | None) -> str:
+    if not seconds:
+        return "0m"
+    minutes = int(seconds) // 60
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
 def _response_with_session(
@@ -1112,6 +1124,297 @@ async def accept_invite(payload: InviteAcceptRequest, db: DatabaseSession) -> Re
         claims.scope,
     )
 
+
+async def _call_stats_payload(
+    context: AuthenticatedContext,
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> dict[str, Any]:
+    filters = {"start_date": start_date, "end_date": end_date}
+    totals = (
+        (
+            await context.session.execute(
+                text(
+                    """
+                SELECT
+                    COUNT(*)::integer AS total_calls,
+                    COUNT(*) FILTER (WHERE c.status = 'completed')::integer AS answered_calls,
+                    COALESCE(SUM(EXTRACT(EPOCH FROM c.ended_at - c.started_at)), 0)::integer
+                        AS total_duration,
+                    COALESCE(
+                        AVG(EXTRACT(EPOCH FROM c.ended_at - c.started_at))
+                            FILTER (WHERE c.status = 'completed'),
+                        0
+                    )::integer AS avg_duration,
+                    AVG(
+                        CASE summary.sentiment
+                            WHEN 'positive' THEN 0.55
+                            WHEN 'negative' THEN -0.55
+                            WHEN 'neutral' THEN 0.0
+                            ELSE NULL
+                        END
+                    ) AS avg_sentiment,
+                    COUNT(*) FILTER (WHERE summary.outcome = 'voicemail')::integer
+                        AS voicemail_calls,
+                    COUNT(*) FILTER (WHERE c.status = 'failed')::integer AS failed_calls
+                FROM calls AS c
+                LEFT JOIN call_summaries AS summary ON summary.call_id = c.id
+                WHERE (CAST(:start_date AS date) IS NULL
+                       OR COALESCE(c.started_at, c.created_at)::date >= CAST(:start_date AS date))
+                  AND (CAST(:end_date AS date) IS NULL
+                       OR COALESCE(c.started_at, c.created_at)::date <= CAST(:end_date AS date))
+                """
+                ),
+                filters,
+            )
+        )
+        .mappings()
+        .one()
+    )
+    trend_rows = (
+        (
+            await context.session.execute(
+                text(
+                    """
+                SELECT
+                    date_trunc('day', COALESCE(c.started_at, c.created_at)) AS day,
+                    COUNT(*)::integer AS total,
+                    COUNT(*) FILTER (WHERE c.status = 'completed')::integer AS answered,
+                    COALESCE(
+                        AVG(EXTRACT(EPOCH FROM c.ended_at - c.started_at))
+                            FILTER (WHERE c.status = 'completed'),
+                        0
+                    )::integer AS avg_duration,
+                    AVG(
+                        CASE summary.sentiment
+                            WHEN 'positive' THEN 0.55
+                            WHEN 'negative' THEN -0.55
+                            WHEN 'neutral' THEN 0.0
+                            ELSE NULL
+                        END
+                    ) AS avg_sentiment
+                FROM calls AS c
+                LEFT JOIN call_summaries AS summary ON summary.call_id = c.id
+                WHERE (CAST(:start_date AS date) IS NULL
+                       OR COALESCE(c.started_at, c.created_at)::date >= CAST(:start_date AS date))
+                  AND (CAST(:end_date AS date) IS NULL
+                       OR COALESCE(c.started_at, c.created_at)::date <= CAST(:end_date AS date))
+                GROUP BY day
+                ORDER BY day DESC
+                LIMIT 7
+                """
+                ),
+                filters,
+            )
+        )
+        .mappings()
+        .all()
+    )
+    trend_rows = list(reversed(trend_rows))
+    labels = [row["day"].strftime("%b %-d") for row in trend_rows]
+    answer_rates = [
+        round(100 * row["answered"] / row["total"], 1) if row["total"] else 0.0
+        for row in trend_rows
+    ]
+    return {
+        "total_calls": totals["total_calls"],
+        "answered_calls": totals["answered_calls"],
+        "total_duration": totals["total_duration"],
+        "avg_duration": totals["avg_duration"],
+        "avg_sentiment": float(totals["avg_sentiment"])
+        if totals["avg_sentiment"] is not None
+        else None,
+        "voicemail_calls": totals["voicemail_calls"],
+        "failed_calls": totals["failed_calls"],
+        "busy_calls": 0,
+        "answer_rate_trend": [
+            {"label": label, "value": rate}
+            for label, rate in zip(labels, answer_rates, strict=True)
+        ],
+        "call_count_trend": [
+            {"label": label, "value": row["total"]}
+            for label, row in zip(labels, trend_rows, strict=True)
+        ],
+        "avg_duration_trend": [
+            {"label": label, "value": row["avg_duration"]}
+            for label, row in zip(labels, trend_rows, strict=True)
+        ],
+        "sentiment_trend": [
+            {"label": label, "value": float(row["avg_sentiment"] or 0.0)}
+            for label, row in zip(labels, trend_rows, strict=True)
+        ],
+        "previous_answer_rate": None,
+        "previous_total_calls": None,
+        "previous_avg_duration": None,
+        "previous_avg_sentiment": None,
+        "weeks_compared": 1,
+    }
+
+
+@app.get("/api/dashboard/overview")
+async def dashboard_overview(
+    context: CurrentContext,
+    period: str = "today",
+) -> dict[str, Any]:
+    valid_periods = {"hour", "today", "week", "month"}
+    if period not in valid_periods:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid period"
+        )
+    now = datetime.now(UTC)
+    start = {
+        "hour": now.date(),
+        "today": now.date(),
+        "week": (now - timedelta(days=7)).date(),
+        "month": now.replace(day=1).date(),
+    }[period]
+    stats = await _call_stats_payload(context, start_date=start)
+    outcome_rows = (
+        (
+            await context.session.execute(
+                text(
+                    """
+                SELECT COALESCE(summary.outcome, c.status) AS outcome, COUNT(*)::integer AS value
+                FROM calls AS c
+                LEFT JOIN call_summaries AS summary ON summary.call_id = c.id
+                WHERE COALESCE(c.started_at, c.created_at)::date >= :start_date
+                GROUP BY COALESCE(summary.outcome, c.status)
+                ORDER BY value DESC
+                """
+                ),
+                {"start_date": start},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    follow_up = (
+        (
+            await context.session.execute(
+                text(
+                    """
+                SELECT
+                    COUNT(*)::integer AS total,
+                    COUNT(*) FILTER (WHERE status = 'scheduled')::integer AS scheduled,
+                    COUNT(*) FILTER (WHERE status = 'completed')::integer AS completed
+                FROM follow_ups
+                """
+                )
+            )
+        )
+        .mappings()
+        .one()
+    )
+    needs_rows = (
+        (
+            await context.session.execute(
+                text(
+                    """
+                SELECT contact.display_name, follow_up.notes, follow_up.scheduled_for
+                FROM follow_ups AS follow_up
+                JOIN contacts AS contact ON contact.id = follow_up.contact_id
+                WHERE follow_up.status = 'scheduled'
+                ORDER BY follow_up.scheduled_for ASC
+                LIMIT 3
+                """
+                )
+            )
+        )
+        .mappings()
+        .all()
+    )
+    total = stats["total_calls"]
+    answered = stats["answered_calls"]
+    calls_over_time = [
+        {
+            "label": point["label"],
+            "connected": int(round(point["value"] * rate / 100)),
+            "no_answer": point["value"] - int(round(point["value"] * rate / 100)),
+            "other": 0,
+        }
+        for point, rate in zip(
+            stats["call_count_trend"],
+            [point["value"] for point in stats["answer_rate_trend"]],
+            strict=True,
+        )
+    ]
+    return {
+        "right_now": {
+            "mode": "idle",
+            "headline": "Ready for the next conversation",
+            "detail": "No call is in progress.",
+            "next_dial_at": None,
+        },
+        "narrative": {
+            "summary": (
+                f"{total} conversations in this period; {answered} reached a completed outcome."
+            ),
+            "period_label": period.title(),
+        },
+        "metrics": [
+            {"label": "Conversations", "value": str(total), "delta": None},
+            {"label": "Completed", "value": str(answered), "delta": None},
+            {
+                "label": "Talk time",
+                "value": _duration_label(stats["total_duration"]),
+                "delta": None,
+            },
+            {
+                "label": "Average sentiment",
+                "value": f"{stats['avg_sentiment']:+.2f}"
+                if stats["avg_sentiment"] is not None
+                else "—",
+                "delta": None,
+            },
+        ],
+        "charts": {
+            "calls_over_time": calls_over_time,
+            "outcomes": [
+                {"label": str(row["outcome"]).replace("_", " ").title(), "value": row["value"]}
+                for row in outcome_rows
+            ],
+            "connect_rate_by_hour": [
+                {"label": point["label"], "rate": point["value"], "total": count["value"]}
+                for point, count in zip(
+                    stats["answer_rate_trend"], stats["call_count_trend"], strict=True
+                )
+            ],
+            "follow_up_funnel": [
+                {"label": "Created", "value": follow_up["total"]},
+                {"label": "Scheduled", "value": follow_up["scheduled"]},
+                {"label": "Completed", "value": follow_up["completed"]},
+            ],
+            "talk_time": {
+                "answered": _duration_label(stats["total_duration"]),
+                "total": _duration_label(stats["total_duration"]),
+                "avg": _duration_label(stats["avg_duration"]),
+                "active": False,
+            },
+            "sentiment_trend": stats["sentiment_trend"],
+        },
+        "needs_you": [
+            {
+                "kind": "task",
+                "who": row["display_name"],
+                "what": row["notes"] or "A follow-up is ready to review.",
+                "when": row["scheduled_for"].strftime("%b %-d, %H:%M"),
+                "action": "Review",
+            }
+            for row in needs_rows
+        ],
+        "observation": {
+            "summary": (
+                f"{answered} completed conversations are available for review in this period."
+            ),
+            "call_ids": [],
+            "period_label": period.title(),
+        }
+        if total
+        else None,
+        "period": period,
+        "generated_at": now,
+    }
 
 @app.get("/api/calls/{call_id}", response_model=CallResponse)
 async def get_call(
