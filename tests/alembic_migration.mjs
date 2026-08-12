@@ -127,7 +127,7 @@ try {
 
   await runAlembic(databaseUrl)
   versions = await db.query('SELECT version_num FROM alembic_version ORDER BY version_num')
-  assert.deepEqual(versions.rows, [{ version_num: '20260811_phase1_campaign_imports' }])
+  assert.deepEqual(versions.rows, [{ version_num: '20260812_merge_son551_campaigns' }])
 
   const historicalImportAfter = await db.query(`
     SELECT filename, column_count, row_count, created_count, merged_count, skipped_count
@@ -163,10 +163,10 @@ try {
   // A second head run is a no-op, matching the managed migration Job retry.
   await runAlembic(databaseUrl)
   versions = await db.query('SELECT version_num FROM alembic_version ORDER BY version_num')
-  assert.deepEqual(versions.rows, [{ version_num: '20260811_phase1_campaign_imports' }])
+  assert.deepEqual(versions.rows, [{ version_num: '20260812_merge_son551_campaigns' }])
   console.log(
     'PASS: Alembic upgraded a populated 20260811_auth_claims PostgreSQL-wire state to ' +
-      '20260811_phase1_campaign_imports, preserved historical data and auth state, and ' +
+      'the merged campaign/customer-memory head, preserved historical data and auth state, and ' +
       'reran cleanly.',
   )
 } finally {
