@@ -19,7 +19,6 @@ from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from app import database
 from app.config import get_settings
 from app.contact_memory import (
     ContactMemoryNotFoundError,
@@ -1519,38 +1518,34 @@ async def delete_contact_memory(
     """Erase one customer's derived CRM memory and its contact-only fuzzy bank.
 
     An owner or admin is required because this is an irreversible privacy
-    action. The authenticated request transaction stays separate from the
-    post-commit provider call, so no fuzzy deletion can run before the local
-    CRM erase is durable.
+    action. The authenticated request transaction is the durable unit for both
+    the local CRM erase and its provider-deletion receipt.
     """
 
     await _require_admin(context)
-    async with database.SessionFactory() as deletion_session, deletion_session.begin():
-        await set_tenant_scope(deletion_session, context.scope)
-        try:
-            staged = await stage_contact_memory_deletion(
-                deletion_session,
-                scope=context.scope,
-                contact_id=contact_id,
-                requested_by_user_id=context.user.id,
-            )
-        except ContactMemoryNotFoundError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Contact not found",
-            ) from exc
-    async with database.SessionFactory() as sync_session, sync_session.begin():
-        await set_tenant_scope(sync_session, context.scope)
-        deletion = await sync_hindsight_deletion(
-            sync_session,
+    try:
+        staged = await stage_contact_memory_deletion(
+            context.session,
             scope=context.scope,
-            deletion_id=staged.deletion_id,
-            hindsight=configured_hindsight_client(
-                base_url=settings.hindsight_base_url,
-                api_key=settings.hindsight_api_key,
-                timeout_seconds=settings.hindsight_timeout_seconds,
-            ),
+            contact_id=contact_id,
+            requested_by_user_id=context.user.id,
         )
+    except ContactMemoryNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Contact not found",
+        ) from exc
+    await context.session.flush()
+    deletion = await sync_hindsight_deletion(
+        context.session,
+        scope=context.scope,
+        deletion_id=staged.deletion_id,
+        hindsight=configured_hindsight_client(
+            base_url=settings.hindsight_base_url,
+            api_key=settings.hindsight_api_key,
+            timeout_seconds=settings.hindsight_timeout_seconds,
+        ),
+    )
     fuzzy_status = "unavailable" if deletion.status == "failed" else deletion.status
     return ContactMemoryDeleteResponse(
         deterministic_entries_removed=staged.deterministic_entries_removed,
