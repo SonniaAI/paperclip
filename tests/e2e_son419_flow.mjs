@@ -10,7 +10,23 @@ const gate0 = await readFile(join(here, '..', 'alembic', 'versions', '20260809_g
 const feature = await readFile(join(here, '..', 'alembic', 'versions', '20260809_feature_data.sql'), 'utf8')
 const son419 = await readFile(join(here, '..', 'alembic', 'versions', '20260809_son419.sql'), 'utf8')
 const authFlow = await readFile(join(here, '..', 'alembic', 'versions', '20260811_auth_flow.sql'), 'utf8')
+const hindsightMemory = await readFile(
+  join(here, '..', 'alembic', 'versions', '20260810_hindsight_memory.sql'),
+  'utf8',
+)
 const authClaims = await readFile(join(here, '..', 'alembic', 'versions', '20260811_auth_claims.sql'), 'utf8')
+const customerMemory = await readFile(
+  join(here, '..', 'alembic', 'versions', '20260812_son551_customer_memory.sql'),
+  'utf8',
+)
+const campaignImports = await readFile(
+  join(here, '..', 'alembic', 'versions', '20260811_phase1_campaign_imports.sql'),
+  'utf8',
+)
+const registrationV2 = await readFile(
+  join(here, '..', 'alembic', 'versions', '20260812_registration_v2.sql'),
+  'utf8',
+)
 
 const db = new PGlite()
 const server = new PGLiteSocketServer({ db, host: '127.0.0.1', port: 0, maxConnections: 10 })
@@ -39,7 +55,14 @@ try {
   await db.exec(feature)
   await db.exec(son419)
   await db.exec(authFlow)
+  await db.exec(hindsightMemory)
   await db.exec(authClaims)
+  // Keep this route proof on the current production-shaped schema, including
+  // the merged SON-551/campaign branches and the registration-v2 columns used
+  // by the current ORM models.
+  await db.exec(customerMemory)
+  await db.exec(campaignImports)
+  await db.exec(registrationV2)
   await db.exec(`
     CREATE ROLE manager_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
     CREATE ROLE manager_auth_resolver NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS;
