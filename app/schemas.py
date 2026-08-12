@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+import re
+from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
@@ -16,6 +17,23 @@ def _normalise_email(value: str) -> str:
     return email
 
 
+_E164_PHONE = re.compile(r"^\+[1-9]\d{7,14}$")
+
+
+def _normalise_required_text(value: str) -> str:
+    normalised = value.strip()
+    if not normalised:
+        raise ValueError("a value is required")
+    return normalised
+
+
+def _normalise_phone(value: str) -> str:
+    normalised = re.sub(r"[\s().-]", "", value.strip())
+    if not _E164_PHONE.fullmatch(normalised):
+        raise ValueError("phone must use international format, for example +6581234567")
+    return normalised
+
+
 class RegisterRequest(BaseModel):
     account_type: Literal["individual", "business"]
     full_name: str = Field(min_length=1, max_length=160)
@@ -23,8 +41,25 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=10, max_length=512)
     company_name: str | None = Field(default=None, min_length=2, max_length=160)
     country: str | None = Field(default=None, min_length=2, max_length=80)
+    phone: str = Field(min_length=8, max_length=32)
+    date_of_birth: date
+    gender: str = Field(min_length=1, max_length=80)
+    role: str = Field(min_length=1, max_length=120)
+    industry: str = Field(min_length=1, max_length=120)
 
     _validate_email = field_validator("email")(_normalise_email)
+    _validate_full_name = field_validator("full_name")(_normalise_required_text)
+    _validate_phone = field_validator("phone")(_normalise_phone)
+    _validate_gender = field_validator("gender")(_normalise_required_text)
+    _validate_role = field_validator("role")(_normalise_required_text)
+    _validate_industry = field_validator("industry")(_normalise_required_text)
+
+    @field_validator("date_of_birth")
+    @classmethod
+    def validate_date_of_birth(cls, value: date) -> date:
+        if value >= date.today():
+            raise ValueError("date of birth must be in the past")
+        return value
 
     @model_validator(mode="after")
     def validate_account_fields(self) -> RegisterRequest:
@@ -352,6 +387,11 @@ class ProfileSettingsResponse(BaseModel):
     totp_enabled: bool
     organization_name: str
     onboarding_state: str
+    phone: str | None = None
+    date_of_birth: date | None = None
+    gender: str | None = None
+    role: str | None = None
+    industry: str | None = None
 
 
 class ProfileUpdateRequest(BaseModel):

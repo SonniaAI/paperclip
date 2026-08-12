@@ -622,6 +622,11 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> RegisterRes
             department_id=department_id,
             email=payload.email,
             display_name=payload.full_name,
+            phone=payload.phone,
+            date_of_birth=payload.date_of_birth,
+            gender=payload.gender,
+            profile_role=payload.role,
+            industry=payload.industry,
             password_hash=hash_password(payload.password),
             email_verified_at=None,
             email_verification_token_digest=token_digest(verification_token),
@@ -2139,6 +2144,11 @@ async def profile_settings(
         totp_enabled=context.user.totp_enabled,
         organization_name=org.name if org else "",
         onboarding_state=org.onboarding_state if org else "pending",
+        phone=context.user.phone,
+        date_of_birth=context.user.date_of_birth,
+        gender=context.user.gender,
+        role=context.user.profile_role,
+        industry=context.user.industry,
     )
 
 

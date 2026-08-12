@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     String,
@@ -172,6 +173,11 @@ class AppUser(Base, TenantScoped):
     )
     email: Mapped[str] = mapped_column(Text)
     display_name: Mapped[str] = mapped_column(Text)
+    phone: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    date_of_birth: Mapped[date | None] = mapped_column(Date, nullable=True)
+    gender: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    profile_role: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    industry: Mapped[str | None] = mapped_column(String(120), nullable=True)
     password_hash: Mapped[str] = mapped_column(Text)
     email_verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

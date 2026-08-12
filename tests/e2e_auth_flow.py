@@ -409,6 +409,11 @@ def _run() -> None:
                 "password": "correct-horse-battery-staple",
                 "company_name": "Org A Solar",
                 "country": "Singapore",
+                "phone": "+6581234567",
+                "date_of_birth": "1988-05-18",
+                "gender": "prefer_not_to_say",
+                "role": "Founder",
+                "industry": "Solar energy",
             },
         )
         assert registration.status_code == 201, registration.text
@@ -441,6 +446,13 @@ def _run() -> None:
         assert "httponly" in set_cookie and "secure" in set_cookie and "samesite=lax" in set_cookie
         owner_a_cookie = client.cookies.get("manager_session")
         assert owner_a_cookie
+        profile = client.get("/api/settings/profile")
+        assert profile.status_code == 200, profile.text
+        assert profile.json()["phone"] == "+6581234567"
+        assert profile.json()["date_of_birth"] == "1988-05-18"
+        assert profile.json()["gender"] == "prefer_not_to_say"
+        assert profile.json()["role"] == "Founder"
+        assert profile.json()["industry"] == "Solar energy"
         raced_verification = next(
             response for response in verification_attempts if response.status_code == 400
         )
@@ -542,6 +554,11 @@ def _run() -> None:
                 "full_name": "Phase 1 Tenant B",
                 "email": "phase1-tenant-b@example.com",
                 "password": "correct-horse-battery-staple",
+                "phone": "+6580000001",
+                "date_of_birth": "1991-01-02",
+                "gender": "prefer_not_to_say",
+                "role": "Operations manager",
+                "industry": "Professional services",
             },
         )
         assert phase1_tenant_b.status_code == 201, phase1_tenant_b.text
@@ -634,6 +651,11 @@ def _run() -> None:
                 "full_name": "Owner B",
                 "email": "owner-b@example.com",
                 "password": "correct-horse-battery-staple",
+                "phone": "+447700900123",
+                "date_of_birth": "1990-08-14",
+                "gender": "woman",
+                "role": "Consultant",
+                "industry": "Professional services",
             },
         )
         assert second_registration.status_code == 201, second_registration.text
