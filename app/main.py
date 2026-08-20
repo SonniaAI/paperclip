@@ -12,7 +12,7 @@ from typing import Annotated, Any
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sqlalchemy import and_, or_, select, text, update
@@ -28,7 +28,16 @@ from app.contact_memory import (
     sync_hindsight_deletion,
 )
 from app.database import TenantScope, get_session, set_tenant_scope
-from app.email_delivery import EmailDeliveryResult, deliver_action_email
+from app.email_delivery import (
+    EmailDeliveryResult,
+    deliver_action_email,
+    deliver_rendered_email,
+)
+from app.email_templates import (
+    render_password_changed_email,
+    render_reset_email,
+    render_verification_email,
+)
 from app.hindsight import configured_hindsight_client
 from app.ingestion import TelnyxPayloadError, ingest_telnyx_event
 from app.materials import (
@@ -60,6 +69,7 @@ from app.models import (
     TaskList,
     UserSession,
 )
+from app.password_policy import PasswordCheckContext, password_violations
 from app.phase1_contracts import build_router, preview_contact_csv_upload
 from app.schemas import (
     ActivityFeedEntry,
@@ -404,6 +414,10 @@ def _public_action_url(path: str, token: str) -> str:
     return f"{settings.public_app_url.rstrip('/')}{path}/{quote(token, safe='')}"
 
 
+def _first_name(display_name: str) -> str:
+    return display_name.strip().split(" ", 1)[0] or "there"
+
+
 async def _deliver_email(
     *,
     recipient: str,
@@ -422,6 +436,48 @@ async def _deliver_email(
         action_label=action_label,
         action_url=action_url,
         expiry_text=expiry_text,
+    )
+
+
+async def _deliver_verification_email(
+    *, recipient: str, first_name: str, action_url: str
+) -> EmailDeliveryResult:
+    rendered = render_verification_email(first_name=first_name, url=action_url)
+    return await run_in_threadpool(
+        deliver_rendered_email,
+        settings=settings,
+        recipient=recipient,
+        subject="Verify your Sonnia account",
+        rendered=rendered,
+    )
+
+
+async def _deliver_reset_email(
+    *, recipient: str, first_name: str, action_url: str
+) -> EmailDeliveryResult:
+    rendered = render_reset_email(first_name=first_name, url=action_url)
+    return await run_in_threadpool(
+        deliver_rendered_email,
+        settings=settings,
+        recipient=recipient,
+        subject="Reset your Sonnia password",
+        rendered=rendered,
+    )
+
+
+async def _deliver_password_changed_email(
+    *, recipient: str, first_name: str
+) -> EmailDeliveryResult:
+    rendered = render_password_changed_email(
+        first_name=first_name,
+        reset_url=_public_action_url("/forgot-password", "").rstrip("/"),
+    )
+    return await run_in_threadpool(
+        deliver_rendered_email,
+        settings=settings,
+        recipient=recipient,
+        subject="Your Sonnia password was changed",
+        rendered=rendered,
     )
 
 
@@ -511,9 +567,7 @@ async def _verify_telnyx_webhook(request: Request, body: bytes) -> None:
     supplied = request.headers.get("X-Telnyx-Signature") or request.headers.get(
         "Telnyx-Signature-Ed25519"
     )
-    expected = hmac.new(
-        settings.telnyx_webhook_secret.encode("utf-8"), body, "sha256"
-    ).hexdigest()
+    expected = hmac.new(settings.telnyx_webhook_secret.encode("utf-8"), body, "sha256").hexdigest()
     if not supplied or not hmac.compare_digest(supplied, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -571,6 +625,21 @@ async def telnyx_webhook(request: Request, db: DatabaseSession) -> JSONResponse:
 )
 async def register(payload: RegisterRequest, db: DatabaseSession) -> RegisterResponse:
     """Create the account graph atomically, then send a one-use verification link."""
+
+    # §4 password policy: reject before any account state is created.
+    violations = await password_violations(
+        payload.password,
+        PasswordCheckContext(
+            display_name=payload.full_name,
+            email=payload.email,
+            company_name=payload.company_name or "",
+        ),
+    )
+    if violations:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": "password_policy", "message": " ".join(violations)},
+        )
 
     async with db.begin():
         if await _resolve_auth_scope(db, payload.email) is not None:
@@ -632,6 +701,8 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> RegisterRes
             terms_version=payload.terms_version,
             terms_accepted_at=datetime.now(UTC),
             marketing_consent=payload.marketing_consent,
+            marketing_consent_at=datetime.now(UTC) if payload.marketing_consent else None,
+            marketing_consent_source="registration" if payload.marketing_consent else None,
             password_hash=hash_password(payload.password),
             email_verified_at=None,
             email_verification_token_digest=token_digest(verification_token),
@@ -664,13 +735,10 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> RegisterRes
         await db.flush()
 
     verification_url = _public_action_url("/verify-email", verification_token)
-    delivery = await _deliver_email(
+    delivery = await _deliver_verification_email(
         recipient=payload.email,
-        subject="Verify your Sonnia account",
-        heading="Verify your email address",
-        action_label="Verify email address",
+        first_name=_first_name(payload.full_name),
         action_url=verification_url,
-        expiry_text="24 hours",
     )
     return RegisterResponse(
         email=payload.email,
@@ -686,6 +754,7 @@ async def resend_verification(
 ) -> EmailDeliveryResponse:
     token: str | None = None
     recipient: str | None = None
+    display_name: str | None = None
     async with db.begin():
         resolved = await _resolve_auth_scope(db, payload.email)
         if resolved is not None:
@@ -699,6 +768,7 @@ async def resend_verification(
                     seconds=settings.email_verification_ttl_seconds
                 )
                 recipient = user.email
+                display_name = user.display_name
                 await db.flush()
 
     default_mode = "smtp" if settings.smtp_host else "development"
@@ -707,13 +777,10 @@ async def resend_verification(
             message="If the account still needs verification, a new link has been sent.",
             delivery=default_mode,
         )
-    delivery = await _deliver_email(
+    delivery = await _deliver_verification_email(
         recipient=recipient,
-        subject="Your new Sonnia verification link",
-        heading="Verify your email address",
-        action_label="Verify email address",
+        first_name=_first_name(display_name or "there"),
         action_url=_public_action_url("/verify-email", token),
-        expiry_text="24 hours",
     )
     return _delivery_response(
         delivery,
@@ -953,6 +1020,7 @@ async def forgot_password(
 ) -> EmailDeliveryResponse:
     token: str | None = None
     recipient: str | None = None
+    display_name: str | None = None
     async with db.begin():
         resolved = await _resolve_auth_scope(db, payload.email)
         if resolved is not None:
@@ -966,19 +1034,17 @@ async def forgot_password(
                     seconds=settings.password_reset_ttl_seconds
                 )
                 recipient = user.email
+                display_name = user.display_name
                 await db.flush()
 
     confirmation = "If an account exists for that email, a reset link has been sent."
     default_mode = "smtp" if settings.smtp_host else "development"
     if token is None or recipient is None:
         return EmailDeliveryResponse(message=confirmation, delivery=default_mode)
-    delivery = await _deliver_email(
+    delivery = await _deliver_reset_email(
         recipient=recipient,
-        subject="Reset your Sonnia password",
-        heading="Reset your password",
-        action_label="Reset password",
+        first_name=_first_name(display_name or "there"),
         action_url=_public_action_url("/reset-password", token),
-        expiry_text="1 hour",
     )
     return _delivery_response(delivery, message=confirmation)
 
@@ -989,6 +1055,25 @@ async def reset_password(payload: ResetPasswordRequest, db: DatabaseSession) -> 
         claims = decode_password_reset_token(payload.token)
     except ValueError as exc:
         raise _invalid_action_token() from exc
+
+    # §4 password policy on the new password, personalised to the account.
+    async with db.begin():
+        await set_tenant_scope(db, claims.scope)
+        policy_user = await db.get(AppUser, claims.user_id)
+    if policy_user is not None:
+        violations = await password_violations(
+            payload.new_password,
+            PasswordCheckContext(
+                display_name=policy_user.display_name,
+                email=policy_user.email,
+                company_name="",
+            ),
+        )
+        if violations:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "password_policy", "message": " ".join(violations)},
+            )
 
     password_hash = hash_password(payload.new_password)
     now = datetime.now(UTC)
@@ -1025,6 +1110,14 @@ async def reset_password(payload: ResetPasswordRequest, db: DatabaseSession) -> 
         )
         session = await _issue_session(db, user=user, scope=claims.scope)
         response_user = await _auth_user_response(db, user=user, scope=claims.scope)
+        recipient = user.email
+        first_name = _first_name(user.display_name)
+
+    # §4.4: completing a reset sends the branded 'password was changed' email.
+    await _deliver_password_changed_email(
+        recipient=recipient,
+        first_name=first_name,
+    )
 
     return _response_with_session(_auth_response(response_user), session, claims.scope)
 
@@ -1100,6 +1193,17 @@ async def accept_invite(payload: InviteAcceptRequest, db: DatabaseSession) -> Re
         existing_user = await db.scalar(select(AppUser).where(AppUser.email == invite.email))
         if existing_user is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="User already exists")
+
+        # §4 password policy on the invited member's new password.
+        violations = await password_violations(
+            payload.password,
+            PasswordCheckContext(display_name=payload.display_name, email=invite.email),
+        )
+        if violations:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "password_policy", "message": " ".join(violations)},
+            )
 
         user = AppUser(
             id=uuid4(),
@@ -1430,6 +1534,148 @@ async def dashboard_overview(
         "generated_at": now,
     }
 
+
+@app.get("/api/calls")
+async def list_calls(
+    context: CurrentContext,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    outcome: str | None = Query(default=None, max_length=64),
+    contact_id: UUID | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> dict[str, object]:
+    """Return the signed-in tenant's paginated call collection.
+
+    PostgreSQL RLS receives the authenticated session scope; browser input can
+    narrow call attributes but cannot name or override a tenant.  Keep this
+    static route above ``/api/calls/{call_id}`` so ``stats`` stays a distinct
+    protected endpoint instead of being parsed as a call identifier.
+    """
+
+    if start_date and end_date and end_date < start_date:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="end_date must not be before start_date",
+        )
+
+    clauses: list[str] = []
+    params: dict[str, object] = {}
+    if outcome:
+        clauses.append("c.status = :outcome")
+        params["outcome"] = outcome
+    if contact_id:
+        clauses.append("c.contact_id = :contact_id")
+        params["contact_id"] = str(contact_id)
+    if start_date:
+        clauses.append("COALESCE(c.started_at, c.created_at) >= :start_date")
+        params["start_date"] = start_date
+    if end_date:
+        clauses.append("COALESCE(c.started_at, c.created_at) < :end_date_exclusive")
+        params["end_date_exclusive"] = end_date + timedelta(days=1)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    total = await context.session.scalar(
+        text(f"SELECT count(*)::int FROM calls AS c {where}"),
+        params,
+    )
+    result = await context.session.execute(
+        text(
+            f"""
+            SELECT
+                c.id,
+                c.contact_id,
+                c.direction,
+                c.status,
+                c.subject,
+                c.started_at,
+                c.ended_at,
+                c.created_at,
+                c.updated_at,
+                contact.display_name AS contact_name,
+                company.name AS company_name,
+                (
+                    SELECT cp.phone_e164
+                    FROM contact_phones AS cp
+                    WHERE cp.contact_id = c.contact_id
+                    ORDER BY cp.is_primary DESC, cp.created_at ASC
+                    LIMIT 1
+                ) AS contact_phone,
+                (
+                    SELECT recording.id
+                    FROM recordings AS recording
+                    WHERE recording.call_id = c.id AND recording.is_private = true
+                    ORDER BY recording.created_at ASC
+                    LIMIT 1
+                ) AS recording_id
+            FROM calls AS c
+            LEFT JOIN contacts AS contact ON contact.id = c.contact_id
+            LEFT JOIN companies AS company ON company.id = c.company_id
+            {where}
+            ORDER BY COALESCE(c.started_at, c.created_at) DESC, c.id DESC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {**params, "limit": page_size, "offset": (page - 1) * page_size},
+    )
+
+    items: list[dict[str, object]] = []
+    for row in result.mappings():
+        value = dict(row)
+        started_at = value["started_at"]
+        ended_at = value["ended_at"]
+        duration: int | None = None
+        if started_at is not None and ended_at is not None:
+            duration = max(0, int((ended_at - started_at).total_seconds()))
+
+        metadata: dict[str, object] = {}
+        if value["contact_name"]:
+            metadata["contact_name"] = str(value["contact_name"])
+        if value["company_name"]:
+            metadata["company_name"] = str(value["company_name"])
+        if value["contact_phone"]:
+            metadata["phone"] = str(value["contact_phone"])
+        if value["recording_id"]:
+            metadata["recording_id"] = str(value["recording_id"])
+
+        items.append(
+            {
+                "id": str(value["id"]),
+                "contact_id": str(value["contact_id"]) if value["contact_id"] else None,
+                "direction": value["direction"] or "unknown",
+                "outcome": value["status"],
+                "subject": value["subject"],
+                "duration": duration,
+                # Private recording URLs are separately issued with a short TTL.
+                "recording_url": "",
+                # Full transcript text belongs to the detail endpoint, not a list.
+                "transcript": "",
+                "sentiment_score": None,
+                "metadata": metadata,
+                "created_at": value["created_at"],
+                "updated_at": value["updated_at"],
+            }
+        )
+
+    return {"items": items, "total": int(total or 0), "page": page, "page_size": page_size}
+
+
+@app.get("/api/calls/stats")
+async def call_stats(
+    context: CurrentContext,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> dict[str, Any]:
+    """Return tenant-scoped call aggregates before the dynamic detail route."""
+
+    if start_date and end_date and end_date < start_date:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="end_date must not be before start_date",
+        )
+    return await _call_stats_payload(context, start_date=start_date, end_date=end_date)
+
+
 @app.get("/api/calls/{call_id}", response_model=CallResponse)
 async def get_call(
     call_id: UUID,
@@ -1560,17 +1806,21 @@ async def get_recording_url(recording_id: UUID, context: CurrentContext) -> dict
     """Issue a short-lived URL for a private object; never return a public path."""
 
     recording = (
-        await context.session.execute(
-            text(
-                """
+        (
+            await context.session.execute(
+                text(
+                    """
                 SELECT storage_bucket, storage_key
                 FROM recordings
                 WHERE id = :recording_id AND is_private = true
                 """
-            ),
-            {"recording_id": str(recording_id)},
+                ),
+                {"recording_id": str(recording_id)},
+            )
         )
-    ).mappings().one_or_none()
+        .mappings()
+        .one_or_none()
+    )
     if recording is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recording not found")
 
@@ -1631,7 +1881,6 @@ async def billing_top_up_placeholder(context: CurrentContext) -> BillingTopUpPla
 
     del context
     return BillingTopUpPlaceholderResponse()
-
 
 
 # ---------------------------------------------------------------------------
@@ -1836,9 +2085,7 @@ async def update_instruction(
         )
     )
     if active is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Instruction not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instruction not found")
     edit = next_instruction_version(
         slug=active.slug,
         title=payload.title or active.title,
@@ -1985,11 +2232,7 @@ async def list_tasks(
     if status_value is not None:
         clause = and_(clause, Task.status == status_value)
     rows = (
-        (
-            await context.session.execute(
-                select(Task).where(clause).order_by(Task.created_at.desc())
-            )
-        )
+        (await context.session.execute(select(Task).where(clause).order_by(Task.created_at.desc())))
         .scalars()
         .all()
     )
@@ -2157,6 +2400,8 @@ async def profile_settings(
         terms_version=context.user.terms_version,
         terms_accepted_at=context.user.terms_accepted_at,
         marketing_consent=context.user.marketing_consent,
+        marketing_consent_at=context.user.marketing_consent_at,
+        marketing_consent_source=context.user.marketing_consent_source,
     )
 
 
@@ -2165,9 +2410,17 @@ async def update_profile(
     payload: ProfileUpdateRequest,
     context: CurrentContext,
 ) -> ProfileSettingsResponse:
-    if payload.display_name:
+    if payload.display_name is not None:
         context.user.display_name = payload.display_name
-        await context.session.flush()
+    if (
+        payload.marketing_consent is not None
+        and payload.marketing_consent != context.user.marketing_consent
+    ):
+        # Consent is an event: record when it was given/withdrawn and from where.
+        context.user.marketing_consent = payload.marketing_consent
+        context.user.marketing_consent_at = datetime.now(UTC)
+        context.user.marketing_consent_source = "settings"
+    await context.session.flush()
     return await profile_settings(context)
 
 
@@ -2180,6 +2433,19 @@ async def change_password(
     if not verify_password(payload.current_password, context.user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect"
+        )
+    violations = await password_violations(
+        payload.new_password,
+        PasswordCheckContext(
+            display_name=context.user.display_name,
+            email=context.user.email,
+            company_name="",
+        ),
+    )
+    if violations:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": "password_policy", "message": " ".join(violations)},
         )
     context.user.password_hash = hash_password(payload.new_password)
     ip, ua = _request_origin(request)
@@ -2544,9 +2810,7 @@ async def contact_import_commit(
     )
 
 
-async def _find_contact_by_keys(
-    context: AuthenticatedContext, keys: set[str]
-) -> Contact | None:
+async def _find_contact_by_keys(context: AuthenticatedContext, keys: set[str]) -> Contact | None:
     for key in keys:
         if key.startswith("email:"):
             email_value = key.split(":", 1)[1]
@@ -2614,6 +2878,4 @@ def _onboarding_next(state: str) -> str | None:
 # Attach the additive Phase 1 routes after all production routes are declared.
 # The shared preview path stays on the combined handler above so both the
 # deployed JSON contract and the new multipart CSV contract remain available.
-app.include_router(
-    build_router(authenticated_context, include_contact_import_preview=False)
-)
+app.include_router(build_router(authenticated_context, include_contact_import_preview=False))

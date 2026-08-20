@@ -17,6 +17,7 @@ dependencies = [
   "httpx>=0.28,<1",
   "itsdangerous>=2.2,<3",
   "mangum>=0.19,<1",
+  "phonenumbers>=8.13,<9",
   "pydantic-settings>=2.7,<3",
   "psycopg[binary]>=3.2,<4",
   "sqlalchemy>=2.0.36,<3",

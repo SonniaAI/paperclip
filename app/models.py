@@ -104,9 +104,7 @@ class Company(Base, TenantScoped):
     name: Mapped[str] = mapped_column(Text)
     legal_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     domain: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -134,9 +132,7 @@ class Integration(Base, TenantScoped):
     credentials_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
     config: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="active")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -188,6 +184,10 @@ class AppUser(Base, TenantScoped):
     marketing_consent: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    marketing_consent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    marketing_consent_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
     password_hash: Mapped[str] = mapped_column(Text)
     email_verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -200,9 +200,7 @@ class AppUser(Base, TenantScoped):
     password_reset_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    two_factor_challenge_token_digest: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    two_factor_challenge_token_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     two_factor_challenge_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -363,9 +361,7 @@ class Transcript(Base, TenantScoped):
     language_code: Mapped[str | None] = mapped_column(String(20), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="pending")
     raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -416,9 +412,7 @@ class Contact(Base, TenantScoped):
     last_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     job_title: Mapped[str | None] = mapped_column(Text, nullable=True)
     do_not_contact: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -437,9 +431,7 @@ class ContactPhone(Base, TenantScoped):
     label: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ContactEmail(Base, TenantScoped):
@@ -455,9 +447,7 @@ class ContactEmail(Base, TenantScoped):
     label: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ContactMemoryBatch(Base, TenantScoped):
@@ -506,9 +496,7 @@ class ContactMemoryBatch(Base, TenantScoped):
     created_by_user_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ContactMemoryEntry(Base, TenantScoped):
@@ -517,9 +505,7 @@ class ContactMemoryEntry(Base, TenantScoped):
     __tablename__ = "contact_memory_entries"
     __table_args__ = (
         UniqueConstraint("org_id", "id", name="contact_memory_entries_org_id_id_key"),
-        CheckConstraint(
-            "kind IN ('fact', 'preference')", name="contact_memory_entries_kind_check"
-        ),
+        CheckConstraint("kind IN ('fact', 'preference')", name="contact_memory_entries_kind_check"),
     )
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -533,9 +519,7 @@ class ContactMemoryEntry(Base, TenantScoped):
     kind: Mapped[str] = mapped_column(String(20))
     value: Mapped[str] = mapped_column(Text)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class HindsightSyncJob(Base, TenantScoped):
@@ -561,9 +545,7 @@ class HindsightSyncJob(Base, TenantScoped):
     attempts: Mapped[int] = mapped_column(default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -579,9 +561,7 @@ class ContactMemoryDeletion(Base, TenantScoped):
 
     __tablename__ = "contact_memory_deletions"
     __table_args__ = (
-        UniqueConstraint(
-            "org_id", "contact_id", name="contact_memory_deletions_contact_key"
-        ),
+        UniqueConstraint("org_id", "contact_id", name="contact_memory_deletions_contact_key"),
         CheckConstraint(
             "status IN ('pending', 'failed', 'delivered')",
             name="contact_memory_deletions_status_check",
@@ -612,9 +592,7 @@ class ContactMemoryDeletion(Base, TenantScoped):
 class Note(Base, TenantScoped):
     __tablename__ = "notes"
     __table_args__ = (
-        CheckConstraint(
-            "visibility IN ('private', 'shared')", name="notes_visibility_check"
-        ),
+        CheckConstraint("visibility IN ('private', 'shared')", name="notes_visibility_check"),
     )
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -632,9 +610,7 @@ class Note(Base, TenantScoped):
     )
     body: Mapped[str] = mapped_column(Text)
     visibility: Mapped[str] = mapped_column(String(10), default="shared")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -651,9 +627,7 @@ class TaskList(Base, TenantScoped):
     __tablename__ = "task_lists"
     __table_args__ = (
         UniqueConstraint("org_id", "department_id", "name"),
-        CheckConstraint(
-            "visibility IN ('private', 'shared')", name="task_lists_visibility_check"
-        ),
+        CheckConstraint("visibility IN ('private', 'shared')", name="task_lists_visibility_check"),
     )
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -666,9 +640,7 @@ class TaskList(Base, TenantScoped):
         PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
     )
     visibility: Mapped[str] = mapped_column(String(10), default="private")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -682,9 +654,7 @@ class Task(Base, TenantScoped):
         CheckConstraint(
             "status IN ('open', 'in_progress', 'done', 'cancelled')", name="tasks_status_check"
         ),
-        CheckConstraint(
-            "visibility IN ('private', 'shared')", name="tasks_visibility_check"
-        ),
+        CheckConstraint("visibility IN ('private', 'shared')", name="tasks_visibility_check"),
     )
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -711,9 +681,7 @@ class Task(Base, TenantScoped):
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="open")
     visibility: Mapped[str] = mapped_column(String(10), default="shared")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -746,9 +714,7 @@ class Instruction(Base, TenantScoped):
     created_by_user_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -776,9 +742,7 @@ class ActivityLogEntry(Base, TenantScoped):
     entity_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
     private: Mapped[bool] = mapped_column(Boolean, default=False)
     activity_metadata: Mapped[dict[str, object]] = mapped_column("metadata", JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class SecurityEvent(Base, TenantScoped):
@@ -797,9 +761,7 @@ class SecurityEvent(Base, TenantScoped):
     ip_address: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
     event_metadata: Mapped[dict[str, object]] = mapped_column("metadata", JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ContactImport(Base, TenantScoped):
@@ -820,6 +782,4 @@ class ContactImport(Base, TenantScoped):
     created_by_user_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

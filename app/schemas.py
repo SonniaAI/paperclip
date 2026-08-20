@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from datetime import date, datetime
 from typing import Literal
 from urllib.parse import urlparse
@@ -18,25 +17,44 @@ def _normalise_email(value: str) -> str:
     return email
 
 
-_E164_PHONE = re.compile(r"^\+[1-9]\d{7,14}$")
-
 RegistrationGender = Literal["female", "male", "other", "prefer_not_to_say"]
 RegistrationRole = Literal[
-    "owner_founder", "director_c_level", "sales_manager", "salesperson",
-    "marketing", "operations", "customer_service", "administrator", "other",
+    "owner_founder",
+    "director_c_level",
+    "sales_manager",
+    "salesperson",
+    "marketing",
+    "operations",
+    "customer_service",
+    "administrator",
+    "other",
 ]
 RegistrationIndustry = Literal[
-    "automotive", "beauty_wellness", "construction_trades", "education_training",
-    "energy_utilities", "financial_services", "healthcare_medical",
-    "hospitality_events", "insurance", "legal", "logistics_transport",
-    "manufacturing", "marketing_advertising", "non_profit",
-    "professional_services", "property_real_estate", "recruitment_staffing",
-    "retail_ecommerce", "software_technology", "solar_renewable_energy",
-    "telecommunications", "travel_tourism", "other",
+    "automotive",
+    "beauty_wellness",
+    "construction_trades",
+    "education_training",
+    "energy_utilities",
+    "financial_services",
+    "healthcare_medical",
+    "hospitality_events",
+    "insurance",
+    "legal",
+    "logistics_transport",
+    "manufacturing",
+    "marketing_advertising",
+    "non_profit",
+    "professional_services",
+    "property_real_estate",
+    "recruitment_staffing",
+    "retail_ecommerce",
+    "software_technology",
+    "solar_renewable_energy",
+    "telecommunications",
+    "travel_tourism",
+    "other",
 ]
-RegistrationCompanySize = Literal[
-    "just_me", "2_10", "11_50", "51_200", "201_500", "500_plus"
-]
+RegistrationCompanySize = Literal["just_me", "2_10", "11_50", "51_200", "201_500", "500_plus"]
 RegistrationReferralSource = Literal[
     "search", "social_media", "word_of_mouth", "event", "press", "other"
 ]
@@ -50,10 +68,30 @@ def _normalise_required_text(value: str) -> str:
 
 
 def _normalise_phone(value: str) -> str:
-    normalised = re.sub(r"[\s().-]", "", value.strip())
-    if not _E164_PHONE.fullmatch(normalised):
-        raise ValueError("phone must use international format, for example +6581234567")
-    return normalised
+    """Validate and normalise a phone number to E.164 via libphonenumber.
+
+    The Registration & Password spec §2, Section 2 requires libphonenumber
+    validation (never a hand-rolled regex).
+    """
+
+    from phonenumbers import (
+        NumberParseException,
+        PhoneNumberFormat,
+        format_number,
+        is_valid_number,
+        parse,
+    )
+
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("a phone number is required")
+    try:
+        parsed = parse(stripped, region=None)
+    except NumberParseException as exc:
+        raise ValueError("phone must use international format, for example +6581234567") from exc
+    if not is_valid_number(parsed):
+        raise ValueError("phone must use a valid international number, for example +6581234567")
+    return format_number(parsed, PhoneNumberFormat.E164)
 
 
 class RegisterRequest(BaseModel):
@@ -441,10 +479,13 @@ class ProfileSettingsResponse(BaseModel):
     terms_version: str | None = None
     terms_accepted_at: datetime | None = None
     marketing_consent: bool = False
+    marketing_consent_at: datetime | None = None
+    marketing_consent_source: str | None = None
 
 
 class ProfileUpdateRequest(BaseModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=160)
+    marketing_consent: bool | None = None
 
 
 class CompanySettingsResponse(BaseModel):
@@ -458,9 +499,7 @@ class CompanySettingsResponse(BaseModel):
 
 class CompanyUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=160)
-    duplicate_call_protection: str | None = Field(
-        default=None, pattern="^(block|warn|allow)$"
-    )
+    duplicate_call_protection: str | None = Field(default=None, pattern="^(block|warn|allow)$")
 
 
 class TeamMemberResponse(BaseModel):
