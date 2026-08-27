@@ -8,13 +8,17 @@ import unicodedata
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+)
 from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -28,6 +32,16 @@ from app.contact_memory import (
     sync_hindsight_deletion,
 )
 from app.database import TenantScope, get_session, set_tenant_scope
+from app.dev_preview import (
+    dev_email_viewer_html,
+    dev_emails_index_html,
+    find_dev_email_template,
+    html_with_images_blocked,
+    render_dummy_email,
+)
+from app.dev_preview import (
+    is_production_environment as dev_preview_is_production,
+)
 from app.email_delivery import (
     EmailDeliveryResult,
     deliver_action_email,
@@ -2879,3 +2893,85 @@ def _onboarding_next(state: str) -> str | None:
 # The shared preview path stays on the combined handler above so both the
 # deployed JSON contract and the new multipart CSV contract remain available.
 app.include_router(build_router(authenticated_context, include_contact_import_preview=False))
+
+
+# ---------------------------------------------------------------------------
+# SON-883 / SON-1355: dev-only preview surfaces (/dev/*).
+#
+# Gating is server-side and environmental only: production answers 404 —
+# never 403 and never a login wall. No auth/roles are added to these routes;
+# they render dummy data exclusively and never touch the database.
+# ---------------------------------------------------------------------------
+
+
+async def _require_non_production() -> None:
+    if dev_preview_is_production():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+
+@app.get(
+    "/dev/emails",
+    dependencies=[Depends(_require_non_production)],
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+async def dev_emails_preview_index() -> HTMLResponse:
+    """Honest inventory of the Transactional Email spec §8 family."""
+
+    return HTMLResponse(content=dev_emails_index_html())
+
+
+@app.get(
+    "/dev/emails/{slug}",
+    dependencies=[Depends(_require_non_production)],
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+async def dev_emails_preview_viewer(
+    slug: str,
+    dark: bool = False,
+    width: Annotated[int, Query(ge=320, le=1400)] = 600,
+    images: Literal["on", "off"] = "on",
+    mode: Literal["html", "text"] = "html",
+) -> HTMLResponse:
+    """Single-template preview page with per-email toggles."""
+
+    template = find_dev_email_template(slug)
+    if template is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown template")
+    return HTMLResponse(
+        content=dev_email_viewer_html(
+            template=template,
+            dark=dark,
+            width=width,
+            images_blocked=images == "off",
+            mode=mode,
+        )
+    )
+
+
+@app.get(
+    "/dev/emails/{slug}/raw",
+    dependencies=[Depends(_require_non_production)],
+    include_in_schema=False,
+)
+async def dev_emails_preview_raw(
+    slug: str,
+    images: Literal["on", "off"] = "on",
+    mode: Literal["html", "text"] = "html",
+) -> Response:
+    """The rendered email exactly as SMTP would deliver it (or its text part)."""
+
+    template = find_dev_email_template(slug)
+    if template is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown template")
+    if not template.built or template.renderer is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"{template.display_name} is not built yet (tracked in SON-877)",
+        )
+    rendered = render_dummy_email(template)
+    if mode == "text":
+        return PlainTextResponse(content=rendered.plain_text)
+    html_content = rendered.html if images == "on" else html_with_images_blocked(rendered.html)
+    return HTMLResponse(content=html_content)
