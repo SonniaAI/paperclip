@@ -175,6 +175,19 @@ class EmailAddressRequest(BaseModel):
     _validate_email = field_validator("email")(_normalise_email)
 
 
+class VerificationPendingResponse(BaseModel):
+    """SON-1363 check-inbox/pending-state probe.
+
+    The envelope is identical for known and unknown addresses; only ``pending``
+    varies. ``resend_available_in_seconds`` is reported for FE countdown
+    rendering and is always 0 today: the reviewed resend-verification path has
+    no send cooldown.
+    """
+
+    pending: bool
+    resend_available_in_seconds: int = Field(ge=0)
+
+
 class VerifyEmailRequest(BaseModel):
     token: str = Field(min_length=20)
 

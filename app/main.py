@@ -119,6 +119,7 @@ from app.schemas import (
     TotpVerifyRequest,
     TwoFactorLoginRequest,
     UserSessionResponse,
+    VerificationPendingResponse,
     VerifyEmailRequest,
     VoiceMemoryRecallHitResponse,
     VoiceMemoryRecallRequest,
@@ -786,6 +787,33 @@ async def resend_verification(
         delivery,
         message="If the account still needs verification, a new link has been sent.",
     )
+
+
+@app.post("/auth/verification/pending", response_model=VerificationPendingResponse)
+async def verification_pending(
+    payload: EmailAddressRequest, db: DatabaseSession
+) -> VerificationPendingResponse:
+    """SON-1363 check-inbox/pending-state probe (read-only; no mail side effects).
+
+    Answers the FE check-inbox question "does this address still need
+    verification?" without leaking whether the address exists: the response
+    envelope is identical for unknown, verified, and deactivated addresses, and
+    only an active account with no ``email_verified_at`` reports
+    ``pending=true``. No token rotation, no resend, no rate-limit mutation —
+    ``resend_available_in_seconds`` is always 0 because the reviewed resend
+    path has no cooldown.
+    """
+
+    pending = False
+    async with db.begin():
+        resolved = await _resolve_auth_scope(db, payload.email)
+        if resolved is not None:
+            scope, user_id = resolved
+            await set_tenant_scope(db, scope)
+            user = await db.get(AppUser, user_id)
+            if user is not None and user.is_active and user.email_verified_at is None:
+                pending = True
+    return VerificationPendingResponse(pending=pending, resend_available_in_seconds=0)
 
 
 @app.post("/auth/verify-email")
