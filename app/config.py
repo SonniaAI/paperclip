@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     two_factor_ttl_seconds: int = 300
     auth_max_failures: int = 5
     auth_lockout_seconds: int = 900
+    auth_probe_max_hits: int = 30
+    auth_probe_window_seconds: int = 900
     secure_cookies: bool = True
     public_app_url: str = "http://localhost:5173"
     smtp_host: str | None = None
@@ -62,6 +64,10 @@ class Settings(BaseSettings):
             raise ValueError("MANAGER_AUTH_MAX_FAILURES must be positive")
         if self.auth_lockout_seconds < 1:
             raise ValueError("MANAGER_AUTH_LOCKOUT_SECONDS must be positive")
+        if self.auth_probe_max_hits < 1:
+            raise ValueError("MANAGER_AUTH_PROBE_MAX_HITS must be positive")
+        if self.auth_probe_window_seconds < 1:
+            raise ValueError("MANAGER_AUTH_PROBE_WINDOW_SECONDS must be positive")
         if self.smtp_host and not self.smtp_from_email:
             raise ValueError("MANAGER_SMTP_FROM_EMAIL is required when SMTP is configured")
         if bool(self.smtp_username) != bool(self.smtp_password):

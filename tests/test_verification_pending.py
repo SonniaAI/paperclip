@@ -18,7 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.database import TenantScope, get_session
-from app.main import _resolve_auth_scope, app, verification_pending
+from app.main import _reset_auth_probe_limits, _resolve_auth_scope, app, verification_pending
 from app.models import AppUser
 from app.schemas import VerificationPendingResponse
 
@@ -79,7 +79,9 @@ def _install(session: _FakeSession) -> None:
 
 @pytest.fixture(autouse=True)
 def _cleanup_overrides():
+    _reset_auth_probe_limits()  # SON-1374: keep probe counters out of test coupling
     yield
+    _reset_auth_probe_limits()
     app.dependency_overrides.pop(get_session, None)
 
 

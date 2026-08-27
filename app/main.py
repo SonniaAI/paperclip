@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -392,6 +393,97 @@ async def _record_failure_and_raise(db: AsyncSession, *, email: str, request: Re
     raise _invalid_credentials()
 
 
+# ---------------------------------------------------------------------------
+# Per-IP auth-probe rate limiting (SON-1374)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _AuthProbeWindow:
+    """Fixed-window per-IP hit counter for one unauthenticated probe route."""
+
+    hits: int
+    window_started_at: datetime
+    blocked_until: datetime | None
+
+
+_auth_probe_windows: dict[tuple[str, str], _AuthProbeWindow] = {}
+_auth_probe_lock = asyncio.Lock()
+_AUTH_PROBE_ROUTES = frozenset({"resend-verification", "verification-pending"})
+
+
+def _reset_auth_probe_limits() -> None:
+    """Clear all per-IP probe counters. Test/diagnostic hook only."""
+
+    _auth_probe_windows.clear()
+
+
+def _auth_probe_429(retry_after_seconds: int) -> HTTPException:
+    # Same response contract as the login-failure lockout: 429 + rate_limited
+    # code + Retry-After, so clients already handling sign-in throttling need
+    # no new handling for probe throttling.
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={
+            "code": "rate_limited",
+            "message": "Too many verification requests. Try again later.",
+        },
+        headers={"Retry-After": str(max(1, retry_after_seconds))},
+    )
+
+
+async def _check_auth_probe_limit(route: str, request: Request) -> None:
+    """Throttle unauthenticated auth-probe routes per client IP (SON-1374).
+
+    ``POST /auth/resend-verification`` and ``POST /auth/verification/pending``
+    answer unauthenticated, so without this guard a single client can probe
+    addresses at line rate. Mirrors the login-failure lockout middleware
+    pattern: after ``MANAGER_AUTH_PROBE_MAX_HITS`` requests within
+    ``MANAGER_AUTH_PROBE_WINDOW_SECONDS`` from one IP, the route returns the
+    same 429 ``rate_limited`` envelope as sign-in lockout (with ``Retry-After``)
+    for the remainder of the window. Counters are per route and per IP.
+
+    State is in-process (per worker): the deployment runs a single uvicorn
+    worker per pod, so an N-replica rollout multiplies the effective
+    cluster-wide threshold by N. No database writes — probe routes stay
+    read-only on the request session (SON-1363 contract).
+    """
+
+    if route not in _AUTH_PROBE_ROUTES:
+        return
+    key = (route, _auth_hash(_request_ip(request)))
+    now = datetime.now(UTC)
+    window = timedelta(seconds=settings.auth_probe_window_seconds)
+    async with _auth_probe_lock:
+        state = _auth_probe_windows.get(key)
+        if state is not None and state.blocked_until is not None:
+            if state.blocked_until > now:
+                retry_after = int((state.blocked_until - now).total_seconds())
+                raise _auth_probe_429(retry_after)
+            # Block served its time; start a fresh counting window.
+            state.blocked_until = None
+            state.hits = 0
+            state.window_started_at = now
+        if state is None or now - state.window_started_at >= window:
+            state = _AuthProbeWindow(hits=0, window_started_at=now, blocked_until=None)
+            _auth_probe_windows[key] = state
+        state.hits += 1
+        if state.hits > settings.auth_probe_max_hits:
+            state.blocked_until = now + window
+            state.hits = 0
+            state.window_started_at = now
+            raise _auth_probe_429(settings.auth_probe_window_seconds)
+        if len(_auth_probe_windows) > 10_000:
+            # Spoofed-XFF floods must not grow the map unboundedly.
+            for stale_key in [
+                key
+                for key, value in _auth_probe_windows.items()
+                if (value.blocked_until is None or value.blocked_until <= now)
+                and now - value.window_started_at >= window
+            ]:
+                del _auth_probe_windows[stale_key]
+
+
 async def _auth_user_response(
     db: AsyncSession, *, user: AppUser, scope: TenantScope
 ) -> AuthUserResponse:
@@ -751,8 +843,9 @@ async def register(payload: RegisterRequest, db: DatabaseSession) -> RegisterRes
 
 @app.post("/auth/resend-verification", response_model=EmailDeliveryResponse)
 async def resend_verification(
-    payload: EmailAddressRequest, db: DatabaseSession
+    payload: EmailAddressRequest, request: Request, db: DatabaseSession
 ) -> EmailDeliveryResponse:
+    await _check_auth_probe_limit("resend-verification", request)
     token: str | None = None
     recipient: str | None = None
     display_name: str | None = None
@@ -791,7 +884,7 @@ async def resend_verification(
 
 @app.post("/auth/verification/pending", response_model=VerificationPendingResponse)
 async def verification_pending(
-    payload: EmailAddressRequest, db: DatabaseSession
+    payload: EmailAddressRequest, request: Request, db: DatabaseSession
 ) -> VerificationPendingResponse:
     """SON-1363 check-inbox/pending-state probe (read-only; no mail side effects).
 
@@ -801,9 +894,11 @@ async def verification_pending(
     only an active account with no ``email_verified_at`` reports
     ``pending=true``. No token rotation, no resend, no rate-limit mutation —
     ``resend_available_in_seconds`` is always 0 because the reviewed resend
-    path has no cooldown.
+    path has no cooldown. The only write in the request path is the in-process
+    per-IP probe counter (SON-1374), which runs before any database work.
     """
 
+    await _check_auth_probe_limit("verification-pending", request)
     pending = False
     async with db.begin():
         resolved = await _resolve_auth_scope(db, payload.email)
