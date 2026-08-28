@@ -43,6 +43,7 @@ from app.dev_preview import (
 from app.dev_preview import (
     is_production_environment as dev_preview_is_production,
 )
+from app.dev_states import dev_states_index_html
 from app.email_delivery import (
     EmailDeliveryResult,
     deliver_action_email,
@@ -3098,3 +3099,15 @@ async def dev_emails_preview_raw(
         return PlainTextResponse(content=rendered.plain_text)
     html_content = rendered.html if images == "on" else html_with_images_blocked(rendered.html)
     return HTMLResponse(content=html_content)
+
+
+@app.get(
+    "/dev/states",
+    dependencies=[Depends(_require_non_production)],
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+async def dev_states_gallery() -> HTMLResponse:
+    """Every auth state from the Auth Flow prompt §3 table on one labelled page."""
+
+    return HTMLResponse(content=dev_states_index_html())
