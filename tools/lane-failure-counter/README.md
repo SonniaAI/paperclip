@@ -107,3 +107,22 @@ provide the focused crossing/replay evidence without modifying the accepted
 WP-A export state. The [`wp-c-dry-run-2026-08-30.md`](./evidence/wp-c-dry-run-2026-08-30.md)
 receipt records the correlated recovery-clear and inspectable transition
 state from the same fixture.
+
+## WP-B sink delivery (server producer, SON-1440)
+
+Transport is no longer "outside": the server-side producer
+`server/src/services/lane-failure-watchdog.ts` consumes terminal
+`heartbeat_runs` (write-attribution via `activity_log`, excluding
+`environment.lease*` / `heartbeat.invoked`) plus Class C reconcile-stranding
+activity rows, drives this reducer, and posts `threshold_crossing` /
+`recovery_clear` events as comments on the Operations sink issue (default
+identifier `SON-1334`; env `PAPERCLIP_LANE_WATCHDOG_SINK_IDENTIFIER`). Reducer
+state + cursor persist per company in `lane_failure_watchdog_state`
+(migration `0228_lane_failure_watchdog_state.sql`); emissions insert BEFORE the
+persist, so delivery is at-least-once while the persisted latch dedups every
+restart/replay path.
+
+This tool copy stays the CANONICAL reducer. The server imports a vendored
+byte-identical copy (`server/src/vendor/lane-failure-counter/`) because the
+server tsconfig pins `rootDir: src`; a sync test fails the build if the two
+drift. Change the reducer here first, then re-copy verbatim.
