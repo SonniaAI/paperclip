@@ -498,3 +498,217 @@ describe("WP-B threshold crossing events", () => {
     expect(result.state.signals.lane?.C).toMatchObject({ current_streak: 1, alert_emitted: true });
   });
 });
+
+describe("WP-C recovery-clear events", () => {
+  it("emits a correlated clear on readonly success and preserves transition history", () => {
+    const alerted = applyCounterState(
+      createEmptyCounterState("2026-08-30T00:00:00Z"),
+      [
+        record("clear-a-1", "lane", "terminal_fail", "2026-08-30T00:01:00Z"),
+        record("clear-a-2", "lane", "terminal_fail", "2026-08-30T00:02:00Z"),
+        record("clear-a-3", "lane", "terminal_fail", "2026-08-30T00:03:00Z"),
+      ],
+      { now: () => "2026-08-30T00:04:00Z" },
+    );
+    const recovered = applyCounterState(
+      alerted.state,
+      [record("clear-success", "lane", "success_readonly", "2026-08-30T00:05:00Z")],
+      { now: () => "2026-08-30T00:06:00Z" },
+    );
+
+    expect(recovered.recovery_clears).toEqual([
+      {
+        event_type: "recovery_clear",
+        emitted_at: "2026-08-30T00:06:00.000Z",
+        lane_id: "lane",
+        class: "A",
+        signal: "generic/ws-open",
+        count: 3,
+        threshold: 3,
+        first_failure_ts: "2026-08-30T00:01:00.000Z",
+        last_failure_ts: "2026-08-30T00:03:00.000Z",
+        alert_emitted_at: "2026-08-30T00:04:00.000Z",
+        run_id: "clear-success",
+      },
+    ]);
+    expect(recovered.state.signals.lane?.A).toMatchObject({
+      current_streak: 0,
+      first_failure_ts: null,
+      last_failure_ts: null,
+      last_success_ts: "2026-08-30T00:05:00.000Z",
+      alert_emitted: false,
+      last_alert_ts: "2026-08-30T00:04:00.000Z",
+      last_clear_ts: "2026-08-30T00:06:00.000Z",
+      last_transition_ts: "2026-08-30T00:06:00.000Z",
+    });
+  });
+
+  it("does not emit a clear when success resets a below-threshold streak", () => {
+    const belowThreshold = applyCounterState(
+      createEmptyCounterState("2026-08-30T00:00:00Z"),
+      [
+        record("below-1", "lane", "terminal_fail", "2026-08-30T00:01:00Z"),
+        record("below-2", "lane", "terminal_fail", "2026-08-30T00:02:00Z"),
+      ],
+      { now: () => "2026-08-30T00:03:00Z" },
+    );
+    const recovered = applyCounterState(
+      belowThreshold.state,
+      [record("below-success", "lane", "success", "2026-08-30T00:04:00Z")],
+      { now: () => "2026-08-30T00:05:00Z" },
+    );
+
+    expect(recovered.recovery_clears).toEqual([]);
+    expect(recovered.state.signals.lane?.A).toMatchObject({
+      current_streak: 0,
+      alert_emitted: false,
+      last_alert_ts: null,
+      last_clear_ts: null,
+      last_transition_ts: null,
+    });
+  });
+
+  it("clears only the explicitly recovered class and keeps Class B latched", () => {
+    const alerted = applyCounterState(
+      createEmptyCounterState("2026-08-30T00:00:00Z"),
+      [
+        record("isolation-a", "lane", "terminal_fail", "2026-08-30T00:01:00Z"),
+        record("isolation-b", "lane", "zero_write", "2026-08-30T00:02:00Z"),
+      ],
+      {
+        now: () => "2026-08-30T00:03:00Z",
+        thresholds: { A: 1, B: 1 },
+      },
+    );
+    const classARecovered = applyCounterState(
+      alerted.state,
+      [record("isolation-a-recovery", "lane", "success", "2026-08-30T00:04:00Z", 0, { signal_class: "A" })],
+      { now: () => "2026-08-30T00:05:00Z", thresholds: { A: 1, B: 1 } },
+    );
+
+    expect(classARecovered.recovery_clears).toHaveLength(1);
+    expect(classARecovered.recovery_clears[0]).toMatchObject({ class: "A", run_id: "isolation-a-recovery" });
+    expect(classARecovered.state.signals.lane?.A).toMatchObject({
+      current_streak: 0,
+      alert_emitted: false,
+      last_clear_ts: "2026-08-30T00:05:00.000Z",
+    });
+    expect(classARecovered.state.signals.lane?.B).toMatchObject({ current_streak: 1, alert_emitted: true });
+
+    const allRecovered = applyCounterState(
+      classARecovered.state,
+      [record("isolation-b-recovery", "lane", "success", "2026-08-30T00:06:00Z")],
+      { now: () => "2026-08-30T00:07:00Z", thresholds: { A: 1, B: 1 } },
+    );
+    expect(allRecovered.recovery_clears).toHaveLength(1);
+    expect(allRecovered.recovery_clears[0]).toMatchObject({ class: "B", run_id: "isolation-b-recovery" });
+  });
+
+  it("does not duplicate a clear after persisted restart and replay", () => {
+    const alerted = applyCounterState(
+      createEmptyCounterState("2026-08-30T00:00:00Z"),
+      [
+        record("restart-1", "lane", "terminal_fail", "2026-08-30T00:01:00Z"),
+        record("restart-2", "lane", "terminal_fail", "2026-08-30T00:02:00Z"),
+        record("restart-3", "lane", "terminal_fail", "2026-08-30T00:03:00Z"),
+      ],
+      { now: () => "2026-08-30T00:04:00Z" },
+    );
+    const restarted = parseCounterState(JSON.parse(serializeCounterState(alerted.state)) as unknown);
+    const recovery = record("restart-success", "lane", "success", "2026-08-30T00:05:00Z");
+    const firstRecovery = applyCounterState(restarted, [recovery], { now: () => "2026-08-30T00:06:00Z" });
+    const replay = applyCounterState(firstRecovery.state, [recovery], { now: () => "2026-08-30T00:07:00Z" });
+
+    expect(firstRecovery.recovery_clears).toHaveLength(1);
+    expect(replay.already_processed_run_ids).toEqual(["restart-success"]);
+    expect(replay.recovery_clears).toEqual([]);
+    expect(replay.state).toEqual(firstRecovery.state);
+  });
+
+  it("merges an active alias alert before clearing it under the canonical lane", () => {
+    const oldAliasState = applyCounterState(
+      createEmptyCounterState("2026-08-30T00:00:00Z"),
+      [
+        record("alias-clear-1", "old lane", "terminal_fail", "2026-08-30T00:01:00Z"),
+        record("alias-clear-2", "old lane", "terminal_fail", "2026-08-30T00:02:00Z"),
+        record("alias-clear-3", "old lane", "terminal_fail", "2026-08-30T00:03:00Z"),
+      ],
+      { now: () => "2026-08-30T00:04:00Z" },
+    ).state;
+    const canonicalHistory = applyCounterState(
+      createEmptyCounterState("2026-08-30T00:00:00Z"),
+      [record("canonical-history", "canonical lane", "success", "2026-08-30T00:02:00Z")],
+      { now: () => "2026-08-30T00:03:00Z" },
+    ).state;
+    const merged = applyCounterState(
+      {
+        ...createEmptyCounterState("2026-08-30T00:00:00Z"),
+        processed_run_ids: [...oldAliasState.processed_run_ids, ...canonicalHistory.processed_run_ids],
+        lanes: {
+          "old lane": oldAliasState.lanes["old lane"]!,
+          "canonical lane": canonicalHistory.lanes["canonical lane"]!,
+        },
+        signals: {
+          "old lane": oldAliasState.signals["old lane"]!,
+          "canonical lane": canonicalHistory.signals["canonical lane"]!,
+        },
+      },
+      [record("alias-clear-success", "canonical lane", "success_readonly", "2026-08-30T00:05:00Z")],
+      {
+        now: () => "2026-08-30T00:06:00Z",
+        laneAliases: { "old lane": "canonical lane" },
+      },
+    );
+
+    expect(merged.recovery_clears).toHaveLength(1);
+    expect(merged.recovery_clears[0]).toMatchObject({
+      lane_id: "canonical lane",
+      class: "A",
+      alert_emitted_at: "2026-08-30T00:04:00.000Z",
+    });
+    expect(merged.state.signals["old lane"]).toBeUndefined();
+    expect(merged.state.signals["canonical lane"]?.A).toMatchObject({
+      current_streak: 0,
+      alert_emitted: false,
+      last_clear_ts: "2026-08-30T00:06:00.000Z",
+    });
+  });
+
+  it("clears Class C after an ordinary success while keeping stranding success latched", () => {
+    const stranded = applyCounterState(
+      createEmptyCounterState("2026-08-30T00:00:00Z"),
+      [
+        record("class-c-stranded", "lane", "success", "2026-08-30T00:01:00Z", 0, {
+          signal_class: "C",
+          signal: "successful_run_missing_state",
+          issue_id: "issue-c",
+          cause_code: "successful_run_missing_state",
+        }),
+      ],
+      { now: () => "2026-08-30T00:02:00Z" },
+    );
+    const recovered = applyCounterState(
+      stranded.state,
+      [record("class-c-recovery", "lane", "success_readonly", "2026-08-30T00:03:00Z")],
+      { now: () => "2026-08-30T00:04:00Z" },
+    );
+
+    expect(stranded.recovery_clears).toEqual([]);
+    expect(recovered.recovery_clears).toEqual([
+      {
+        event_type: "recovery_clear",
+        emitted_at: "2026-08-30T00:04:00.000Z",
+        lane_id: "lane",
+        class: "C",
+        signal: "stranded_assigned_issue",
+        count: 1,
+        threshold: 1,
+        first_failure_ts: "2026-08-30T00:01:00.000Z",
+        last_failure_ts: "2026-08-30T00:01:00.000Z",
+        alert_emitted_at: "2026-08-30T00:02:00.000Z",
+        run_id: "class-c-recovery",
+      },
+    ]);
+    expect(recovered.state.signals.lane?.C).toMatchObject({ current_streak: 0, alert_emitted: false });
+  });
+});

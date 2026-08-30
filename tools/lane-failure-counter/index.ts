@@ -92,7 +92,7 @@ export interface LaneCounterState {
   failure_counts: FailureCounts;
 }
 
-/** Persisted WP-B state for one canonical lane and one signal class. */
+/** Persisted WP-B/WP-C state for one canonical lane and one signal class. */
 export interface SignalCounterState {
   current_streak: number;
   first_failure_ts: string | null;
@@ -101,6 +101,12 @@ export interface SignalCounterState {
   updated_at: string;
   threshold: number;
   alert_emitted: boolean;
+  /** When the current/most recent threshold-crossing alert was emitted. */
+  last_alert_ts: string | null;
+  /** When the current/most recent alert was cleared by a successful run. */
+  last_clear_ts: string | null;
+  /** The latest alert-state transition, either alert or recovery clear. */
+  last_transition_ts: string | null;
 }
 
 export type LaneSignalStates = Partial<Record<SignalClass, SignalCounterState>>;
@@ -111,7 +117,7 @@ export interface CounterState {
   processed_run_ids: string[];
   lanes: Record<string, LaneCounterState>;
   /**
-   * Additive WP-B state.  Keeping it separate preserves the WP-A `lanes`
+   * Additive WP-B/WP-C state. Keeping it separate preserves the WP-A `lanes`
    * shape for existing readers while making the per-(lane,class) state
    * inspectable and persistable.
    */
@@ -140,6 +146,24 @@ export interface ThresholdCrossingEvent {
   cause_code?: string;
 }
 
+export interface RecoveryClearEvent {
+  event_type: "recovery_clear";
+  emitted_at: string;
+  lane_id: string;
+  class: SignalClass;
+  signal: string;
+  /** The active streak count immediately before the successful reset. */
+  count: number;
+  threshold: number;
+  first_failure_ts: string | null;
+  last_failure_ts: string | null;
+  /** Links this clear to the threshold crossing that set the alert latch. */
+  alert_emitted_at: string | null;
+  run_id?: string;
+  issue_id?: string;
+  cause_code?: string;
+}
+
 export interface SkippedRecord {
   run_id: string;
   lane: string;
@@ -155,6 +179,7 @@ export interface ApplyResult {
   conflicting_duplicate_run_ids: string[];
   skipped: SkippedRecord[];
   threshold_crossings: ThresholdCrossingEvent[];
+  recovery_clears: RecoveryClearEvent[];
   /** Aliases make the result readable to callers that think in alerts/events. */
   emitted_alerts: ThresholdCrossingEvent[];
   events: ThresholdCrossingEvent[];
@@ -755,6 +780,9 @@ function newSignalState(updatedAt: string, threshold: number): SignalCounterStat
     updated_at: updatedAt,
     threshold,
     alert_emitted: false,
+    last_alert_ts: null,
+    last_clear_ts: null,
+    last_transition_ts: null,
   };
 }
 
@@ -770,6 +798,9 @@ function parseSignalState(value: unknown, signalClass: SignalClass): SignalCount
     updated_at: updatedAt,
     threshold: positiveInteger(value.threshold, DEFAULT_THRESHOLDS[signalClass]),
     alert_emitted: readBoolean(value.alert_emitted),
+    last_alert_ts: normalizedTimestampOrNull(value.last_alert_ts),
+    last_clear_ts: normalizedTimestampOrNull(value.last_clear_ts),
+    last_transition_ts: normalizedTimestampOrNull(value.last_transition_ts),
   };
 }
 
@@ -922,6 +953,12 @@ function mergeSignalStates(left: SignalCounterState, right: SignalCounterState):
   const currentStreak = mergedCurrentStreak(left, right);
   const latestSuccess = latestTimestamp(left.last_success_ts, right.last_success_ts);
   const latestFailure = latestTimestamp(left.last_failure_ts, right.last_failure_ts);
+  const lastAlertTs = latestTimestamp(left.last_alert_ts, right.last_alert_ts);
+  const lastClearTs = latestTimestamp(left.last_clear_ts, right.last_clear_ts);
+  const lastTransitionTs = latestTimestamp(
+    latestTimestamp(left.last_transition_ts, right.last_transition_ts),
+    latestTimestamp(lastAlertTs, lastClearTs),
+  );
   const newerState = left.updated_at >= right.updated_at ? left : right;
   const leftIsLive = Boolean(
     left.last_success_ts && right.last_failure_ts && left.last_success_ts >= right.last_failure_ts,
@@ -976,6 +1013,9 @@ function mergeSignalStates(left: SignalCounterState, right: SignalCounterState):
     updated_at: latestTimestamp(left.updated_at, right.updated_at)!,
     threshold: newerState.threshold,
     alert_emitted: alertEmitted,
+    last_alert_ts: lastAlertTs,
+    last_clear_ts: lastClearTs,
+    last_transition_ts: lastTransitionTs,
   };
 }
 
@@ -1027,6 +1067,7 @@ export function applyCounterState(
   const alreadyProcessedRunIds: string[] = [];
   const skipped: SkippedRecord[] = [];
   const thresholdCrossings: ThresholdCrossingEvent[] = [];
+  const recoveryClears: RecoveryClearEvent[] = [];
 
   for (const record of coalesced.records) {
     if (processed.has(record.run_id)) {
@@ -1116,6 +1157,8 @@ export function applyCounterState(
         if (record.cause_code) event.cause_code = record.cause_code;
         thresholdCrossings.push(event);
         signalState.alert_emitted = true;
+        signalState.last_alert_ts = now;
+        signalState.last_transition_ts = now;
       }
       laneSignals[signalClass] = signalState;
       state.signals[record.lane] = laneSignals;
@@ -1131,12 +1174,33 @@ export function applyCounterState(
             now,
             effectiveThreshold(resetClass, undefined, options.thresholds),
           );
+          const threshold = effectiveThreshold(resetClass, existingSignalState, options.thresholds);
+          if (signalState.alert_emitted) {
+            const event: RecoveryClearEvent = {
+              event_type: "recovery_clear",
+              emitted_at: now,
+              lane_id: record.lane,
+              class: resetClass,
+              signal: signalLabelForNormalizedRecord(record, resetClass),
+              count: signalState.current_streak,
+              threshold,
+              first_failure_ts: signalState.first_failure_ts,
+              last_failure_ts: signalState.last_failure_ts,
+              alert_emitted_at: signalState.last_alert_ts,
+              run_id: record.run_id,
+            };
+            if (record.issue_id) event.issue_id = record.issue_id;
+            if (record.cause_code) event.cause_code = record.cause_code;
+            recoveryClears.push(event);
+            signalState.last_clear_ts = now;
+            signalState.last_transition_ts = now;
+          }
           signalState.current_streak = 0;
           signalState.first_failure_ts = null;
           signalState.last_failure_ts = null;
           signalState.last_success_ts = latestTimestamp(signalState.last_success_ts, record.finished_at);
           signalState.updated_at = now;
-          signalState.threshold = effectiveThreshold(resetClass, existingSignalState, options.thresholds);
+          signalState.threshold = threshold;
           signalState.alert_emitted = false;
           targetSignals[resetClass] = signalState;
         }
@@ -1159,6 +1223,7 @@ export function applyCounterState(
     conflicting_duplicate_run_ids: coalesced.conflictingDuplicateRunIds,
     skipped,
     threshold_crossings: thresholdCrossings,
+    recovery_clears: recoveryClears,
     emitted_alerts: thresholdCrossings,
     events: thresholdCrossings,
   };

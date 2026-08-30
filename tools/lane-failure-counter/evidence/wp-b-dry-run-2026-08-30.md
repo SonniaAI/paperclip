@@ -27,6 +27,8 @@ node tools/lane-failure-counter/dist/dry-run.js \
 - Duplicate run IDs: **1** (`wpb-b-3`, coalesced before reduction)
 - Threshold crossings: **3** — Class A at counts 3 and 3 after the
   `success_readonly` reset, and Class B at count 3
+- WP-C recovery clears: **1** — Class A cleared by `wpb-a-reset` after its
+  four-record active streak
 - Canonical lanes: `PE display` merged into `Product Engineer`; `Zero Write
   Display` reduced under `lane-b`
 - Class A and Class B each retained an independent count-3 latch
@@ -34,6 +36,10 @@ node tools/lane-failure-counter/dist/dry-run.js \
 The resulting signal state records current-streak timestamps in UTC ISO form:
 Class A's re-crossing is `00:06:00Z`–`00:08:00Z`; Class B's crossing is
 `00:01:30Z`–`00:03:30Z`.
+
+The `success_readonly` reset also produces the WP-C `recovery_clear` event;
+the dedicated receipt below records its correlation and persisted transition
+fields.
 
 ## Read-only replay
 

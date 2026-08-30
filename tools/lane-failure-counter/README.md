@@ -1,6 +1,6 @@
-# SON-1536 WP-A/WP-B — lane failure counter and crossing events
+# SON-1536 WP-A/WP-B/WP-C — lane failure counter and transition events
 
-This is a standalone TypeScript reducer for the WP-A/WP-B slices. It does not import
+This is a standalone TypeScript reducer for the WP-A/WP-B/WP-C slices. It does not import
 the Paperclip server, gateway, adapter, or database packages, and it performs
 no database writes.
 
@@ -47,6 +47,27 @@ Lane names can be resolved at the input boundary with an agents-table-backed
 records and persisted state are canonicalized before reduction, so a display
 name rename does not split a streak or orphan its alert latch.
 
+## WP-C recovery-clear contract
+
+When an ordinary `success` or `success_readonly` record resets a class whose
+`alert_emitted` latch is on, the reducer emits one correlated `recovery_clear`
+event. A success below the threshold resets the current streak but does not
+emit a clear because there is no alert to resolve. Class C stranding records
+remain signal increments, including their success-shaped outcome; a later
+ordinary success performs the recovery clear.
+
+Each clear contains the canonical lane/class/signal, the pre-reset `count` and
+threshold, the prior current-streak timestamps, the UTC `emitted_at`, and
+`alert_emitted_at` pointing to the crossing that set the latch. Run, issue, and
+cause metadata are carried when present. The result exposes these events as
+`recovery_clears`; transport and sink delivery remain outside WP-C.
+
+The persisted signal state remains read-only inspectable after the reset:
+`alert_emitted` is `false`, current streak timestamps are cleared, and
+`last_alert_ts`, `last_clear_ts`, and `last_transition_ts` preserve the
+alert/clear transition history. These fields are additive and old version-1
+states parse with null transition history.
+
 ## Read-only dry run
 
 The CLI is read-only by default and accepts the manager's JSONL export:
@@ -83,4 +104,6 @@ never observe a partial JSON document.
 The committed [`wp-b-crossing-fixture.jsonl`](./evidence/wp-b-crossing-fixture.jsonl)
 and [`wp-b-dry-run-2026-08-30.md`](./evidence/wp-b-dry-run-2026-08-30.md)
 provide the focused crossing/replay evidence without modifying the accepted
-WP-A export state.
+WP-A export state. The [`wp-c-dry-run-2026-08-30.md`](./evidence/wp-c-dry-run-2026-08-30.md)
+receipt records the correlated recovery-clear and inspectable transition
+state from the same fixture.

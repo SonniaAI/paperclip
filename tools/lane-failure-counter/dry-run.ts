@@ -133,6 +133,7 @@ const output: Record<string, unknown> = {
   conflicting_duplicate_run_ids: result.conflicting_duplicate_run_ids,
   skipped: result.skipped,
   threshold_crossings: result.threshold_crossings,
+  recovery_clears: result.recovery_clears,
   lanes: stateSummary(result.state),
   signals: signalSummary(result.state),
 };
