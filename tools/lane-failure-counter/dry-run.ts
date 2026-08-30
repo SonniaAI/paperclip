@@ -97,6 +97,14 @@ function stateSummary(state: CounterState) {
   );
 }
 
+function signalSummary(state: CounterState) {
+  return Object.fromEntries(
+    Object.entries(state.signals)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([lane, laneSignals]) => [lane, laneSignals]),
+  );
+}
+
 const options = parseArgs(process.argv.slice(2));
 const parsed = await parseLedgerFile(options.ledgerPath, { laneAliases: options.laneAliases });
 const initial = options.statePath
@@ -126,6 +134,7 @@ const output: Record<string, unknown> = {
   skipped: result.skipped,
   threshold_crossings: result.threshold_crossings,
   lanes: stateSummary(result.state),
+  signals: signalSummary(result.state),
 };
 if (parsed.metadata) output.metadata = parsed.metadata;
 if (options.printState) output.state = result.state;

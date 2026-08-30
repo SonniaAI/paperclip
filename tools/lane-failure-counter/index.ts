@@ -726,9 +726,10 @@ function positiveInteger(value: unknown, fallback: number): number {
 function thresholdFor(signalClass: SignalClass, thresholds: ThresholdConfig = {}): number {
   const configured = thresholds[signalClass];
   if (configured === undefined) return DEFAULT_THRESHOLDS[signalClass];
-  const threshold = positiveInteger(configured, 0);
-  if (threshold === 0) throw new Error(`Threshold for Class ${signalClass} must be a positive integer`);
-  return threshold;
+  if (typeof configured !== "number" || !Number.isInteger(configured) || configured <= 0) {
+    throw new Error(`Threshold for Class ${signalClass} must be a positive integer`);
+  }
+  return configured;
 }
 
 function effectiveThreshold(
@@ -921,22 +922,60 @@ function mergeSignalStates(left: SignalCounterState, right: SignalCounterState):
   const currentStreak = mergedCurrentStreak(left, right);
   const latestSuccess = latestTimestamp(left.last_success_ts, right.last_success_ts);
   const latestFailure = latestTimestamp(left.last_failure_ts, right.last_failure_ts);
-  const successClearedAllKnownFailures = Boolean(
-    latestSuccess && latestFailure && latestSuccess >= latestFailure,
-  );
   const newerState = left.updated_at >= right.updated_at ? left : right;
+  const leftIsLive = Boolean(
+    left.last_success_ts && right.last_failure_ts && left.last_success_ts >= right.last_failure_ts,
+  );
+  const rightIsLive = Boolean(
+    right.last_success_ts && left.last_failure_ts && right.last_success_ts >= left.last_failure_ts,
+  );
+  const sameSnapshot = Boolean(
+    left.last_failure_ts &&
+      right.last_failure_ts &&
+      left.last_failure_ts === right.last_failure_ts &&
+      left.last_success_ts === right.last_success_ts,
+  );
+
+  const firstFailureTs = currentStreak === 0
+    ? null
+    : leftIsLive
+      ? left.first_failure_ts
+      : rightIsLive
+        ? right.first_failure_ts
+        : sameSnapshot
+          ? (left.current_streak >= right.current_streak ? left.first_failure_ts : right.first_failure_ts)
+          : left.current_streak === 0
+            ? right.first_failure_ts
+            : right.current_streak === 0
+              ? left.first_failure_ts
+              : earliestTimestamp(left.first_failure_ts, right.first_failure_ts);
+  const alertEmitted = currentStreak === 0
+    ? false
+    : leftIsLive
+      ? left.alert_emitted
+      : rightIsLive
+        ? right.alert_emitted
+        : sameSnapshot
+          ? left.alert_emitted || right.alert_emitted
+          : left.current_streak === 0
+            ? right.alert_emitted
+            : right.current_streak === 0
+              ? left.alert_emitted
+              : left.alert_emitted || right.alert_emitted;
   return {
     current_streak: currentStreak,
-    first_failure_ts: currentStreak > 0
-      ? earliestTimestamp(left.first_failure_ts, right.first_failure_ts)
+    first_failure_ts: firstFailureTs,
+    last_failure_ts: currentStreak > 0
+      ? leftIsLive
+        ? left.last_failure_ts
+        : rightIsLive
+          ? right.last_failure_ts
+          : latestFailure
       : null,
-    last_failure_ts: latestFailure,
     last_success_ts: latestSuccess,
     updated_at: latestTimestamp(left.updated_at, right.updated_at)!,
     threshold: newerState.threshold,
-    alert_emitted: successClearedAllKnownFailures
-      ? false
-      : left.alert_emitted || right.alert_emitted,
+    alert_emitted: alertEmitted,
   };
 }
 
@@ -996,10 +1035,18 @@ export function applyCounterState(
     }
 
     const signalClass = classifySignalClass(record);
+    const isClassCStranding =
+      signalClass === "C" && (record.outcome === "success" || record.outcome === "success_readonly" || record.outcome === "other");
+    const incrementsSignal = Boolean(
+      signalClass &&
+        (FAILURE_SET.has(record.outcome as FailureOutcome) ||
+          record.outcome === "other" ||
+          isClassCStranding),
+    );
     const requiresTerminalTimestamp =
       FAILURE_SET.has(record.outcome as FailureOutcome) ||
       SUCCESS_SET.has(record.outcome) ||
-      signalClass !== null;
+      incrementsSignal;
     if (requiresTerminalTimestamp && !requireFinishedAt(record)) {
       skipped.push({
         run_id: record.run_id,
@@ -1010,10 +1057,10 @@ export function applyCounterState(
       continue;
     }
 
-    // Keep the WP-A aggregate shape intact for existing readers.  Class C is
-    // a distinct stranding signal whose outcome may be `success`, so it must
-    // not reset or mutate the legacy failure counter.
-    if (signalClass !== "C") {
+    // Keep the WP-A aggregate shape intact for existing readers. Class C is a
+    // distinct stranding signal whose success outcome is not a lane recovery,
+    // so that special signal must not reset the legacy counter.
+    if (!isClassCStranding) {
       const laneState = state.lanes[record.lane] ?? newLaneState(now);
       laneState.outcome_counts[record.outcome] += 1;
       laneState.updated_at = now;
@@ -1030,18 +1077,22 @@ export function applyCounterState(
       state.lanes[record.lane] = laneState;
     }
 
-    if (signalClass) {
+    if (incrementsSignal && signalClass) {
       const laneSignals = state.signals[record.lane] ?? {};
-      const threshold = thresholdFor(signalClass, options.thresholds);
-      const signalState = laneSignals[signalClass] ?? newSignalState(now, threshold);
+      const existingSignalState = laneSignals[signalClass];
+      const threshold = effectiveThreshold(signalClass, existingSignalState, options.thresholds);
+      const signalState = existingSignalState ?? newSignalState(now, threshold);
       const previousStreak = signalState.current_streak;
       signalState.threshold = threshold;
       signalState.updated_at = now;
       signalState.current_streak += 1;
-      if (previousStreak === 0 || !signalState.first_failure_ts) {
+      if (previousStreak === 0) {
         signalState.first_failure_ts = record.finished_at;
+        signalState.last_failure_ts = record.finished_at;
+      } else {
+        signalState.first_failure_ts = earliestTimestamp(signalState.first_failure_ts, record.finished_at);
+        signalState.last_failure_ts = latestTimestamp(signalState.last_failure_ts, record.finished_at);
       }
-      signalState.last_failure_ts = latestTimestamp(signalState.last_failure_ts, record.finished_at);
 
       if (signalState.current_streak >= threshold && !signalState.alert_emitted) {
         const firstFailureTs = signalState.first_failure_ts;
@@ -1070,17 +1121,26 @@ export function applyCounterState(
       state.signals[record.lane] = laneSignals;
     } else if (SUCCESS_SET.has(record.outcome)) {
       const laneSignals = state.signals[record.lane];
-      if (laneSignals) {
-        for (const signalClass of SIGNAL_CLASSES) {
-          const signalState = laneSignals[signalClass];
-          if (!signalState) continue;
+      const classesToReset = signalClass ? [signalClass] : SIGNAL_CLASSES;
+      if (laneSignals || signalClass) {
+        const targetSignals = laneSignals ?? {};
+        for (const resetClass of classesToReset) {
+          const existingSignalState = targetSignals[resetClass];
+          if (!existingSignalState && !signalClass) continue;
+          const signalState = existingSignalState ?? newSignalState(
+            now,
+            effectiveThreshold(resetClass, undefined, options.thresholds),
+          );
           signalState.current_streak = 0;
           signalState.first_failure_ts = null;
+          signalState.last_failure_ts = null;
           signalState.last_success_ts = latestTimestamp(signalState.last_success_ts, record.finished_at);
           signalState.updated_at = now;
-          signalState.threshold = thresholdFor(signalClass, options.thresholds);
+          signalState.threshold = effectiveThreshold(resetClass, existingSignalState, options.thresholds);
           signalState.alert_emitted = false;
+          targetSignals[resetClass] = signalState;
         }
+        if (Object.keys(targetSignals).length > 0) state.signals[record.lane] = targetSignals;
       }
     }
 
@@ -1111,7 +1171,19 @@ export function serializeCounterState(state: CounterState): string {
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([lane, laneState]) => [lane, laneState]),
   );
-  return `${JSON.stringify({ ...normalized, processed_run_ids: [...normalized.processed_run_ids].sort(), lanes }, null, 2)}\n`;
+  const signals = Object.fromEntries(
+    Object.entries(normalized.signals)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([lane, laneSignals]) => [
+        lane,
+        Object.fromEntries(
+          SIGNAL_CLASSES
+            .filter((signalClass) => laneSignals[signalClass] !== undefined)
+            .map((signalClass) => [signalClass, laneSignals[signalClass]]),
+        ),
+      ]),
+  );
+  return `${JSON.stringify({ ...normalized, processed_run_ids: [...normalized.processed_run_ids].sort(), lanes, signals }, null, 2)}\n`;
 }
 
 export async function readCounterState(path: string, now: Date | string = new Date()): Promise<CounterState> {

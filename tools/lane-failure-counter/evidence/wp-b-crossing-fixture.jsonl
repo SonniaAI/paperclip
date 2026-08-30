@@ -1,0 +1,13 @@
+{"meta":{"schema":"son-1536.wp-b.crossing-fixture.v1","purpose":"deterministic reducer-side crossing/replay probe","base_state":"state.json"}}
+{"run_id":"wpb-a-1","lane":"Product Engineer","outcome":"terminal_fail","finished_at":"2026-08-30T00:01:00Z"}
+{"run_id":"wpb-a-2","lane":"PE display","outcome":"terminal_fail","finished_at":"2026-08-30T00:02:00Z"}
+{"run_id":"wpb-a-3","lane":"PE display","outcome":"terminal_fail","finished_at":"2026-08-30T00:03:00Z"}
+{"run_id":"wpb-a-4","lane":"PE display","outcome":"terminal_fail","finished_at":"2026-08-30T00:04:00Z"}
+{"run_id":"wpb-a-reset","lane":"PE display","outcome":"success_readonly","finished_at":"2026-08-30T00:05:00Z"}
+{"run_id":"wpb-a-5","lane":"PE display","outcome":"terminal_fail","finished_at":"2026-08-30T00:06:00Z"}
+{"run_id":"wpb-a-6","lane":"PE display","outcome":"terminal_fail","finished_at":"2026-08-30T00:07:00Z"}
+{"run_id":"wpb-a-7","lane":"PE display","outcome":"terminal_fail","finished_at":"2026-08-30T00:08:00Z"}
+{"run_id":"wpb-b-1","lane":"Zero Write Display","outcome":"zero_write","finished_at":"2026-08-30T00:01:30Z"}
+{"run_id":"wpb-b-2","lane":"Zero Write Display","outcome":"zero_write","finished_at":"2026-08-30T00:02:30Z"}
+{"run_id":"wpb-b-3","lane":"Zero Write Display","outcome":"zero_write","finished_at":"2026-08-30T00:03:30Z"}
+{"run_id":"wpb-b-3","lane":"Zero Write Display","outcome":"zero_write","finished_at":"2026-08-30T00:03:30Z"}

@@ -79,3 +79,8 @@ tsx tools/lane-failure-counter/dry-run.ts \
 
 The state writer uses a same-directory temporary file and rename, so readers
 never observe a partial JSON document.
+
+The committed [`wp-b-crossing-fixture.jsonl`](./evidence/wp-b-crossing-fixture.jsonl)
+and [`wp-b-dry-run-2026-08-30.md`](./evidence/wp-b-dry-run-2026-08-30.md)
+provide the focused crossing/replay evidence without modifying the accepted
+WP-A export state.

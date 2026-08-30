@@ -330,6 +330,65 @@ describe("WP-B threshold crossing events", () => {
     });
   });
 
+  it("retains an explicit threshold through restart and clears the current failure boundary on readonly success", () => {
+    const first = applyCounterState(
+      createEmptyCounterState("2026-08-30T00:00:00Z"),
+      [
+        record("configured-1", "lane", "terminal_fail", "2026-08-30T00:01:00Z"),
+        record("configured-2", "lane", "terminal_fail", "2026-08-30T00:02:00Z"),
+      ],
+      { now: () => "2026-08-30T00:03:00Z", thresholds: { A: 2 } },
+    );
+    expect(first.threshold_crossings).toHaveLength(1);
+    expect(first.state.signals.lane?.A).toMatchObject({ threshold: 2, current_streak: 2, alert_emitted: true });
+
+    const reset = applyCounterState(
+      first.state,
+      [record("configured-success", "lane", "success_readonly", "2026-08-30T00:04:00Z")],
+      { now: () => "2026-08-30T00:05:00Z" },
+    );
+    expect(reset.state.signals.lane?.A).toMatchObject({
+      threshold: 2,
+      current_streak: 0,
+      first_failure_ts: null,
+      last_failure_ts: null,
+      last_success_ts: "2026-08-30T00:04:00.000Z",
+      alert_emitted: false,
+    });
+
+    const recross = applyCounterState(
+      reset.state,
+      [
+        record("configured-3", "lane", "terminal_fail", "2026-08-30T00:06:00Z"),
+        record("configured-4", "lane", "terminal_fail", "2026-08-30T00:07:00Z"),
+      ],
+      { now: () => "2026-08-30T00:08:00Z" },
+    );
+    expect(recross.threshold_crossings).toHaveLength(1);
+    expect(recross.threshold_crossings[0]).toMatchObject({ count: 2, threshold: 2 });
+  });
+
+  it("coalesces alias spellings of one run before incrementing or emitting", () => {
+    const result = applyCounterState(
+      createEmptyCounterState("2026-08-30T00:00:00Z"),
+      [
+        record("same-run", "legacy lane", "terminal_fail", "2026-08-30T00:01:00Z", 0),
+        record("same-run", "canonical lane", "terminal_fail", "2026-08-30T00:01:00Z", 1),
+      ],
+      {
+        now: () => "2026-08-30T00:02:00Z",
+        laneAliases: { "legacy lane": "canonical lane" },
+        thresholds: { A: 2 },
+      },
+    );
+
+    expect(result.duplicate_run_ids).toEqual(["same-run"]);
+    expect(result.applied).toHaveLength(1);
+    expect(result.state.signals["legacy lane"]).toBeUndefined();
+    expect(result.state.signals["canonical lane"]?.A).toMatchObject({ current_streak: 1, alert_emitted: false });
+    expect(result.threshold_crossings).toEqual([]);
+  });
+
   it("keeps the alert latch across a persisted restart and does not re-emit replayed failures", async () => {
     const directory = await mkdtemp(join(os.tmpdir(), "son-1536-wp-b-"));
     const statePath = join(directory, "state.json");
