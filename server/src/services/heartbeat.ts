@@ -207,6 +207,7 @@ import {
 } from "./heartbeat-stop-metadata.js";
 import {
   classifyRunLiveness,
+  type RunLivenessClassification,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import {
@@ -575,6 +576,7 @@ const CANCELLABLE_HEARTBEAT_RUN_STATUSES = [
 const NATIVE_QUESTION_CANCELLATION_CONTEXT_KEY = "nativeQuestionCancellation";
 const HEARTBEAT_RUN_TERMINAL_STATUSES = [
   "succeeded",
+  "no_op",
   "interrupted",
   "failed",
   "cancelled",
@@ -7199,6 +7201,57 @@ function isHeartbeatRunTerminalStatus(
   );
 }
 
+/** Wake contexts that retry an issue's own execution: monitor ticks, stranded-issue
+ * continuation recovery, and bounded run-liveness continuations (SON-1612). */
+const CONTINUATION_WAKE_CONTEXT_VALUES: ReadonlySet<string> = new Set([
+  "issue_continuation_needed",
+  "issue_monitor_due",
+  RUN_LIVENESS_CONTINUATION_REASON,
+]);
+
+function isContinuationWakeContext(contextSnapshot: unknown): boolean {
+  const parsed = parseObject(contextSnapshot);
+  const wakeReason = readNonEmptyString(parsed.wakeReason);
+  const retryReason = readNonEmptyString(parsed.retryReason);
+  return (
+    (wakeReason !== null && CONTINUATION_WAKE_CONTEXT_VALUES.has(wakeReason)) ||
+    (retryReason !== null && CONTINUATION_WAKE_CONTEXT_VALUES.has(retryReason))
+  );
+}
+
+/**
+ * SON-1612 no_op classification: a continuation-scoped run that ended
+ * liveness-blocked without any material issue-visible action (documents, work
+ * products, workspace operations, activity events, or tool/action events —
+ * comments alone do not count) produced no new information. Recording it as
+ * `no_op` instead of `succeeded` keeps success counts honest and, together
+ * with the recovery-side requeue gate, stops comment-only continuation loops.
+ */
+function isNoOpContinuationRunClassification(input: {
+  outcome: RunSessionOutcome;
+  classification: RunLivenessClassification | null;
+  livenessInput: RunLivenessClassificationInput | null;
+  contextSnapshot: unknown;
+}): boolean {
+  if (input.outcome !== "succeeded") return false;
+  if (input.classification?.livenessState !== "blocked") return false;
+  if (!isContinuationWakeContext(input.contextSnapshot)) return false;
+  const evidence = input.livenessInput?.evidence;
+  if (!evidence) return false;
+  return (
+    normalizeEvidenceCount(evidence.documentRevisionsCreated) === 0 &&
+    normalizeEvidenceCount(evidence.planDocumentRevisionsCreated) === 0 &&
+    normalizeEvidenceCount(evidence.workProductsCreated) === 0 &&
+    normalizeEvidenceCount(evidence.workspaceOperationsCreated) === 0 &&
+    normalizeEvidenceCount(evidence.activityEventsCreated) === 0 &&
+    normalizeEvidenceCount(evidence.toolOrActionEventsCreated) === 0
+  );
+}
+
+function normalizeEvidenceCount(value: number | null | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
 export function buildHeartbeatRunStatusLiveEventPayload(
   run: Pick<
     typeof heartbeatRuns.$inferSelect,
@@ -12001,6 +12054,22 @@ export function heartbeatService(
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+
+    // SON-1612: no_op continuation runs are liveness-blocked sweeps with no
+    // material action. Manufacturing a comment (or a missing-comment retry
+    // wake) for them would re-create the per-tick comment noise this status
+    // exists to stop.
+    if (run.status === "no_op") {
+      if (run.issueCommentStatus !== "not_applicable") {
+        await patchRunIssueCommentStatus(run.id, {
+          issueCommentStatus: "not_applicable",
+          issueCommentSatisfiedByCommentId: null,
+          issueCommentRetryQueuedAt: null,
+        });
+      }
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
+
     if (!issueId) {
       if (run.issueCommentStatus !== "not_applicable") {
         await patchRunIssueCommentStatus(run.id, {
@@ -21042,8 +21111,12 @@ export function heartbeatService(
         }
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
+        // A `no_op` terminal status written by another path (e.g. reaper) keeps
+        // success-class session/agent semantics; the no-op-specific gates below
+        // re-read the persisted status.
+        const lateNoOp = latestRun?.status === "no_op";
         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
-          outcome = latestRun.status;
+          outcome = latestRun.status === "no_op" ? "succeeded" : latestRun.status;
         } else if (adapterResult.nativeFinalization) {
           const nativeTerminal =
             adapterResult.nativeFinalization.terminal.runTerminalState;
@@ -21219,6 +21292,27 @@ export function heartbeatService(
           adapterResult.summary ?? null,
         );
 
+        // SON-1612: classify liveness before the terminal write so a comment-only
+        // continuation sweep that ended liveness-blocked is recorded as `no_op`
+        // in the same single compare-and-set (and never flashes `succeeded`).
+        let livenessClassification: RunLivenessClassification | null = null;
+        let livenessInput: RunLivenessClassificationInput | null = null;
+        if (outcome === "succeeded" && !lateNoOp) {
+          livenessInput = await buildRunLivenessInput(
+            { ...run, status: "succeeded" },
+            persistedResultJson,
+          );
+          livenessClassification = classifyRunLiveness(livenessInput);
+        }
+        const isNoOpContinuationRun = lateNoOp ||
+          isNoOpContinuationRunClassification({
+            outcome,
+            classification: livenessClassification,
+            livenessInput,
+            contextSnapshot: run.contextSnapshot,
+          });
+        const finalStatus = isNoOpContinuationRun ? "no_op" : status;
+
         const finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert> = {
           finishedAt: new Date(),
           error: runErrorMessage,
@@ -21234,10 +21328,19 @@ export function heartbeatService(
           logBytes: logSummary?.bytes,
           logSha256: logSummary?.sha256,
           logCompressed: logSummary?.compressed ?? false,
+          ...(livenessClassification
+            ? {
+              livenessState: livenessClassification.livenessState,
+              livenessReason: livenessClassification.livenessReason,
+              continuationAttempt: livenessClassification.continuationAttempt,
+              lastUsefulActionAt: livenessClassification.lastUsefulActionAt,
+              nextAction: livenessClassification.nextAction,
+            }
+            : {}),
         };
         const persistedRunWrite = await setRunStatusIfRunning(
           run.id,
-          status,
+          finalStatus,
           finalRunPatch,
         );
         let persistedRun: typeof heartbeatRuns.$inferSelect | null =
@@ -21253,7 +21356,7 @@ export function heartbeatService(
           // by the path that won the compare-and-set.
           if (
             adapterResult.nativeFinalization &&
-            persistedRunWrite.run?.status === status
+            persistedRunWrite.run?.status === finalStatus
           ) {
             persistedRun = await db
               .update(heartbeatRuns)
@@ -21266,7 +21369,7 @@ export function heartbeatService(
               .where(
                 and(
                   eq(heartbeatRuns.id, run.id),
-                  eq(heartbeatRuns.status, status),
+                  eq(heartbeatRuns.status, finalStatus),
                 ),
               )
               .returning()
@@ -21284,13 +21387,6 @@ export function heartbeatService(
             return;
           }
         }
-        if (persistedRun) {
-          persistedRun =
-            (await classifyAndPersistRunLiveness(
-              persistedRun,
-              persistedResultJson,
-            )) ?? persistedRun;
-        }
 
         await setWakeupStatus(
           run.wakeupRequestId,
@@ -21307,9 +21403,9 @@ export function heartbeatService(
             eventType: "lifecycle",
             stream: "system",
             level: outcome === "succeeded" ? "info" : "error",
-            message: `run ${outcome}`,
+            message: `run ${finalizedRun.status}`,
             payload: {
-              status,
+              status: finalizedRun.status,
               exitCode: adapterResult.exitCode,
             },
           });
@@ -21362,6 +21458,10 @@ export function heartbeatService(
             if (
               issueId &&
               !skipRunIssueComment &&
+              // no_op continuation runs produce no new reportable information;
+              // posting an auto summary comment would re-introduce the per-tick
+              // comment noise SON-1612 removes.
+              livenessRun.status !== "no_op" &&
               presentationDecision.commentAction === "create" &&
               resolved.text
             ) {
@@ -21404,7 +21504,7 @@ export function heartbeatService(
                 commentAction: "none",
                 reasonCodes: [
                   ...presentationDecision.reasonCodes,
-                  skipRunIssueComment
+                  skipRunIssueComment || livenessRun.status === "no_op"
                     ? "issue_comment_suppressed"
                     : "run_has_no_issue",
                 ],
