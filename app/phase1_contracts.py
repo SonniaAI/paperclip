@@ -1171,7 +1171,7 @@ def build_router(
             ["id", "org_id", "department_id", "name", "objective", *setting_columns, "status"]
         )
         placeholder_list = ", ".join(
-            [":id", ":org_id", ":department_id", ":name", ":objective", *setting_columns, "'draft'"]
+            [":id", ":org_id", ":department_id", ":name", ":objective", *[f":{c}" for c in setting_columns], "'draft'"]
         )
         insert_params: dict[str, object] = {
             "id": str(campaign_id),
