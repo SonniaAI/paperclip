@@ -536,6 +536,20 @@ export interface IssueUnblockDescriptor {
   action: string;
 }
 
+/**
+ * First-class external (human/out-of-company) blocker: a `blocked` issue must
+ * carry either dependency edges (`blockedByIssueIds`) or one of these, so that
+ * liveness, readiness, and escalation can distinguish "waiting on a named
+ * human" from an unattributable dead state (see upstream issue #10404).
+ */
+export interface IssueExternalBlocker {
+  owner: string;
+  note?: string | null;
+  since: string;
+  decisionDueAt?: string | null;
+  resolvedAt?: string | null;
+}
+
 export type IssueProductivityReviewTrigger =
   | "no_comment_streak"
   | "long_active_duration"

@@ -484,6 +484,13 @@ const createIssueBaseSchema = z.object({
     ]),
     action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
   }).strict().optional().nullable(),
+  externalBlocker: z.object({
+    owner: z.string().trim().min(1).max(120),
+    note: multilineTextSchema.pipe(z.string().trim().max(4_000)).optional().nullable(),
+    since: z.string().datetime().optional(),
+    decisionDueAt: z.string().datetime().optional().nullable(),
+    resolvedAt: z.string().datetime().optional().nullable(),
+  }).strict().optional().nullable(),
   inheritExecutionWorkspaceFromIssueId: z.string().guid().optional().nullable(),
   title: z.string().min(1),
   description: multilineTextSchema.optional().nullable(),
@@ -527,6 +534,44 @@ function requireBlockedStatusForUnblockDescriptor(
   }
 }
 
+/**
+ * A blocked issue must carry a reason the system can attribute: at least one
+ * dependency edge, or a first-class external/human blocker. Prevents the
+ * silent unwakeable dead state of upstream issue #10404. Enforced on create
+ * and on updates that set status to blocked; clearing an externalBlocker or
+ * all edges while keeping blocked status is also rejected.
+ */
+function requireBlockedJustification(
+  value: { status?: string; blockedByIssueIds?: unknown; externalBlocker?: unknown },
+  ctx: z.RefinementCtx,
+) {
+  const settingBlocked = value.status === "blocked";
+  const hasEdges = Array.isArray(value.blockedByIssueIds) && value.blockedByIssueIds.length > 0;
+  const hasExternal = value.externalBlocker != null;
+  if (settingBlocked && !hasEdges && !hasExternal) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "blocked status requires either blockedByIssueIds or an externalBlocker " +
+        "(set externalBlocker: {owner, note} when waiting on a human or outside dependency)",
+      path: ["status"],
+    });
+  }
+  const clearingExternal = value.externalBlocker === null;
+  const clearingEdges = Array.isArray(value.blockedByIssueIds) && value.blockedByIssueIds.length === 0;
+  if (settingBlocked && (clearingExternal || clearingEdges)) {
+    const wouldKeepExternal = !clearingExternal && hasExternal;
+    const wouldKeepEdges = !clearingEdges && hasEdges;
+    if (!wouldKeepExternal && !wouldKeepEdges) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "cannot clear the last blocker reason while status is blocked",
+        path: ["status"],
+      });
+    }
+  }
+}
+
 const createIssueDuplicateGuardSchema = {
   idempotencyKey: z.string().trim().min(1).max(255).optional().nullable(),
   allowDuplicate: z.boolean()
@@ -553,7 +598,7 @@ export const createIssueSchema = withCreateIssueStatusDefault(
     ...createIssueDuplicateGuardSchema,
     ...onboardingFirstTaskMarkerSchema,
   }),
-).superRefine(requireBlockedStatusForUnblockDescriptor);
+).superRefine(requireBlockedStatusForUnblockDescriptor).superRefine(requireBlockedJustification);
 
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 
@@ -609,6 +654,10 @@ export const updateIssueSchema = objectWithoutDefaults(
   interrupt: z.boolean().optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
 });
+
+export const blockedJustificationRefinement = requireBlockedJustification;
+
+export const updateIssueValidatedSchema = updateIssueSchema.superRefine(requireBlockedJustification);
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
 export type IssueExecutionWorkspaceSettings = z.infer<typeof issueExecutionWorkspaceSettingsSchema>;

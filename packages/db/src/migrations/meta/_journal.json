@@ -1660,6 +1660,13 @@
       "when": 1789302852996,
       "tag": "0238_lane_failure_watchdog_state",
       "breakpoints": true
+    },
+    {
+      "idx": 239,
+      "version": "7",
+      "when": 1790822087000,
+      "tag": "0239_external_blocker",
+      "breakpoints": true
     }
   ]
 }
