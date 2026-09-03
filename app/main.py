@@ -53,11 +53,13 @@ from app.email_templates import (
     NEW_SIGNIN_SUBJECT,
     PASSWORD_CHANGED_SUBJECT,
     RESET_SUBJECT,
+    TEAM_INVITE_SUBJECT,
     VERIFICATION_SUBJECT,
     WELCOME_SUBJECT,
-    render_password_changed_email,
     render_new_signin_email,
+    render_password_changed_email,
     render_reset_email,
+    render_team_invite_email,
     render_verification_email,
     render_welcome_email,
 )
@@ -592,6 +594,23 @@ async def _deliver_password_changed_email(
         settings=settings,
         recipient=recipient,
         subject=PASSWORD_CHANGED_SUBJECT,
+        rendered=rendered,
+    )
+
+
+async def _deliver_team_invite_email(
+    *,
+    recipient: str,
+    inviter: str,
+    company: str,
+    action_url: str,
+) -> EmailDeliveryResult:
+    rendered = render_team_invite_email(inviter=inviter, company=company, url=action_url)
+    return await run_in_threadpool(
+        deliver_rendered_email,
+        settings=settings,
+        recipient=recipient,
+        subject=TEAM_INVITE_SUBJECT.format(inviter=inviter, company=company),
         rendered=rendered,
     )
 
@@ -1390,7 +1409,32 @@ async def create_invite(
     token = issue_invite_token(invite_id=invite.id, scope=context.scope, email=invite.email)
     invite.token_digest = token_digest(token)
     await context.session.flush()
-    return InviteResponse(invite_token=token, expires_at=invite.expires_at)
+
+    inviter_name = context.user.display_name or context.user.email
+    org_name = await context.session.scalar(
+        select(Organization.name).where(Organization.id == context.scope.org_id)
+    )
+    delivery = await _deliver_team_invite_email(
+        recipient=invite.email,
+        inviter=_first_name(inviter_name),
+        company=org_name or "Sonnia",
+        action_url=_public_action_url("/invite/accept", token),
+    )
+    messages = {
+        "smtp": f"Invitation sent to {invite.email}.",
+        "development": (
+            "Invitation created. Email delivery is not configured, "
+            "so preview it under /dev/emails."
+        ),
+        "failed": "Invitation created, but the email could not be sent.",
+    }
+    return InviteResponse(
+        invite_token=token,
+        expires_at=invite.expires_at,
+        message=messages.get(delivery.mode, "Invitation created."),
+        delivery=delivery.mode,
+        development_url=_browser_development_url(delivery),
+    )
 
 
 @app.post("/auth/invites/accept")

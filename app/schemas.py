@@ -249,7 +249,7 @@ class TotpEnrollmentResponse(BaseModel):
     issuer: str = "manager.sonnia.ai"
 
 
-class InviteResponse(BaseModel):
+class InviteResponse(EmailDeliveryResponse):
     invite_token: str
     expires_at: datetime
 

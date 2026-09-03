@@ -70,6 +70,7 @@ WELCOME_SUBJECT = "Your Sonnia account is active"
 RESET_SUBJECT = "Reset your Sonnia password"
 PASSWORD_CHANGED_SUBJECT = "Your Sonnia password was changed"
 NEW_SIGNIN_SUBJECT = "New sign-in to your Sonnia account"
+TEAM_INVITE_SUBJECT = "{inviter} invited you to {company} on Sonnia"
 
 ZWNJ_RUN = "&#8204;&nbsp;&#8204;&nbsp;&#8204;&nbsp;&#8204;&nbsp;"
 
@@ -436,7 +437,7 @@ def render_team_invite_email(
             "Wasn't expecting this? You can ignore this email — the "
             "invitation expires on its own."
         ),
-        subject=f"{inviter} invited you to {company} on Sonnia",
+        subject=TEAM_INVITE_SUBJECT.format(inviter=inviter, company=company),
         preheader=f"{inviter} would like you to join {company} on Sonnia.",
         status_line="invitation",
         footer_address=footer_address,
