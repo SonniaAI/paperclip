@@ -207,7 +207,8 @@ class InviteCreateRequest(BaseModel):
 class InviteAcceptRequest(BaseModel):
     token: str = Field(min_length=20)
     display_name: str = Field(min_length=1, max_length=160)
-    password: str = Field(min_length=12, max_length=512)
+    # §4 family floor — same schema floor as registration and reset (SON-1789).
+    password: str = Field(min_length=10, max_length=512)
 
 
 class TotpVerifyRequest(BaseModel):

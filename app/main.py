@@ -1505,12 +1505,9 @@ async def accept_invite(payload: InviteAcceptRequest, db: DatabaseSession) -> Re
         db.add(membership_department)
         await db.flush()
         session = await _issue_session(db, user=user, scope=claims.scope)
+        response_user = await _auth_user_response(db, user=user, scope=claims.scope)
 
-    return _response_with_session(
-        AuthResponse(),
-        session,
-        claims.scope,
-    )
+    return _response_with_session(_auth_response(response_user), session, claims.scope)
 
 
 async def _call_stats_payload(
