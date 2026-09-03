@@ -4,9 +4,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
+  assets,
   companies,
+  costEvents,
   createDb,
   heartbeatRuns,
+  issueAttachments,
   issueComments,
   issues,
 } from "@paperclipai/db";
@@ -19,6 +22,7 @@ import {
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+  PRODUCTIVITY_REVIEW_LONG_ACTIVE_SUPPRESSED_ACTIVITY,
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   productivityReviewService,
@@ -758,5 +762,265 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.failed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  // SON-1463: suppress long_active_duration re-triggers on parked issues when the
+  // SON-1316 signature holds (0 active runs, 0 cost events, latest run succeeded
+  // with artifacts), and re-arm whenever any condition breaks.
+  async function seedParkedLongActiveIssue(opts?: { now?: Date }) {
+    const now = opts?.now ?? new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const runId = randomUUID();
+    const runCreatedAt = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: runCreatedAt,
+      finishedAt: new Date(runCreatedAt.getTime() + 30_000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      createdAt: runCreatedAt,
+      updatedAt: runCreatedAt,
+    });
+    return { ...seeded, now, runId };
+  }
+
+  async function seedRunArtifact(input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    runId: string;
+    createdAt: Date;
+  }) {
+    const assetId = randomUUID();
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId: input.companyId,
+      issueId: input.issueId,
+      authorAgentId: input.agentId,
+      createdByRunId: input.runId,
+      body: "Run completed with attached artifacts",
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    });
+    await db.insert(assets).values({
+      id: assetId,
+      companyId: input.companyId,
+      provider: "test",
+      objectKey: `test/${input.runId}/artifact.bin`,
+      contentType: "application/octet-stream",
+      byteSize: 128,
+      sha256: randomUUID().replace(/-/g, ""),
+      originalFilename: "artifact.bin",
+      createdByAgentId: input.agentId,
+    });
+    await db.insert(issueAttachments).values({
+      companyId: input.companyId,
+      issueId: input.issueId,
+      assetId,
+      issueCommentId: commentId,
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    });
+  }
+
+  it("suppresses long_active_duration for the SON-1316 parked-issue signature and records the suppression", async () => {
+    const seeded = await seedParkedLongActiveIssue();
+    await seedRunArtifact({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      agentId: seeded.coderId,
+      runId: seeded.runId,
+      createdAt: seeded.now,
+    });
+    const service = productivityReviewService(db);
+
+    // The identical signature was closed productive 7h ago — beyond the 6h
+    // resolved-review snooze, which is exactly when the SON-1316 re-fire happened.
+    const reviewCreatedAt = new Date(seeded.now.getTime() - 7 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      title: "Review productivity (closed productive)",
+      status: "done",
+      priority: "medium",
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      parentId: seeded.issueId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: reviewCreatedAt,
+      updatedAt: reviewCreatedAt,
+    });
+
+    const result = await service.reconcileProductivityReviews({
+      now: seeded.now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.longActiveSuppressed).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
+
+    const suppressed = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, PRODUCTIVITY_REVIEW_LONG_ACTIVE_SUPPRESSED_ACTIVITY));
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]?.entityId).toBe(seeded.issueId);
+    expect(suppressed[0]?.details).toMatchObject({
+      sourceIssueId: seeded.issueId,
+      trigger: "long_active_duration",
+      suppressed: true,
+    });
+  });
+
+  it("keeps long_active_duration armed when any suppression condition breaks", async () => {
+    const baseOpts = { now: new Date("2026-04-28T12:00:00.000Z") };
+
+    // active run present
+    {
+      const seeded = await seedParkedLongActiveIssue(baseOpts);
+      await seedRunArtifact({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        agentId: seeded.coderId,
+        runId: seeded.runId,
+        createdAt: seeded.now,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "running",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: new Date(seeded.now.getTime() - 60_000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        createdAt: new Date(seeded.now.getTime() - 60_000),
+        updatedAt: new Date(seeded.now.getTime() - 60_000),
+      });
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now: seeded.now,
+        companyId: seeded.companyId,
+      });
+      expect(result.longActiveSuppressed).toBe(0);
+      expect(result.created).toBe(1);
+    }
+
+    // non-zero cost events
+    {
+      const seeded = await seedParkedLongActiveIssue(baseOpts);
+      await seedRunArtifact({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        agentId: seeded.coderId,
+        runId: seeded.runId,
+        createdAt: seeded.now,
+      });
+      await db.insert(costEvents).values({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        heartbeatRunId: seeded.runId,
+        provider: "test",
+        model: "test-model",
+        costCents: 5,
+        occurredAt: seeded.now,
+      });
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now: seeded.now,
+        companyId: seeded.companyId,
+      });
+      expect(result.longActiveSuppressed).toBe(0);
+      expect(result.created).toBe(1);
+    }
+
+    // latest run succeeded WITHOUT artifacts
+    {
+      const seeded = await seedParkedLongActiveIssue(baseOpts);
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now: seeded.now,
+        companyId: seeded.companyId,
+      });
+      expect(result.longActiveSuppressed).toBe(0);
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    }
+
+    // latest run terminal but failed
+    {
+      const seeded = await seedParkedLongActiveIssue(baseOpts);
+      await seedRunArtifact({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        agentId: seeded.coderId,
+        runId: seeded.runId,
+        createdAt: seeded.now,
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "failed" })
+        .where(eq(heartbeatRuns.id, seeded.runId));
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now: seeded.now,
+        companyId: seeded.companyId,
+      });
+      expect(result.longActiveSuppressed).toBe(0);
+      expect(result.created).toBe(1);
+    }
+
+    // comment activity after the latest run re-arms the trigger
+    {
+      const seeded = await seedParkedLongActiveIssue(baseOpts);
+      await seedRunArtifact({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        agentId: seeded.coderId,
+        runId: seeded.runId,
+        createdAt: seeded.now,
+      });
+      // a newer assignee run (no artifacts) re-arms the trigger
+      const newRunId = randomUUID();
+      const newRunCreatedAt = new Date(seeded.now.getTime() - 30 * 60 * 1000);
+      await db.insert(heartbeatRuns).values({
+        id: newRunId,
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: newRunCreatedAt,
+        finishedAt: new Date(newRunCreatedAt.getTime() + 30_000),
+        contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+        createdAt: newRunCreatedAt,
+        updatedAt: newRunCreatedAt,
+      });
+      await db.insert(issueComments).values({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        authorAgentId: seeded.coderId,
+        createdByRunId: newRunId,
+        body: "New activity after the artifact-bearing run",
+        createdAt: new Date(seeded.now.getTime() - 29 * 60 * 1000),
+        updatedAt: new Date(seeded.now.getTime() - 29 * 60 * 1000),
+      });
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now: seeded.now,
+        companyId: seeded.companyId,
+      });
+      expect(result.longActiveSuppressed).toBe(0);
+      expect(result.created).toBe(1);
+    }
   });
 });

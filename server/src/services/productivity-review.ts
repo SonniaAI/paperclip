@@ -7,8 +7,10 @@ import {
   companies,
   costEvents,
   heartbeatRuns,
+  issueAttachments,
   issueComments,
   issues,
+  nativeRunResults,
   projects,
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -30,6 +32,7 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
+export const PRODUCTIVITY_REVIEW_LONG_ACTIVE_SUPPRESSED_ACTIVITY = "issue.productivity_review_long_active_suppressed";
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -83,6 +86,7 @@ type ProductivityReviewEvidence = {
   usageSamples: Array<{ runId: string; usageJson: Record<string, unknown> | null }>;
   nextAction: string | null;
   thresholds: ProductivityReviewThresholds;
+  longActiveSuppression: { reason: string } | null;
   generatedAt: Date;
 };
 
@@ -221,6 +225,74 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .from(companies)
       .where(eq(companies.id, companyId))
       .then((rows) => rows[0]?.issuePrefix ?? "PAP");
+  }
+
+  // v1.1 item 7 (SON-1463): long_active_duration is suppressed on a parked source
+  // issue when there is no work in flight: zero active runs, zero cost events, and
+  // the latest assignee run terminal-succeeded with artifacts. Any run that does
+  // not end terminal-succeeded-with-artifacts, any new cost event, or any comment
+  // activity after the latest run re-arms the trigger. Suppression is always
+  // recorded to the activity log (observable, never silent).
+  async function latestSucceededRunWithArtifacts(sourceIssue: IssueRow, run: ProductivityRunSample) {
+    if (run.status !== "succeeded") return false;
+    const attachmentRows = await db
+      .select({ id: issueAttachments.id })
+      .from(issueAttachments)
+      .innerJoin(issueComments, eq(issueAttachments.issueCommentId, issueComments.id))
+      .where(
+        and(
+          eq(issueAttachments.companyId, sourceIssue.companyId),
+          eq(issueAttachments.issueId, sourceIssue.id),
+          eq(issueComments.createdByRunId, run.id),
+        ),
+      )
+      .limit(1);
+    if (attachmentRows.length > 0) return true;
+    const nativeResultRows = await db
+      .select({ resultJson: nativeRunResults.resultJson })
+      .from(nativeRunResults)
+      .where(
+        and(
+          eq(nativeRunResults.companyId, sourceIssue.companyId),
+          eq(nativeRunResults.issueId, sourceIssue.id),
+          eq(nativeRunResults.runId, run.id),
+        ),
+      )
+      .limit(1);
+    for (const row of nativeResultRows) {
+      const artifacts = row.resultJson?.artifacts;
+      if (Array.isArray(artifacts) && artifacts.length > 0) return true;
+    }
+    return false;
+  }
+
+  async function evaluateLongActiveSuppression(
+    sourceIssue: IssueRow,
+    evidence: {
+      trigger: ProductivityReviewTrigger;
+      activeRunCount: number;
+      costCents: number;
+      latestRuns: ProductivityRunSample[];
+      latestComments: Array<typeof issueComments.$inferSelect>;
+    },
+  ) {
+    if (evidence.trigger !== "long_active_duration") return null;
+    if (evidence.activeRunCount !== 0) return null;
+    if (evidence.costCents !== 0) return null;
+    const latestRun = evidence.latestRuns[0] ?? null;
+    if (!latestRun) return null;
+    const commentActivityAfterLatestRun = evidence.latestComments.some(
+      (comment) =>
+        comment.createdByRunId !== latestRun.id &&
+        comment.createdAt.getTime() > latestRun.createdAt.getTime(),
+    );
+    if (commentActivityAfterLatestRun) return null;
+    if (!(await latestSucceededRunWithArtifacts(sourceIssue, latestRun))) return null;
+    return {
+      reason:
+        `suppressed long_active_duration: 0 active runs, 0 cost events, ` +
+        `latest assignee run ${latestRun.id} terminal-succeeded with artifacts`,
+    };
   }
 
   async function getAgent(agentId: string) {
@@ -553,6 +625,14 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn });
     if (!trigger) return null;
 
+    const longActiveSuppression = await evaluateLongActiveSuppression(sourceIssue, {
+      trigger,
+      activeRunCount,
+      costCents: costRow.costCents,
+      latestRuns,
+      latestComments,
+    });
+
     const triggerReasons: string[] = [];
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment`);
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
@@ -586,6 +666,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         .map((run) => ({ runId: run.id, usageJson: run.usageJson ?? null })),
       nextAction: latestRuns.find((run) => run.nextAction)?.nextAction ?? null,
       thresholds,
+      longActiveSuppression,
       generatedAt: now,
     };
   }
@@ -868,6 +949,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       creationCapped: 0,
       noActionSuppressed: 0,
       skipped: 0,
+      longActiveSuppressed: 0,
       failed: 0,
       reviewIssueIds: [] as string[],
       failedIssueIds: [] as string[],
@@ -900,6 +982,33 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       const evidence = await collectEvidence(candidate, sourceAgent, thresholds, now);
       if (!evidence) {
         result.skipped += 1;
+        continue;
+      }
+      if (evidence.longActiveSuppression) {
+        result.longActiveSuppressed += 1;
+        try {
+          await logActivity(db, {
+            companyId: candidate.companyId,
+            actorType: "system",
+            actorId: "system",
+            action: PRODUCTIVITY_REVIEW_LONG_ACTIVE_SUPPRESSED_ACTIVITY,
+            entityType: "issue",
+            entityId: candidate.id,
+            agentId: candidate.assigneeAgentId,
+            details: {
+              source: "productivity_review.reconcile",
+              sourceIssueId: candidate.id,
+              trigger: evidence.trigger,
+              suppressed: true,
+              reason: evidence.longActiveSuppression.reason,
+            },
+          });
+        } catch (err) {
+          logger.warn(
+            { err, companyId: candidate.companyId, issueId: candidate.id },
+            "failed to record long_active_duration suppression receipt",
+          );
+        }
         continue;
       }
       let prefix = prefixCache.get(candidate.companyId);
