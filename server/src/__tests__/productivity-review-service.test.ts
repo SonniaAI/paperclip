@@ -11,6 +11,8 @@ import {
   heartbeatRuns,
   issueAttachments,
   issueComments,
+  issueThreadInteractions,
+  issueWorkProducts,
   issues,
 } from "@paperclipai/db";
 import {
@@ -1022,5 +1024,175 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(result.longActiveSuppressed).toBe(0);
       expect(result.created).toBe(1);
     }
+  });
+
+  describe("SON-1463 v1.1 posture-based suppression (b0f74407 layer 2)", () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const WINDOW_MS = 24 * 60 * 60 * 1000;
+
+    async function seedLongActiveIssue() {
+      return seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      });
+    }
+
+    async function insertClosedLongActiveReviewChild(input: {
+      companyId: string;
+      issueId: string;
+      issuePrefix: string;
+      issueNumber: number;
+      completedAt: Date;
+    }) {
+      const reviewId = randomUUID();
+      await db.insert(issues).values({
+        id: reviewId,
+        companyId: input.companyId,
+        title: "Review productivity for parked issue",
+        status: "done",
+        priority: "medium",
+        parentId: input.issueId,
+        originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+        issueNumber: input.issueNumber,
+        identifier: `${input.issuePrefix}-${input.issueNumber}`,
+        description: "Primary trigger: `long_active_duration`",
+        createdAt: new Date(input.completedAt.getTime() - 60 * 60 * 1000),
+        updatedAt: input.completedAt,
+        completedAt: input.completedAt,
+      });
+      return reviewId;
+    }
+
+    async function seedLivingLogActivity(input: {
+      companyId: string;
+      agentId: string;
+      issueId: string;
+      now: Date;
+    }) {
+      // SON-1528 profile: near-daily runs with cost events and outcome comments.
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: input.companyId,
+        agentId: input.agentId,
+        status: "succeeded",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: new Date(input.now.getTime() - 60 * 60 * 1000),
+        finishedAt: new Date(input.now.getTime() - 30 * 60 * 1000),
+        contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+        createdAt: new Date(input.now.getTime() - 60 * 60 * 1000),
+        updatedAt: new Date(input.now.getTime() - 30 * 60 * 1000),
+      });
+      await db.insert(costEvents).values({
+        id: randomUUID(),
+        companyId: input.companyId,
+        agentId: input.agentId,
+        issueId: input.issueId,
+        provider: "test",
+        model: "test-model",
+        costCents: 40,
+        occurredAt: new Date(input.now.getTime() - 30 * 60 * 1000),
+      });
+      await db.insert(issueComments).values({
+        companyId: input.companyId,
+        issueId: input.issueId,
+        authorAgentId: input.agentId,
+        body: "Decision log entry appended.",
+        createdAt: new Date(input.now.getTime() - 15 * 60 * 1000),
+        updatedAt: new Date(input.now.getTime() - 15 * 60 * 1000),
+      });
+    }
+
+    async function insertPendingConfirmation(input: { companyId: string; issueId: string; createdAt: Date }) {
+      await db.insert(issueThreadInteractions).values({
+        companyId: input.companyId,
+        issueId: input.issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        payload: { version: 1, prompt: "Review hold: living decision log." },
+        createdAt: input.createdAt,
+        updatedAt: input.createdAt,
+      });
+    }
+
+    it("AC#5 fixture: reviewer-held living log with daily runs/cost/comments produces no new review child within the window", async () => {
+      const seeded = await seedLongActiveIssue();
+      await insertClosedLongActiveReviewChild({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        issuePrefix: seeded.issuePrefix,
+        issueNumber: 2,
+        completedAt: new Date(now.getTime() - 20 * 60 * 60 * 1000),
+      });
+      await insertPendingConfirmation({ companyId: seeded.companyId, issueId: seeded.issueId, createdAt: new Date(now.getTime() - 20 * 60 * 60 * 1000) });
+      await seedLivingLogActivity({ companyId: seeded.companyId, agentId: seeded.coderId, issueId: seeded.issueId, now });
+      const service = productivityReviewService(db);
+
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      expect(result.created).toBe(0);
+      expect(result.longActiveSuppressed).toBe(1);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1); // only the prior close
+    });
+
+    it("blocked posture with named owner suppresses within the window", async () => {
+      const seeded = await seedLongActiveIssue();
+      await db.update(issues).set({
+        status: "blocked",
+        blockedOwnerNotifiedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      }).where(eq(issues.id, seeded.issueId));
+      await insertClosedLongActiveReviewChild({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        issuePrefix: seeded.issuePrefix,
+        issueNumber: 2,
+        completedAt: new Date(now.getTime() - 20 * 60 * 60 * 1000),
+      });
+      const service = productivityReviewService(db);
+
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      expect(result.created).toBe(0);
+      expect(result.longActiveSuppressed).toBe(1);
+    });
+
+    it("expires: normal watchdog behavior resumes after the 24h window", async () => {
+      const seeded = await seedLongActiveIssue();
+      await db.update(issues).set({
+        status: "blocked",
+        blockedOwnerNotifiedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
+      }).where(eq(issues.id, seeded.issueId));
+      await insertClosedLongActiveReviewChild({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        issuePrefix: seeded.issuePrefix,
+        issueNumber: 2,
+        completedAt: new Date(now.getTime() - WINDOW_MS - 60 * 60 * 1000),
+      });
+      const service = productivityReviewService(db);
+
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      expect(result.longActiveSuppressed).toBe(0);
+      expect(result.created).toBe(1);
+    });
+
+    it("AC#2: a genuinely active non-posture issue still re-triggers", async () => {
+      const seeded = await seedLongActiveIssue();
+      await insertClosedLongActiveReviewChild({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        issuePrefix: seeded.issuePrefix,
+        issueNumber: 2,
+        completedAt: new Date(now.getTime() - 20 * 60 * 60 * 1000),
+      });
+      await seedLivingLogActivity({ companyId: seeded.companyId, agentId: seeded.coderId, issueId: seeded.issueId, now });
+      const service = productivityReviewService(db);
+
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      expect(result.longActiveSuppressed).toBe(0);
+      expect(result.created).toBe(1);
+    });
   });
 });

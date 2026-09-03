@@ -9,6 +9,7 @@ import {
   heartbeatRuns,
   issueAttachments,
   issueComments,
+  issueThreadInteractions,
   issues,
   nativeRunResults,
   projects,
@@ -32,6 +33,12 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
+// SON-1463 v1.1 (b0f74407): posture-based suppression window. A parked or
+// blocked posture suppresses long_active_duration re-triggers for this long
+// after a prior productive close of the same signature; afterwards normal
+// watchdog behavior resumes.
+export const DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_POSTURE_SUPPRESS_WINDOW_MS =
+  24 * 60 * 60 * 1000;
 export const PRODUCTIVITY_REVIEW_LONG_ACTIVE_SUPPRESSED_ACTIVITY = "issue.productivity_review_long_active_suppressed";
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -63,6 +70,7 @@ type ProductivityReviewThresholds = {
   creationWindowMs: number;
   maxCreationsPerWindow: number;
   maxConsecutiveNoActionReviews: number;
+  longActivePostureSuppressWindowMs: number;
 };
 
 type ProductivityReviewEvidence = {
@@ -170,6 +178,11 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
     resolvedSnoozeMs: readPositiveInteger(
       overrides?.resolvedSnoozeMs ?? DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
       DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
+    ),
+    longActivePostureSuppressWindowMs: readPositiveInteger(
+      overrides?.longActivePostureSuppressWindowMs ??
+        DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_POSTURE_SUPPRESS_WINDOW_MS,
+      DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_POSTURE_SUPPRESS_WINDOW_MS,
     ),
     refreshIntervalMs: readPositiveInteger(
       overrides?.refreshIntervalMs ?? DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
@@ -292,6 +305,67 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       reason:
         `suppressed long_active_duration: 0 active runs, 0 cost events, ` +
         `latest assignee run ${latestRun.id} terminal-succeeded with artifacts`,
+    };
+  }
+
+  // SON-1463 v1.1 layer 2 (b0f74407): posture-based suppression. A source
+  // issue whose posture is parked — blocked with a named unblock owner on
+  // record, or reviewer-held via a pending request_confirmation (living log
+  // with directed continuation) — does not re-fire long_active_duration
+  // within the configurable window of a prior productive close of the same
+  // signature. Genuinely active non-posture issues still re-trigger (this
+  // path only evaluates parked/blocked postures). After the window, normal
+  // watchdog behavior resumes (expiry).
+  async function evaluateLongActivePostureSuppression(
+    sourceIssue: IssueRow,
+    thresholds: ProductivityReviewThresholds,
+    now: Date,
+  ) {
+    const isBlockedWithOwner =
+      sourceIssue.status === "blocked" && sourceIssue.blockedOwnerNotifiedAt !== null;
+    if (!isBlockedWithOwner && sourceIssue.status !== "in_progress") return null;
+    const pendingConfirmation = await db
+      .select({ id: issueThreadInteractions.id })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, sourceIssue.companyId),
+          eq(issueThreadInteractions.issueId, sourceIssue.id),
+          eq(issueThreadInteractions.kind, "request_confirmation"),
+          eq(issueThreadInteractions.status, "pending"),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const posture = isBlockedWithOwner
+      ? "blocked with named unblock owner on record"
+      : pendingConfirmation
+        ? "reviewer-held: pending request_confirmation (living log with directed continuation)"
+        : null;
+    if (!posture) return null;
+    const windowStart = new Date(now.getTime() - thresholds.longActivePostureSuppressWindowMs);
+    const anchor = await db
+      .select({ id: issues.id, identifier: issues.identifier, completedAt: issues.completedAt })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, sourceIssue.companyId),
+          eq(issues.parentId, sourceIssue.id),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          sql`${issues.description} like ${"%`long_active_duration`%"}`,
+          gte(issues.completedAt, windowStart),
+        ),
+      )
+      .orderBy(desc(issues.completedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!anchor) return null;
+    return {
+      reason:
+        `posture-based suppression (${posture}): long_active_duration re-trigger within ` +
+        `${Math.round(thresholds.longActivePostureSuppressWindowMs / 3_600_000)}h window of the ` +
+        `prior productive close ${anchor.identifier ?? anchor.id} ` +
+        `(completed ${anchor.completedAt?.toISOString() ?? "unknown"})`,
     };
   }
 
@@ -611,7 +685,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
     const activeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
-    const elapsedMs = sourceIssue.status === "in_progress" && activeStartedAt
+    // SON-1463 v1.1: a blocked episode with a startedAt anchor is still a
+    // long-active episode — the posture-based suppression layer needs the
+    // trigger to be evaluable while the issue sits blocked with a named owner.
+    const activeEpisodeStatuses = ["in_progress", "blocked"];
+    const elapsedMs = activeEpisodeStatuses.includes(sourceIssue.status) && activeStartedAt
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
 
@@ -931,7 +1009,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
           visibleIssueCondition(),
           isNull(issues.assigneeUserId),
-          inArray(issues.status, ["todo", "in_progress"]),
+          inArray(issues.status, ["todo", "in_progress", "blocked"]),
           sql`${issues.assigneeAgentId} is not null`,
           sql`${issues.originKind} <> ${PRODUCTIVITY_REVIEW_ORIGIN_KIND}`,
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
@@ -1007,6 +1085,39 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           logger.warn(
             { err, companyId: candidate.companyId, issueId: candidate.id },
             "failed to record long_active_duration suppression receipt",
+          );
+        }
+        continue;
+      }
+      const postureSuppression = await evaluateLongActivePostureSuppression(
+        candidate,
+        thresholds,
+        now,
+      );
+      if (postureSuppression) {
+        result.longActiveSuppressed += 1;
+        try {
+          await logActivity(db, {
+            companyId: candidate.companyId,
+            actorType: "system",
+            actorId: "system",
+            action: PRODUCTIVITY_REVIEW_LONG_ACTIVE_SUPPRESSED_ACTIVITY,
+            entityType: "issue",
+            entityId: candidate.id,
+            agentId: candidate.assigneeAgentId,
+            details: {
+              source: "productivity_review.reconcile",
+              sourceIssueId: candidate.id,
+              trigger: evidence.trigger,
+              suppressed: true,
+              layer: "posture",
+              reason: postureSuppression.reason,
+            },
+          });
+        } catch (err) {
+          logger.warn(
+            { err, companyId: candidate.companyId, issueId: candidate.id },
+            "failed to record posture-based long_active_duration suppression receipt",
           );
         }
         continue;
