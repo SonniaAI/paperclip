@@ -239,10 +239,15 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
   // operator hides either surface. Until the health response resolves, the
   // hidden set is unknown — keep the shortcut out rather than flash it.
   const { hidden: hiddenSettings, loaded: hiddenSettingsLoaded } = useHiddenSettings();
-  const showInvitePeople =
-    hiddenSettingsLoaded &&
-    !hidesCompanyPage(hiddenSettings, "company.members") &&
-    !hidesCompanyPage(hiddenSettings, "company.invites");
+  // On Cloud the shortcut always shows, but it leads out of the tenant app:
+  // memberships are managed in the cloud app's People settings, and a managed
+  // host typically hides the tenant-side Members/Invites surfaces wholesale —
+  // those hide keys must not take the cloud shortcut down with them.
+  const showInvitePeople = isCloud
+    ? true
+    : hiddenSettingsLoaded &&
+      !hidesCompanyPage(hiddenSettings, "company.members") &&
+      !hidesCompanyPage(hiddenSettings, "company.invites");
   const cloudBaseUrl = cloud?.cloudBaseUrl ?? null;
   const stacksQuery = useQuery({
     queryKey: queryKeys.cloud.stacks,
@@ -487,23 +492,43 @@ export function SidebarCompanyMenu({ open: controlledOpen, onOpenChange }: Sideb
           </>
         )}
         {showInvitePeople ? (
-          <DropdownMenuItem asChild disabled={isEditingOrder}>
-            <Link
-              to="/company/settings/members?tab=invites"
-              onClick={(event) => {
-                if (isEditingOrder) {
-                  event.preventDefault();
-                  return;
-                }
+          isCloud ? (
+            <DropdownMenuItem
+              disabled={isEditingOrder}
+              onClick={() => {
+                if (isEditingOrder) return;
                 closeNavigationChrome();
+                // Same-origin on purpose: the cloud front door owns /members
+                // on tenant hosts and forwards it to this stack's own People
+                // settings in the cloud app. It knows the portal origin and
+                // this stack's id; this menu needs neither.
+                navigateTopLevel("/members");
               }}
             >
               <UserPlus className="size-4" />
               <span className="truncate">
                 {currentName ? `Invite people to ${currentName}` : "Invite people"}
               </span>
-            </Link>
-          </DropdownMenuItem>
+            </DropdownMenuItem>
+          ) : (
+            <DropdownMenuItem asChild disabled={isEditingOrder}>
+              <Link
+                to="/company/settings/members?tab=invites"
+                onClick={(event) => {
+                  if (isEditingOrder) {
+                    event.preventDefault();
+                    return;
+                  }
+                  closeNavigationChrome();
+                }}
+              >
+                <UserPlus className="size-4" />
+                <span className="truncate">
+                  {currentName ? `Invite people to ${currentName}` : "Invite people"}
+                </span>
+              </Link>
+            </DropdownMenuItem>
+          )
         ) : null}
         {session?.session ? (
           <>

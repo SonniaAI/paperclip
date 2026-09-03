@@ -421,6 +421,36 @@ describe("SidebarCompanyMenu", () => {
     });
   });
 
+  it("keeps the invite shortcut on cloud and sends it to /members, ignoring tenant hide keys", async () => {
+    // A managed host hides the tenant-side Members/Invites surfaces, but
+    // people are still invited — in the cloud app. The shortcut must survive
+    // the hide keys and leave the tenant app entirely: the cloud front door
+    // owns /members on this host and forwards it to this stack's own People
+    // settings.
+    const { root } = renderMenu({
+      health: { ...CLOUD_HEALTH, hiddenSettings: ["company.members", "company.invites"] },
+    });
+    await flushReact();
+    await flushReact();
+
+    await openMenu("Open Acme Labs organization switcher");
+
+    const inviteItem = Array.from(document.body.querySelectorAll('[data-slot="dropdown-menu-item"]'))
+      .find((element) => element.textContent?.includes("Invite people to Acme Labs"));
+    expect(inviteItem).toBeTruthy();
+
+    act(() => {
+      inviteItem?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(mockNavigateTopLevel).toHaveBeenCalledWith("/members");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
   it("toggles company order editing without selecting a company", async () => {
     const root = createRoot(container);
     const queryClient = new QueryClient({
