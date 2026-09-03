@@ -50,9 +50,16 @@ from app.email_delivery import (
     deliver_rendered_email,
 )
 from app.email_templates import (
+    NEW_SIGNIN_SUBJECT,
+    PASSWORD_CHANGED_SUBJECT,
+    RESET_SUBJECT,
+    VERIFICATION_SUBJECT,
+    WELCOME_SUBJECT,
     render_password_changed_email,
+    render_new_signin_email,
     render_reset_email,
     render_verification_email,
+    render_welcome_email,
 )
 from app.hindsight import configured_hindsight_client
 from app.ingestion import TelnyxPayloadError, ingest_telnyx_event
@@ -555,7 +562,7 @@ async def _deliver_verification_email(
         deliver_rendered_email,
         settings=settings,
         recipient=recipient,
-        subject="Verify your Sonnia account",
+        subject=VERIFICATION_SUBJECT,
         rendered=rendered,
     )
 
@@ -568,7 +575,7 @@ async def _deliver_reset_email(
         deliver_rendered_email,
         settings=settings,
         recipient=recipient,
-        subject="Reset your Sonnia password",
+        subject=RESET_SUBJECT,
         rendered=rendered,
     )
 
@@ -584,7 +591,74 @@ async def _deliver_password_changed_email(
         deliver_rendered_email,
         settings=settings,
         recipient=recipient,
-        subject="Your Sonnia password was changed",
+        subject=PASSWORD_CHANGED_SUBJECT,
+        rendered=rendered,
+    )
+
+
+def _short_device(user_agent: str) -> str:
+    """Summarise a request user agent into a short human-readable device."""
+
+    ua = (user_agent or "").strip()
+    if not ua:
+        return "an unknown browser"
+    browser = "browser"
+    for marker, name in (
+        ("Edg/", "Edge"),
+        ("OPR/", "Opera"),
+        ("Chrome/", "Chrome"),
+        ("Firefox/", "Firefox"),
+        ("Safari/", "Safari"),
+    ):
+        if marker in ua:
+            browser = name
+            break
+    platform = ""
+    for marker, name in (
+        ("Windows", "Windows"),
+        ("Mac OS", "macOS"),
+        ("Android", "Android"),
+        ("iPhone", "iPhone"),
+        ("Linux", "Linux"),
+    ):
+        if marker in ua:
+            platform = name
+            break
+    return f"{browser} on {platform}" if platform else browser
+
+
+async def _deliver_welcome_email(
+    *, recipient: str, first_name: str, dashboard_url: str
+) -> EmailDeliveryResult:
+    rendered = render_welcome_email(first_name=first_name, url=dashboard_url)
+    return await run_in_threadpool(
+        deliver_rendered_email,
+        settings=settings,
+        recipient=recipient,
+        subject=WELCOME_SUBJECT,
+        rendered=rendered,
+    )
+
+
+async def _deliver_new_signin_email(
+    *,
+    recipient: str,
+    first_name: str,
+    device: str,
+    signed_in_at: str,
+    secure_url: str,
+) -> EmailDeliveryResult:
+    rendered = render_new_signin_email(
+        first_name=first_name,
+        device=device,
+        signed_in_at=signed_in_at,
+        url=secure_url,
+    )
+    return await run_in_threadpool(
+        deliver_rendered_email,
+        settings=settings,
+        recipient=recipient,
+        subject=NEW_SIGNIN_SUBJECT,
         rendered=rendered,
     )
 
@@ -967,6 +1041,12 @@ async def verify_email(payload: VerifyEmailRequest, db: DatabaseSession) -> Resp
         session = await _issue_session(db, user=user, scope=claims.scope)
         response_user = await _auth_user_response(db, user=user, scope=claims.scope)
 
+    await _deliver_welcome_email(
+        recipient=user.email,
+        first_name=_first_name(user.display_name),
+        dashboard_url=f"{settings.public_app_url.rstrip('/')}/dashboard",
+    )
+
     return _response_with_session(_auth_response(response_user), session, claims.scope)
 
 
@@ -1038,6 +1118,14 @@ async def login(
     if session is None or response_user is None or resolved is None:
         raise _invalid_credentials()
     scope, _ = resolved
+    if settings.new_signin_notifications_enabled:
+        await _deliver_new_signin_email(
+            recipient=response_user.email,
+            first_name=_first_name(response_user.name),
+            device=_short_device(request.headers.get("user-agent", "")),
+            signed_in_at=datetime.now(UTC).strftime("%d %B %Y at %H:%M UTC").lstrip("0"),
+            secure_url=f"{settings.public_app_url.rstrip('/')}/forgot-password",
+        )
     return _response_with_session(_auth_response(response_user), session, scope)
 
 

@@ -112,7 +112,8 @@ def test_password_changed_email_branded_slots() -> None:
     assert "SECURITY · CHANGED" in rendered.html
     assert "your password was changed" in rendered.html
     assert "Wasn&#x27;t you?" in rendered.html
-    assert "signed out" in rendered.html
+    # SON-1721: copy now comes from the Szonja spec §8 family table.
+    assert "If that wasn't you, secure your account now." in rendered.html
     assert "SECURITY · CHANGED" in rendered.plain_text
 
 
@@ -123,7 +124,9 @@ def test_verification_email_branded_slots() -> None:
     assert "NEW ACCOUNT · VERIFY" in rendered.html
     assert "one click and you&#x27;re in" in rendered.html
     assert "works for 24 hours" in rendered.html
-    assert "ACCOUNT · PENDING" in rendered.html
+    # SON-1721: the old ACCOUNT · PENDING header tag is now the spec §5
+    # live-text status chip (image-blocked safe).
+    assert "LINE_01  STATUS: PENDING → CONNECTED" in rendered.html
 
 
 def test_rendered_email_under_102kb() -> None:

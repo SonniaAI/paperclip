@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     smtp_from_email: str | None = None
     smtp_use_tls: bool = True
     smtp_timeout_seconds: float = 10.0
+    new_signin_notifications_enabled: bool = False
     telnyx_webhook_secret: str | None = None
     storage_bucket: str | None = None
     storage_region: str | None = None
