@@ -3031,7 +3031,11 @@ export function issueRoutes(
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
-    if (!req.actor.agentId || !req.actor.runId) throw crossIssueInfluenceRunContextError();
+    if (!req.actor.agentId || !req.actor.runId) {
+      throw crossIssueInfluenceRunContextError(
+        req.get("x-paperclip-run-id")?.trim() ? "unrecognized" : "missing",
+      );
+    }
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.

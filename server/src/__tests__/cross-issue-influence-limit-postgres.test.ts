@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -30,6 +31,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(issues);
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -112,5 +114,79 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
     expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_observed")).toHaveLength(20);
     expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_cap_rejected")).toHaveLength(1);
+  });
+
+  it("attributes writes to an issue the run checked out even when the wake has no issue binding (SON-1775)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const otherRunId = randomUUID();
+    const targetIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "board-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Portfolio Sweeper",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: runId,
+        companyId,
+        agentId,
+        status: "running",
+        responsibleUserId: "board-user",
+        contextSnapshot: {},
+      },
+      {
+        id: otherRunId,
+        companyId,
+        agentId,
+        status: "running",
+        responsibleUserId: "board-user",
+        contextSnapshot: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: targetIssueId,
+      companyId,
+      title: "Anchored portfolio target",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+      executionRunId: runId,
+      identifier: "ANCHOR-1",
+    });
+
+    const input = {
+      companyId,
+      agentId,
+      targetIssueId,
+      targetIssueIdentifier: "ANCHOR-1",
+      kind: "comment" as const,
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    };
+    await expect(observeCrossIssueInfluence(db, { ...input, runId })).resolves.toBeNull();
+
+    // The anchor is specific to the owning run: another live run of the same
+    // agent with no issue binding is still unattributable.
+    await expect(observeCrossIssueInfluence(db, { ...input, runId: otherRunId }))
+      .rejects.toMatchObject({ status: 403, details: { code: "cross_issue_influence_run_context_required" } });
+
+    const recorded = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.companyId, companyId));
+    expect(recorded).toEqual([]);
   });
 });

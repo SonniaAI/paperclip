@@ -3,6 +3,7 @@ import {
   CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
   CROSS_ISSUE_INFLUENCE_LIMIT,
   crossIssueInfluenceLimitError,
+  crossIssueInfluenceRunContextError,
   evaluateCrossIssueInfluenceLimit,
   observeCrossIssueInfluence,
 } from "../services/cross-issue-influence-limit.ts";
@@ -10,8 +11,11 @@ import {
 function counterDb(
   initialCount = 0,
   runOverrides: Record<string, unknown> | null = {},
+  anchoredRows: Array<Record<string, unknown>> = [],
+  runLookup?: (attempt: number) => Record<string, unknown> | null,
 ) {
   let observedCount = initialCount;
+  let runLookupAttempt = 0;
   const inserted: Array<Record<string, unknown>> = [];
   const tx = {
     select: (selection: Record<string, unknown>) => ({
@@ -24,14 +28,22 @@ function counterDb(
           }
           return {
             for: () => ({
-              then: (resolve: (rows: unknown[]) => unknown) => resolve(runOverrides === null ? [] : [{
-                id: "11111111-1111-4111-8111-111111111111",
-                companyId: "22222222-2222-4222-8222-222222222222",
-                agentId: "33333333-3333-4333-8333-333333333333",
-                responsibleUserId: "user-1",
-                contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" },
-                ...runOverrides,
-              }]),
+              then: (resolve: (rows: unknown[]) => unknown) => {
+                const configuredRun = runLookup
+                  ? runLookup(runLookupAttempt++)
+                  : runOverrides;
+                return resolve(configuredRun === null ? [] : [{
+                  id: "11111111-1111-4111-8111-111111111111",
+                  companyId: "22222222-2222-4222-8222-222222222222",
+                  agentId: "33333333-3333-4333-8333-333333333333",
+                  responsibleUserId: "user-1",
+                  contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" },
+                  ...configuredRun,
+                }]);
+              },
+            }),
+            limit: () => ({
+              then: (resolve: (rows: unknown[]) => unknown) => resolve(anchoredRows),
             }),
           };
         },
@@ -162,6 +174,36 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
+  it("allows a checkout-anchored disposition for a run with no source issue (SON-1775)", async () => {
+    const fake = counterDb(0, { contextSnapshot: {} }, [
+      { id: "55555555-5555-4555-8555-555555555555" },
+    ]);
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    })).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("treats a checkout anchor as attribution even when the run is bound to a different source issue", async () => {
+    const fake = counterDb(0, { contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" } }, [
+      { id: "55555555-5555-4555-8555-555555555555" },
+    ]);
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "update",
+    })).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+  });
+
   it.each([
     ["missing", null],
     ["wrong-agent", { agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }],
@@ -185,32 +227,60 @@ describe("cross-issue influence limit rollout", () => {
   it("fails closed before querying for a malformed run id", async () => {
     const fake = counterDb();
 
-    await expect(observeCrossIssueInfluence(fake.db as never, {
+    const error = await observeCrossIssueInfluence(fake.db as never, {
       companyId: "22222222-2222-4222-8222-222222222222",
       runId: "attacker-controlled-run-id",
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "comment",
-    })).rejects.toMatchObject({
+    }).catch((caught) => caught);
+    expect(error).toMatchObject({
       status: 403,
       details: { code: "cross_issue_influence_run_context_required" },
     });
+    expect(error.message).toContain("request sent an `X-Paperclip-Run-Id`");
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
-    const fake = counterDb(0, { contextSnapshot: {} });
+  it("retries a registration race before failing closed", async () => {
+    const fake = counterDb(0, {}, [], (attempt) =>
+      attempt === 0 ? null : { contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" } },
+    );
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
       companyId: "22222222-2222-4222-8222-222222222222",
       runId: "11111111-1111-4111-8111-111111111111",
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    })).resolves.toMatchObject({ count: 1, allowed: true });
+  });
+
+  it("uses distinct copy for missing, unrecognized, and unbound run context", () => {
+    const missing = crossIssueInfluenceRunContextError("missing");
+    const unrecognized = crossIssueInfluenceRunContextError("unrecognized");
+    const unbound = crossIssueInfluenceRunContextError("unbound");
+
+    expect(missing.message).toContain("carried no run id");
+    expect(unrecognized.message).toContain("is not recognized for this agent");
+    expect(unbound.message).toContain("run is registered");
+  });
+
+  it("fails closed when the persisted run has no source issue", async () => {
+    const fake = counterDb(0, { contextSnapshot: {} });
+
+    const error = await observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "update",
-    })).rejects.toMatchObject({
+    }).catch((caught) => caught);
+    expect(error).toMatchObject({
       status: 403,
       details: { code: "cross_issue_influence_run_context_required" },
     });
+    expect(error.message).toContain("run is registered");
     expect(fake.inserted).toEqual([]);
   });
 });

@@ -75,6 +75,15 @@ export interface IssueWriteDenialContext {
   count?: number | null;
   /** ISO timestamp at which log-only rollout becomes enforcement. */
   enforceAt?: string | null;
+  /**
+   * For `cross_issue_influence_run_context_required`: which run-context
+   * boundary fired. `"missing"` means the caller omitted the header;
+   * `"unrecognized"` means an id was supplied but no matching run row exists;
+   * `"unbound"` means the run is recognized but has neither a source issue nor
+   * a checkout anchor for the target. These are different fixes, so the copy
+   * must not conflate them (SON-1775).
+   */
+  runContextFailure?: "missing" | "unrecognized" | "unbound" | null;
 }
 
 export function isIssueWriteDenialCode(
@@ -244,7 +253,47 @@ export function describeIssueWriteDenial(
       };
     }
 
-    case "cross_issue_influence_run_context_required":
+    case "cross_issue_influence_run_context_required": {
+      const runContextFailure = context.runContextFailure ?? "missing";
+      if (runContextFailure === "unrecognized") {
+        return {
+          code,
+          status: 403,
+          tone: "boundary",
+          boundary: "Heartbeat run context",
+          title: "This run id is not recognized for this agent",
+          description:
+            `Every agent comment and task update is attributed to a heartbeat run so the ` +
+            `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
+            `The request sent an \`X-Paperclip-Run-Id\`, but no heartbeat run row for ${actor} in ` +
+            `this company matches it — the id is stale, from a finished run, or was never ` +
+            `registered server-side, so the write could not be attributed.`,
+          whoCanAct: `${actor}, once the request carries a run id Paperclip has registered.`,
+          sanctionedPath:
+            `Use the run id Paperclip assigned to the current wake (\`$PAPERCLIP_RUN_ID\`) — ` +
+            `do not reuse an id from an earlier run or invent one. If your wake carries no ` +
+            `issue binding (portfolio/board_direction sweep), \`POST /api/issues/{id}/checkout\` ` +
+            `first — an issue checked out by your live run is attributed to it.`,
+        };
+      }
+      if (runContextFailure === "unbound") {
+        return {
+          code,
+          status: 403,
+          tone: "boundary",
+          boundary: "Heartbeat run attribution",
+          title: "This heartbeat run has no source or checkout anchor",
+          description:
+            `The heartbeat run is registered, but its wake context names no source issue and ` +
+            `it does not hold a checkout on ${issue}. A write without either anchor could not ` +
+            `be attributed as owned work.`,
+          whoCanAct: `${actor}, after checking out the target issue with this live run.`,
+          sanctionedPath:
+            `For an unbound portfolio/board_direction wake, use the current run id ` +
+            `(\`$PAPERCLIP_RUN_ID\`) in \`POST /api/issues/{id}/checkout\`, then retry the ` +
+            `write. Writes to issues beyond your checkout still need a bound source issue.`,
+        };
+      }
       return {
         code,
         status: 403,
@@ -254,13 +303,16 @@ export function describeIssueWriteDenial(
         description:
           `Every agent comment and task update is attributed to a heartbeat run so the ` +
           `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
-          `This request arrived without a valid run, so it could not be contained.`,
+          `This request carried no run id and the run has no issue bound in its wake ` +
+          `context nor a checkout on the target issue, so the write could not be attributed.`,
         whoCanAct: `${actor}, once the request carries its own run id.`,
         sanctionedPath:
           `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
-          `and retry.`,
-
+          `and retry. If your wake carries no issue binding (portfolio/board_direction sweep), ` +
+          `\`POST /api/issues/{id}/checkout\` first — an issue checked out by your run is ` +
+          `attributed to it; writes beyond your anchored issues still need a bound source issue.`,
       };
+    }
 
     case "issue_write_attribution_spoof_rejected":
       return {
