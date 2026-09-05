@@ -2190,6 +2190,20 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
+  it("distinguishes a supplied but unrecognized run header", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    const actor = { ...agentActor(), runId: undefined };
+    const res = await request(await installActor(createApp(), actor))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .set("X-Paperclip-Run-Id", "stale-run")
+      .send({ body: "cross-issue write" });
+
+    expect(res.status).toBe(403);
+    expect(mockCrossIssueInfluenceRunContextError).toHaveBeenCalledWith("unrecognized");
+    expect(mockObserveCrossIssueInfluence).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
   it.each(["invalid", "wrong agent", "wrong company"])(
     "rejects comment and PATCH writes with a %s run",
     async () => {

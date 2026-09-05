@@ -86,6 +86,32 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.sanctionedPath).toContain("PAPERCLIP_RUN_ID");
   });
 
+  it("distinguishes a missing header from an unrecognized run id", () => {
+    const missing = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextFailure: "missing",
+    });
+    const unrecognized = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runContextFailure: "unrecognized",
+    });
+
+    expect(missing.title).toBe("Cross-issue writes need a run to attribute them to");
+    expect(missing.description).toContain("carried no run id");
+    expect(unrecognized.title).toBe("This run id is not recognized for this agent");
+    expect(unrecognized.description).toContain("request sent an `X-Paperclip-Run-Id`");
+    expect(unrecognized.sanctionedPath).toContain("do not reuse an id");
+  });
+
+  it("explains how a registered unbound wake obtains a target anchor", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      issueIdentifier: "TASK-482",
+      runContextFailure: "unbound",
+    });
+
+    expect(copy.title).toContain("no source or checkout anchor");
+    expect(copy.description).toContain("TASK-482");
+    expect(copy.sanctionedPath).toContain("checkout");
+  });
+
   it("tells a spoof attempt that the write itself was fine", () => {
     const copy = describeIssueWriteDenial("issue_write_attribution_spoof_rejected", {
       actorLabel: "Fable",

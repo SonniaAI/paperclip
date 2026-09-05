@@ -1,6 +1,6 @@
-import { and, count, eq } from "drizzle-orm";
+import { and, count, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -10,6 +10,13 @@ export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.00
 
 const CROSS_ISSUE_INFLUENCE_ACTIVITY = "issue.cross_issue_influence_observed";
 const CROSS_ISSUE_INFLUENCE_REJECTED_ACTIVITY = "issue.cross_issue_influence_cap_rejected";
+// A queued heartbeat run is committed before its adapter is dispatched, but a
+// cloud/gateway wake can race the commit at the API boundary. Give that
+// registration transaction a short, bounded window to become visible without
+// weakening the fail-closed behavior for a genuinely unknown run id.
+const RUN_REGISTRATION_RETRY_DELAYS_MS = [5, 25] as const;
+
+type CrossIssueInfluenceRunContextFailure = "missing" | "unrecognized" | "unbound";
 
 /**
  * Every kind shares one per-run counter. `interaction_resolution` covers the
@@ -27,11 +34,25 @@ export type CrossIssueInfluenceDecision = {
   enforceAt: string;
 };
 
-export function crossIssueInfluenceRunContextError() {
+/**
+ * The failure shapes behind one code need different fixes: no header at all,
+ * a header the server does not recognize (stale/finished/unregistered run), or
+ * a recognized run with no source/checkout anchor. The copy contract splits
+ * them so the agent reading the 403 is told which fix applies (SON-1775).
+ */
+export function crossIssueInfluenceRunContextError(
+  failure: CrossIssueInfluenceRunContextFailure = "missing",
+) {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
   // so the agent reading this 403 is told the fix, not just the refusal.
-  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required");
+  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required", {
+    runContextFailure: failure,
+  });
   return forbidden(body.error, body.details);
+}
+
+async function waitForRunRegistration(delayMs: number) {
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
 }
 
 function readRunSourceIssueId(contextSnapshot: unknown) {
@@ -82,10 +103,10 @@ export async function observeCrossIssueInfluence(
 ): Promise<CrossIssueInfluenceDecision | null> {
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
-  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError();
+  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError("unrecognized");
 
   return db.transaction(async (tx) => {
-    const run = await tx
+    const findRun = () => tx
       .select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
@@ -101,21 +122,59 @@ export async function observeCrossIssueInfluence(
       ))
       .for("update")
       .then((rows) => rows[0] ?? null);
+
+    let run = await findRun();
+    for (const delayMs of RUN_REGISTRATION_RETRY_DELAYS_MS) {
+      if (run) break;
+      await waitForRunRegistration(delayMs);
+      run = await findRun();
+    }
     if (
       !run ||
       run.companyId !== input.companyId ||
       run.agentId !== input.agentId
     ) {
-      throw crossIssueInfluenceRunContextError();
+      throw crossIssueInfluenceRunContextError("unrecognized");
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
-    if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
-    ) {
-      return null;
+    if (sourceIssueId) {
+      if (
+        sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier &&
+          sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      ) {
+        return null;
+      }
+    }
+
+    // Checkout-anchored exemption (SON-1775): holding the execution lock on the
+    // target issue is attribution. The anchor only exists because checkout
+    // validated this live run, this agent, and an allowed status transition,
+    // so a write to the anchored issue is owned work, not cross-issue
+    // influence to cap. Without it, wakes whose context snapshot carries no
+    // issue binding (portfolio/board_direction sweeps) fail closed on every
+    // disposition and can never close their own recovery loop. Anchors clear
+    // with the run (terminal-run sweep / release), so a finished or dispossessed
+    // run cannot ride a stale anchor past this gate.
+    const anchored = await tx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.id, input.targetIssueId),
+        eq(issues.companyId, input.companyId),
+        eq(issues.assigneeAgentId, input.agentId),
+        or(
+          eq(issues.executionRunId, input.runId),
+          eq(issues.checkoutRunId, input.runId),
+        ),
+      ))
+      .limit(1)
+      .then((rows) => rows.length > 0);
+    if (anchored) return null;
+
+    if (!sourceIssueId) {
+      throw crossIssueInfluenceRunContextError("unbound");
     }
 
     const priorCount = await tx
