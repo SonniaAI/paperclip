@@ -27,6 +27,13 @@ jobs:
         with:
           base-ref: ${{ github.event.pull_request.base.sha }}
           head-ref: ${{ github.event.pull_request.head.sha }}
+        # SON-1440 / CEO merge-bar ruling 2026-09-13: the SonniaAI org has dependency
+        # graph disabled (repo-level enable is a silent no-op for org-owned repos),
+        # so this step fails environmentally in ~10s on every fork PR and skips the
+        # code-signal steps below. Tolerate its failure so those steps always execute;
+        # quality gates remain the enforced signal. Systemic fix (org-owner enable)
+        # is pending in the founder lane; drop this override once it lands.
+        continue-on-error: true
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
