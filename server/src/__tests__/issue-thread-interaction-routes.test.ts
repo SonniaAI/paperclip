@@ -111,6 +111,13 @@ const mockDbTransaction = vi.hoisted(() => vi.fn(async (callback: (tx: unknown) 
         }
         const run = mockRunAttribution.value;
         return {
+          // The checkout-anchored attribution probe (SON-1775) selects the
+          // target issue row with .limit(1). This harness only exercises
+          // un-anchored runs, so the probe resolves "no anchor" and the cap
+          // path proceeds as before.
+          limit: () => ({
+            then: (resolve: (rows: unknown[]) => unknown) => resolve([]),
+          }),
           for: () => ({
             then: (resolve: (rows: unknown[]) => unknown) => resolve(run
               ? [{
