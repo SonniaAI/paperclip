@@ -14,6 +14,13 @@ RUN usermod -u $USER_UID --non-unique node \
 
 FROM base AS deps
 WORKDIR /app
+# Native-module toolchain for pnpm install: node-gyp builds ssh2 (et al)
+# on linux/arm64 + node 24 where no prebuild ships, and the slim base
+# carries no make/g++. Deps-stage only — production copies /app from the
+# build stage, so the toolchain never ships in the final image.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential \
+  && rm -rf /var/lib/apt/lists/*
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ./
 COPY cli/package.json cli/
 COPY server/package.json server/
