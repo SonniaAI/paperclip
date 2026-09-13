@@ -3240,3 +3240,5 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockCrossIssueInfluence.inserted).toEqual([]);
   });
 });
+
+// ci-baseline probe (SON-1440 attribution): matrix baseline on clean master; comment-only, no behavior change.
