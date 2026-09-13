@@ -648,6 +648,18 @@ async function migrationStatementAlreadyApplied(
     return constraintExists(sql, addConstraintMatch[2]);
   }
 
+  // Newer drizzle-kit emits constraint DDL wrapped in a DO block with a
+  // duplicate_object guard (e.g. `DO $$ BEGIN ALTER TABLE "t" ADD CONSTRAINT
+  // "c" ...; EXCEPTION WHEN duplicate_object THEN NULL; END $$;`). Recognize
+  // the wrapped form so a restored database missing only the migration-history
+  // row reconciles instead of re-executing.
+  const doBlockConstraintMatch = normalized.match(
+    /^DO \$\$ BEGIN ALTER TABLE "[^"]+" ADD CONSTRAINT "([^"]+)"/i,
+  );
+  if (doBlockConstraintMatch) {
+    return constraintExists(sql, doBlockConstraintMatch[1]);
+  }
+
   const createFunctionMatch = normalized.match(
     /^CREATE OR REPLACE FUNCTION "?([A-Za-z_][A-Za-z0-9_]*)"?\s*\(/i,
   );

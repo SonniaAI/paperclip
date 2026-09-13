@@ -18,6 +18,7 @@ import {
   sweepAbandonedImportTransferSpools,
 } from "./services/company-import-transfers.js";
 import { companyTransferRunService } from "./services/company-transfer-runs.js";
+import { resolveLaneWatchdogConfig, tickLaneFailureWatchdog } from "./services/lane-failure-watchdog.js";
 import { healthRoutes } from "./routes/health.js";
 import { cloudRuntimeIdentityMiddleware } from "./middleware/cloud-runtime-identity.js";
 import { cloudRoutes } from "./routes/cloud.js";
@@ -904,6 +905,28 @@ export async function createApp(
     .finally(() => {
       sweepImportTransferSpools();
     });
+  // Fleet lane-failure watchdog (SON-1440 WP-B sink delivery): poll terminal
+  // heartbeat runs + reconcile strandings through the pure lane-failure-counter
+  // reducer and post threshold crossings / recovery clears to the Operations
+  // sink issue. Same setInterval + unref + error-swallow shape as the spool
+  // sweep above; the tick itself is also re-entrant-drop and fail-contained.
+  const laneWatchdogConfig = resolveLaneWatchdogConfig();
+  if (laneWatchdogConfig.enabled) {
+    const tickLaneWatchdog = () => {
+      tickLaneFailureWatchdog(db)
+        .then((result) => {
+          if (result.runsProcessed > 0 || result.alertsEmitted > 0 || result.clearsEmitted > 0) {
+            logger.info(result, "lane failure watchdog tick");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "lane failure watchdog tick failed");
+        });
+    };
+    const laneWatchdogTimer = setInterval(tickLaneWatchdog, laneWatchdogConfig.intervalMs);
+    laneWatchdogTimer.unref?.();
+    setTimeout(tickLaneWatchdog, 15_000).unref?.();
+  }
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });

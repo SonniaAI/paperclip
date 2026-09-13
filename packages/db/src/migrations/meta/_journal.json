@@ -1653,6 +1653,13 @@
       "when": 1788296836732,
       "tag": "0237_clammy_colonel_america",
       "breakpoints": true
+    },
+    {
+      "idx": 238,
+      "version": "7",
+      "when": 1789302852996,
+      "tag": "0238_lane_failure_watchdog_state",
+      "breakpoints": true
     }
   ]
 }
