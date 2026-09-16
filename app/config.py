@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     hindsight_base_url: str | None = None
     hindsight_api_key: str | None = None
     hindsight_timeout_seconds: float = 10.0
+    build_sha: str = ""
+    capture_log_enabled: bool = True
 
     @model_validator(mode="after")
     def require_real_production_secret(self) -> Settings:

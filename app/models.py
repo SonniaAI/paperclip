@@ -11,6 +11,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -783,3 +784,65 @@ class ContactImport(Base, TenantScoped):
         PGUUID(as_uuid=True), ForeignKey("app_users.id"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+
+class WebhookReceiptCapture(Base):
+    """CP2 - append-only webhook receipt boundary capture (SON-1458).
+
+    System-level audit row for every receipt at POST /webhooks/telnyx:
+    raw body verbatim as received, credential headers redacted, receive
+    timestamp, and the signature-verification decision.  Insert-only;
+    intentionally not tenant-scoped (records pre-ingestion receipts).
+    """
+
+    __tablename__ = "webhook_receipt_capture"
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    source: Mapped[str] = mapped_column(String(40), default="telnyx")
+    method: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remote_addr: Mapped[str | None] = mapped_column(Text, nullable=True)
+    headers_redacted: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    raw_body: Mapped[str] = mapped_column(Text)
+    body_bytes: Mapped[int] = mapped_column(Integer)
+    signature_algorithm: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    signature_result: Mapped[str] = mapped_column(String(20))
+    signature_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tenant_scope: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+
+
+class IngestionTraceCapture(Base):
+    """CP3 - append-only ingestion trace (SON-1458).
+
+    Idempotency/dedupe decision, event-to-entity mapping (call, transcript,
+    recording refs), deployed build git SHA, and processing latency for one
+    ingested webhook event.  Insert-only; links to CP2 via receipt_id.
+    """
+
+    __tablename__ = "ingestion_trace_capture"
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    receipt_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("webhook_receipt_capture.id"),
+        nullable=True,
+        index=True,
+    )
+    event_id: Mapped[str] = mapped_column(Text, index=True)
+    event_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dedupe_decision: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    outcome: Mapped[str] = mapped_column(String(40))
+    call_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True, index=True)
+    contact_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
+    transcript_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recording_refs: Mapped[list[object] | None] = mapped_column(JSON, nullable=True)
+    build_sha: Mapped[str | None] = mapped_column(Text, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)

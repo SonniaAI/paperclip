@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import re
+import time
 import unicodedata
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -24,6 +25,12 @@ from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
+from app.capture_log import (
+    capture_ingestion_trace,
+    capture_webhook_receipt,
+    evaluate_telnyx_signature,
+    extract_event_context,
+)
 from app.config import get_settings
 from app.contact_memory import (
     ContactMemoryNotFoundError,
@@ -762,18 +769,21 @@ def _webhook_scope(request: Request) -> TenantScope:
         ) from exc
 
 
-async def _verify_telnyx_webhook(request: Request, body: bytes) -> None:
-    if not settings.telnyx_webhook_secret:
-        return
+def _verify_telnyx_webhook(request: Request, body: bytes) -> tuple[str, str, str | None]:
+    """CP2 signature decision for the telnyx webhook (algorithm, result, detail).
+
+    Failure enforcement stays with the caller so the receipt capture lands
+    before the 401 short-circuit - response behavior is unchanged.
+    """
+
     supplied = request.headers.get("X-Telnyx-Signature") or request.headers.get(
         "Telnyx-Signature-Ed25519"
     )
-    expected = hmac.new(settings.telnyx_webhook_secret.encode("utf-8"), body, "sha256").hexdigest()
-    if not supplied or not hmac.compare_digest(supplied, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid webhook signature",
-        )
+    return evaluate_telnyx_signature(settings.telnyx_webhook_secret, supplied, body)
+
+
+def _webhook_latency_ms(started: float) -> int:
+    return max(0, int((time.monotonic() - started) * 1000))
 
 
 @app.post("/webhooks/telnyx", status_code=status.HTTP_202_ACCEPTED)
@@ -782,11 +792,32 @@ async def telnyx_webhook(request: Request, db: DatabaseSession) -> JSONResponse:
 
     Scope headers are supplied by the integration endpoint configuration, not
     by the provider payload.  The raw body is stored before normalization.
+Each request is also recorded to the append-only CP2/CP3 capture log
+(SON-1458); capture failures never alter processing.
     """
 
     scope = _webhook_scope(request)
     body = await request.body()
-    await _verify_telnyx_webhook(request, body)
+    started = time.monotonic()
+    signature_algorithm, signature_result, signature_detail = _verify_telnyx_webhook(
+        request, body
+    )
+    receipt_id = await capture_webhook_receipt(
+        request.headers,
+        body,
+        signature_algorithm=signature_algorithm,
+        signature_result=signature_result,
+        signature_detail=signature_detail,
+        tenant_scope=f"org={scope.org_id},department={scope.department_id}",
+        method=request.method,
+        path=request.url.path,
+        remote_addr=request.client.host if request.client else None,
+    )
+    if signature_result == "fail":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid webhook signature",
+        )
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
@@ -799,7 +830,25 @@ async def telnyx_webhook(request: Request, db: DatabaseSession) -> JSONResponse:
             storage=configured_private_object_storage(settings),
         )
     except TelnyxPayloadError as exc:
+        await capture_ingestion_trace(
+            receipt_id,
+            event_id="unknown",
+            outcome="payload_error",
+            latency_ms=_webhook_latency_ms(started),
+        )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    event_context = extract_event_context(payload)
+    await capture_ingestion_trace(
+        receipt_id,
+        event_id=event_context.event_id,
+        event_type=event_context.event_type,
+        dedupe_decision="duplicate" if result.duplicate else "inserted",
+        outcome=result.status,
+        call_id=str(result.call_id) if result.call_id else None,
+        recording_refs=list(event_context.recording_refs),
+        transcript_ref=event_context.transcript_ref,
+        latency_ms=_webhook_latency_ms(started),
+    )
     if result.status in {"processed", "duplicate"} and result.canonical_payload is not None:
         await dispatch_transcript_memory(
             db,
