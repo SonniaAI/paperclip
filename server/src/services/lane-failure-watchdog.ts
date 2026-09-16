@@ -279,6 +279,17 @@ export async function tickLaneFailureWatchdog(db: Db, now: Date = new Date()): P
   return result;
 }
 
+/**
+ * SON-2066: lower bound for the terminal-run window. A persisted run cursor
+ * continues strictly after it; a fresh state row starts at the 7-day lookback
+ * instead of genesis, so first boot or state-row loss cannot blind current
+ * alerts behind a months-long backlog crawl or replay stale crossings at the
+ * sink.
+ */
+export function runWindowFloor(cursor: WatchdogCursor, now: Date): Date | null {
+  return cursor.runs ? null : new Date(now.getTime() - COMPANY_LOOKBACK_MS);
+}
+
 async function tickCompanyWatchdog(
   db: Db,
   companyId: string,
@@ -326,6 +337,14 @@ async function tickCompanyWatchdog(
       )!,
     );
   }
+  // SON-2066: with no persisted run cursor (first boot, rolled or lost state
+  // row), bound the first pass to the lookback window instead of genesis —
+  // otherwise the cursor crawls at MAX_BATCH per tick, current failures stay
+  // unseen for hours, and stale crossings replay at the sink.
+  const runFloor = runWindowFloor(cursor, now);
+  if (runFloor) {
+    runConds.push(gte(heartbeatRuns.finishedAt, runFloor));
+  }
   const runs = await db
     .select({
       id: heartbeatRuns.id,
@@ -337,6 +356,13 @@ async function tickCompanyWatchdog(
     .where(and(...runConds))
     .orderBy(asc(heartbeatRuns.finishedAt), asc(heartbeatRuns.id))
     .limit(MAX_BATCH);
+
+  if (!cursor.runs && runs.length >= MAX_BATCH) {
+    logger.warn(
+      { companyId, runFloor: runFloor?.toISOString() },
+      "lane watchdog: first tick saturated MAX_BATCH within the 7-day lookback; cursor drains on subsequent ticks",
+    );
+  }
 
   let runRecords: Record<string, unknown>[] = [];
   if (runs.length > 0) {

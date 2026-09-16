@@ -8,6 +8,7 @@ import {
   recordFromHeartbeatRun,
   recordFromStrandingActivity,
   resolveLaneWatchdogConfig,
+  runWindowFloor,
 } from "../services/lane-failure-watchdog.js";
 import {
   applyCounterState,
@@ -254,5 +255,18 @@ describe("reducer integration (vendored module, frozen semantics)", () => {
     const replay = applyCounterState(first.state, normalize([stranding]));
     expect(replay.already_processed_run_ids).toContain("activity-1");
     expect(replay.threshold_crossings).toHaveLength(0);
+  });
+});
+
+describe("runWindowFloor (SON-2066 first-boot cursor bound)", () => {
+  const now = new Date("2026-09-16T12:00:00.000Z");
+
+  it("bounds a fresh state row to the 7-day lookback instead of genesis", () => {
+    expect(runWindowFloor({}, now)).toEqual(new Date("2026-09-09T12:00:00.000Z"));
+  });
+
+  it("keeps the strict cursor continuation (no extra floor) when a run cursor exists", () => {
+    const cursor = { runs: { ts: "2026-09-15T08:00:00.000Z", id: "run-9" } };
+    expect(runWindowFloor(cursor, now)).toBeNull();
   });
 });
