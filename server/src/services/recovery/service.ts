@@ -129,6 +129,10 @@ import {
 import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  classifyWriteTransportFailure,
+  writeTransportRecoveryWarning,
+} from "./write-transport-failure.js";
+import {
   collectDispositionRepairSourceState,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
@@ -3483,6 +3487,21 @@ export function recoveryService(
     attemptCount: number;
     terminalReason: string;
   }) {
+    // SON-1775: unchanged source state only proves the owner stalled if the
+    // owner could actually write. When the latest run's failure is a board
+    // write-transport failure, unchanged state means writes were denied, not
+    // that the owner ignored the repair wake — defer the board escalation and
+    // let the bounded repair schedule keep retrying.
+    const transportFailure = classifyWriteTransportFailure(input.latestRun);
+    if (transportFailure) {
+      await recordWriteTransportRecoveryDeferral({
+        issue: input.issue,
+        latestRun: input.latestRun,
+        failure: transportFailure,
+        source: "recovery.reconcile_disposition_repair_transport_deferred",
+      });
+      return null;
+    }
     const action = await ensureDispositionRepairAction({
       issue: input.issue,
       latestRun: input.latestRun,
@@ -3724,6 +3743,67 @@ export function recoveryService(
     return scheduled ? "queued" : "skipped";
   }
 
+  /**
+   * SON-1775: record (deduped per failing run) that a stranded/disposition
+   * escalation was deferred because the run's failure is a board
+   * write-transport failure. Log + activity only, no issue comment, so the
+   * deferral cannot wake the issue thread it failed to write to.
+   */
+  async function recordWriteTransportRecoveryDeferral(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    failure: NonNullable<ReturnType<typeof classifyWriteTransportFailure>>;
+    source: string;
+  }) {
+    const latestRunId = input.latestRun?.id ?? null;
+    const recentDeferrals = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, input.issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.issue.id),
+          eq(activityLog.action, "issue.write_transport_recovery_deferred"),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt))
+      .limit(20);
+    const alreadyRecorded = recentDeferrals.some((row) =>
+      readNonEmptyString(parseObject(row.details).latestRunId) === latestRunId &&
+      readNonEmptyString(parseObject(row.details).source) === input.source,
+    );
+    if (alreadyRecorded) return;
+
+    logger.warn({
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      runId: latestRunId,
+      transportFailureKind: input.failure.kind,
+      transportFailureMatched: input.failure.matched,
+    }, "write-transport failure deferred stranded-issue escalation; issue status unchanged");
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "recovery",
+      agentId: null,
+      runId: latestRunId,
+      action: "issue.write_transport_recovery_deferred",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: input.issue.status,
+        source: input.source,
+        transportFailureKind: input.failure.kind,
+        transportFailureMatched: input.failure.matched,
+        latestRunId,
+        latestRunStatus: input.latestRun?.status ?? null,
+        latestRunErrorCode: input.latestRun?.errorCode ?? null,
+      },
+    });
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -3739,6 +3819,24 @@ export function recoveryService(
         previousStatus: input.previousStatus,
         latestRun: input.latestRun,
       });
+    }
+
+    // SON-1775: a board write-transport failure (issue-write denial, agent
+    // auth flap, board-API 5xx) means the wake could not DELIVER its writes,
+    // so it is not evidence that the issue itself is blocked. Escalating such
+    // an issue to blocked fail-closes live work. Defer the escalation: leave
+    // the status unchanged, record the deferral, and let the normal
+    // continuation-retry policy continue; requeued wakes carry a transport
+    // warning.
+    const transportFailure = classifyWriteTransportFailure(input.latestRun);
+    if (transportFailure) {
+      await recordWriteTransportRecoveryDeferral({
+        issue: input.issue,
+        latestRun: input.latestRun,
+        failure: transportFailure,
+        source: "recovery.reconcile_stranded_transport_deferred",
+      });
+      return null;
     }
 
     const recoveryCause = resolveStrandedRecoveryCause(
@@ -5133,28 +5231,42 @@ export function recoveryService(
               classification.errorCode,
             );
           if (consecutive >= classification.maxAttempts) {
-            const attemptCopy =
-              consecutive <= 1 ? "" : ` (${consecutive}× attempts)`;
-            const updated = await escalateStrandedAssignedIssue({
-              issue,
-              previousStatus: "in_progress",
-              latestRun,
-              notice: {
-                body:
-                  "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
-                  `execution disappeared, but it still has no live execution path${attemptCopy}. ` +
-                  "Moving it to `blocked` so it is visible for intervention.",
-                title: "No live execution path",
-                tone: "danger",
-              },
-            });
-            if (updated) {
-              result.escalated += 1;
-              result.issueIds.push(issue.id);
-            } else {
-              result.skipped += 1;
+            // SON-1775: transport-class exhaustion must not flip the issue to
+            // blocked (the writes were denied, not the work stranded).
+            // Record the deferral (deduped per failing run) and fall through
+            // to the continuation requeue below — the rewake throttle bounds
+            // the cadence and the requeued wake carries a transport warning.
+            const exhaustedTransportFailure = classifyWriteTransportFailure(latestRun);
+            if (!exhaustedTransportFailure) {
+              const attemptCopy =
+                consecutive <= 1 ? "" : ` (${consecutive}× attempts)`;
+              const updated = await escalateStrandedAssignedIssue({
+                issue,
+                previousStatus: "in_progress",
+                latestRun,
+                notice: {
+                  body:
+                    "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
+                    `execution disappeared, but it still has no live execution path${attemptCopy}. ` +
+                    "Moving it to `blocked` so it is visible for intervention.",
+                  title: "No live execution path",
+                  tone: "danger",
+                },
+              });
+              if (updated) {
+                result.escalated += 1;
+                result.issueIds.push(issue.id);
+              } else {
+                result.skipped += 1;
+              }
+              continue;
             }
-            continue;
+            await recordWriteTransportRecoveryDeferral({
+              issue,
+              latestRun,
+              failure: exhaustedTransportFailure,
+              source: "recovery.reconcile_stranded_transport_deferred",
+            });
           }
 
           if (classification.baseBackoffMs > 0 && latestFinishedAt) {
@@ -5175,6 +5287,7 @@ export function recoveryService(
         continue;
       }
 
+      const continuationTransportFailure = classifyWriteTransportFailure(latestRun);
       const queued = await enqueueStrandedIssueRecovery({
         issueId: issue.id,
         agentId,
@@ -5182,6 +5295,13 @@ export function recoveryService(
         retryReason: "issue_continuation_needed",
         source: "issue.continuation_recovery",
         retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
+        ...(continuationTransportFailure
+          ? {
+            extraContext: {
+              transportWarning: writeTransportRecoveryWarning(continuationTransportFailure),
+            },
+          }
+          : {}),
       });
       if (queued) {
         result.continuationRequeued += 1;

@@ -43,7 +43,7 @@ interface WriteTransportRunLike {
 const MAX_EVIDENCE_SCAN_CHARS = 8_000;
 
 const WRITE_DENIAL_PATTERNS: RegExp[] = [
-  /cross_issue_influence/i,
+  /cross_issue_influence[a-z_]*/i,
   /issue_write_not_visible/i,
   /issue_write_actor_class_excluded/i,
   /issue_write_responsible_user_ceiling/i,

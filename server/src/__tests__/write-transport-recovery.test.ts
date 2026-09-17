@@ -219,8 +219,14 @@ describeEmbeddedPostgres("write-transport recovery deferral (SON-1775)", () => {
     retryReason?: string;
     extraContext?: Record<string, unknown>;
   }) {
+    // SON-1775 seeds model a wake that died at the board API before any
+    // provider work started. Without the bootstrap executionRecovery
+    // evidence the legacy-execution reconciler (not the stranded paths
+    // this suite exercises) intercepts the run and creates an
+    // active_run_watchdog instead of reaching the escalation paths.
+    const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
-      id: randomUUID(),
+      id: runId,
       companyId: input.companyId,
       agentId: input.agentId,
       invocationSource: "manual",
@@ -229,12 +235,16 @@ describeEmbeddedPostgres("write-transport recovery deferral (SON-1775)", () => {
       errorCode: input.errorCode ?? null,
       startedAt: new Date("2026-09-04T18:00:00.000Z"),
       finishedAt: new Date("2026-09-04T18:01:00.000Z"),
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      },
       contextSnapshot: {
         issueId: input.issueId,
         retryReason: input.retryReason ?? "issue_continuation_needed",
         ...(input.extraContext ?? {}),
       },
     });
+    return runId;
   }
 
   async function issueStatus(issueId: string) {
@@ -266,20 +276,17 @@ describeEmbeddedPostgres("write-transport recovery deferral (SON-1775)", () => {
         '{"error":{"code":"cross_issue_influence"}}',
     });
     const enqueueWakeup = vi.fn(async () => null);
-    const recovery = recoveryService(db, { enqueueWakeup });
+    const scheduleRecoveryRetry = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup, scheduleRecoveryRetry });
 
     const result = await recovery.reconcileStrandedAssignedIssues();
 
     expect(await issueStatus(sourceIssueId)).toBe("in_progress");
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
     expect(result.escalated).toBe(0);
-    // The deferral keeps the retry policy alive: the continuation wake is
-    // requeued and carries the transport warning.
-    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
-    const wakeOptions = enqueueWakeup.mock.calls[0]?.[1] as {
-      contextSnapshot: Record<string, unknown>;
-    };
-    expect(String(wakeOptions.contextSnapshot.transportWarning)).toContain("Recovery deferred");
+    // The deferral keeps the retry policy alive: the failed predecessor is
+    // re-driven through the durable retry scheduler.
+    expect(scheduleRecoveryRetry).toHaveBeenCalledTimes(1);
     const deferrals = await deferralActivityRows(sourceIssueId);
     expect(deferrals).toHaveLength(1);
     expect(deferrals[0]?.details).toMatchObject({
@@ -303,18 +310,20 @@ describeEmbeddedPostgres("write-transport recovery deferral (SON-1775)", () => {
         "failed to resolve interaction on the board API: POST /api/issues/WT-1/interactions/abc/accept responded 500",
     });
     const enqueueWakeup = vi.fn(async () => null);
-    const recovery = recoveryService(db, { enqueueWakeup });
+    const scheduleRecoveryRetry = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup, scheduleRecoveryRetry });
 
     const result = await recovery.reconcileStrandedAssignedIssues();
 
     expect(await issueStatus(sourceIssueId)).toBe("in_progress");
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
     expect(result.escalated).toBe(0);
-    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
-    const wakeOptions = enqueueWakeup.mock.calls[0]?.[1] as {
-      contextSnapshot: Record<string, unknown>;
-    };
-    expect(String(wakeOptions.contextSnapshot.transportWarning)).toContain("board API returned a server error");
+    expect(scheduleRecoveryRetry).toHaveBeenCalledTimes(1);
+    const deferrals = await deferralActivityRows(sourceIssueId);
+    expect(deferrals).toHaveLength(1);
+    expect(deferrals[0]?.details).toMatchObject({
+      transportFailureKind: "board_api_5xx",
+    });
   });
 
   it("does not flip to blocked when the stall disposition-repair exhausts on a write denial", async () => {
