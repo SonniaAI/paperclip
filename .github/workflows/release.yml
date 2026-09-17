@@ -116,6 +116,10 @@ jobs:
       - name: Publish canary
         env:
           GITHUB_ACTIONS: "true"
+          # Registry fallback for environments where npm OIDC trusted
+          # publishing is not configured for a package. An empty value is
+          # ignored by npm, so provisioning the secret is optional.
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
         run: ./scripts/release.sh canary --skip-verify
 
       - name: Dump npm debug logs
@@ -355,6 +359,7 @@ jobs:
       - name: Publish nightly
         env:
           GITHUB_ACTIONS: "true"
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
         run: |
           args=(nightly --skip-verify)
           if [ "${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}" = "true" ]; then
@@ -621,6 +626,7 @@ jobs:
       - name: Publish beta
         env:
           GITHUB_ACTIONS: "true"
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
         run: |
           args=(beta --skip-verify)
           if [ "${{ needs.select_beta.outputs.mode }}" = "candidate" ]; then
@@ -1051,6 +1057,7 @@ jobs:
       - name: Publish stable
         env:
           GITHUB_ACTIONS: "true"
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
         run: |
           args=(stable --skip-verify)
           if [ -n "${{ inputs.stable_date }}" ]; then
@@ -1186,3 +1193,65 @@ jobs:
             echo "- Open and merge the PR (a human opens it so CI runs):"
             echo "  https://github.com/${GITHUB_REPOSITORY}/compare/master...${branch}?expand=1"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ----- Failure alerting ---------------------------------------------------
+  # The first four nightly failures surfaced only as a quiet email thread to
+  # whoever happened to be subscribed. Every failed Release run now opens (or
+  # comments on) a tracking issue, so a red pipeline is loud, durable, and
+  # visible on the issue board instead of buried in Actions notifications.
+  notify_release_failure:
+    if: failure() && !cancelled()
+    needs:
+      - verify_canary
+      - publish_canary
+      - smoke_canary_onboarding
+      - select_nightly
+      - smoke_nightly
+      - publish_nightly
+      - select_beta
+      - verify_beta_candidate
+      - publish_beta
+      - draft_stable_notes
+      - smoke_beta
+      - preflight_stable
+      - verify_stable
+      - preview_stable
+      - publish_stable
+      - canonicalize_stable_notes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      EVENT: ${{ github.event_name }}
+      REF_NAME: ${{ github.ref_name }}
+      SHA: ${{ github.sha }}
+    steps:
+      - name: Open or update the release-failure tracking issue
+        run: |
+          set -euo pipefail
+          title="[release-alert] Release pipeline failed"
+          failed_jobs="$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json jobs --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")')"
+          body_file="$(mktemp)"
+          {
+            echo "The Release workflow failed."
+            echo ""
+            echo "- Event: $EVENT"
+            echo "- Ref: $REF_NAME"
+            echo "- Head: $SHA"
+            echo "- Failed jobs: $failed_jobs"
+            echo "- Run: $RUN_URL"
+          } >"$body_file"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "release-alert in:title" --json number --jq '.[0].number' || true)"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file "$body_file"
+            echo "Commented on existing alert issue #$existing"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body_file"
+            echo "Created new alert issue"
+          fi
+          rm -f "$body_file"
