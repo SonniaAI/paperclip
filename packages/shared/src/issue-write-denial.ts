@@ -31,6 +31,8 @@ export const ISSUE_WRITE_DENIAL_CODES = [
   "issue_write_assignee_run_lock",
   "cross_issue_influence_cap_exceeded",
   "cross_issue_influence_run_context_required",
+  "cross_issue_influence_run_context_missing",
+  "cross_issue_influence_run_context_unrecognized",
   "issue_write_attribution_spoof_rejected",
 ] as const;
 
@@ -260,6 +262,42 @@ export function describeIssueWriteDenial(
           `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
           `and retry.`,
 
+      };
+
+    case "cross_issue_influence_run_context_missing":
+      return {
+        code,
+        status: 403,
+        tone: "boundary",
+        boundary: "Heartbeat run context",
+        title: "Write arrived without a run id to attribute it to",
+        description:
+          `Every agent comment and task update is attributed to a heartbeat run so the ` +
+          `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
+          `This request carried no parseable run id, so it could not be contained.`,
+        whoCanAct: `${actor}, once the request carries its own run id.`,
+        sanctionedPath:
+          `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
+          `and retry.`,
+      };
+
+    case "cross_issue_influence_run_context_unrecognized":
+      return {
+        code,
+        status: 403,
+        tone: "boundary",
+        boundary: "Heartbeat run context",
+        title: "The sent run id is not a recognized run for this agent",
+        description:
+          `Every agent comment and task update is attributed to a heartbeat run so the ` +
+          `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
+          `The run id on this request has no matching run for this agent in this company, ` +
+          `so the write cannot be attributed to a run the server dispatched.`,
+        whoCanAct: `${actor}, acting from a run the server dispatched for this company.`,
+        sanctionedPath:
+          `Retry from the live wake so its own \`$PAPERCLIP_RUN_ID\` is sent. If the id is ` +
+          `correct but stale, re-checkout the task to re-anchor execution, or wait for the ` +
+          `next heartbeat run and act from it.`,
       };
 
     case "issue_write_attribution_spoof_rejected":

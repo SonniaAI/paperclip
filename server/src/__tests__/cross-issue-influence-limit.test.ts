@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { heartbeatRuns } from "@paperclipai/db";
 import {
   CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
   CROSS_ISSUE_INFLUENCE_LIMIT,
@@ -13,6 +14,7 @@ function counterDb(
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
+  const runInserts: Array<Record<string, unknown>> = [];
   const tx = {
     select: (selection: Record<string, unknown>) => ({
       from: () => ({
@@ -37,18 +39,33 @@ function counterDb(
         },
       }),
     }),
-    insert: () => ({
-      values: async (value: Record<string, unknown>) => {
-        inserted.push(value);
-        if (value.action === "issue.cross_issue_influence_observed") observedCount += 1;
-      },
-    }),
+    insert: (table: unknown) => {
+      if (table === heartbeatRuns) {
+        return {
+          values: (value: Record<string, unknown>) => ({
+            onConflictDoNothing: () => ({
+              returning: async () => {
+                runInserts.push(value);
+                return [{ id: value.id }];
+              },
+            }),
+          }),
+        };
+      }
+      return {
+        values: async (value: Record<string, unknown>) => {
+          inserted.push(value);
+          if (value.action === "issue.cross_issue_influence_observed") observedCount += 1;
+        },
+      };
+    },
   };
   return {
     db: {
       transaction: async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx),
     },
     inserted,
+    runInserts,
     get observedCount() {
       return observedCount;
     },
@@ -162,8 +179,34 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
+  it("self-registers an unbound run on first attributed write when the run row is missing", async () => {
+    const fake = counterDb(0, null);
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    })).resolves.toMatchObject({ count: 1, allowed: true });
+
+    expect(fake.runInserts).toHaveLength(1);
+    expect(fake.runInserts[0]).toMatchObject({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "22222222-2222-4222-8222-222222222222",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      invocationSource: "api_self_registered",
+    });
+    expect((fake.runInserts[0]?.contextSnapshot as Record<string, unknown>).unbound).toBe(true);
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({
+        action: "issue.cross_issue_influence_observed",
+      }),
+    ]);
+    expect((fake.inserted[0]?.details as Record<string, unknown>).runUnbound).toBe(true);
+  });
+
   it.each([
-    ["missing", null],
     ["wrong-agent", { agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }],
     ["wrong-company", { companyId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }],
   ] as const)("fails closed for a %s locked run", async (_label, runOverrides) => {
@@ -177,7 +220,7 @@ describe("cross-issue influence limit rollout", () => {
       kind: "comment",
     })).rejects.toMatchObject({
       status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
+      details: { code: "cross_issue_influence_run_context_unrecognized" },
     });
     expect(fake.inserted).toEqual([]);
   });
@@ -193,12 +236,13 @@ describe("cross-issue influence limit rollout", () => {
       kind: "comment",
     })).rejects.toMatchObject({
       status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
+      details: { code: "cross_issue_influence_run_context_missing" },
     });
     expect(fake.inserted).toEqual([]);
+    expect(fake.runInserts).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
+  it("counts every write from a recognized unbound run instead of refusing", async () => {
     const fake = counterDb(0, { contextSnapshot: {} });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
@@ -207,10 +251,8 @@ describe("cross-issue influence limit rollout", () => {
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "update",
-    })).rejects.toMatchObject({
-      status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
-    });
-    expect(fake.inserted).toEqual([]);
+    })).resolves.toMatchObject({ count: 1, allowed: true });
+    expect(fake.runInserts).toEqual([]);
+    expect((fake.inserted[0]?.details as Record<string, unknown>).runUnbound).toBe(true);
   });
 });

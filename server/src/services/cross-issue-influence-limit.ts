@@ -27,10 +27,21 @@ export type CrossIssueInfluenceDecision = {
   enforceAt: string;
 };
 
-export function crossIssueInfluenceRunContextError() {
+export type CrossIssueRunContextErrorVariant = "missing" | "unrecognized";
+
+export function crossIssueInfluenceRunContextError(
+  variant: CrossIssueRunContextErrorVariant = "missing",
+) {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
   // so the agent reading this 403 is told the fix, not just the refusal.
-  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required");
+  // SON-1775: the single "without a valid run" refusal conflated a missing
+  // header with a present-but-unrecognized run id, which sent unbound-wake
+  // debugging in the wrong direction; the split names each case.
+  const { body } = issueWriteDenialResponse(
+    variant === "unrecognized"
+      ? "cross_issue_influence_run_context_unrecognized"
+      : "cross_issue_influence_run_context_missing",
+  );
   return forbidden(body.error, body.details);
 }
 
@@ -82,10 +93,10 @@ export async function observeCrossIssueInfluence(
 ): Promise<CrossIssueInfluenceDecision | null> {
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
-  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError();
+  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError("missing");
 
   return db.transaction(async (tx) => {
-    const run = await tx
+    let run = await tx
       .select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
@@ -101,19 +112,58 @@ export async function observeCrossIssueInfluence(
       ))
       .for("update")
       .then((rows) => rows[0] ?? null);
+
+    if (!run) {
+      // SON-1775: unbound board_direction/portfolio wakes legitimately act
+      // with a run id the control plane never registered, and failing every
+      // disposition write closed the missing-disposition recovery loop for
+      // them. Register the run lazily on first attributed write: the API key
+      // has already authenticated the agent, the row carries an unbound
+      // marker, and every write from it still counts against the per-run cap
+      // below. A conflicting row (same id, different owner) still refuses.
+      const selfRegistered = await tx
+        .insert(heartbeatRuns)
+        .values({
+          id: input.runId,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          invocationSource: "api_self_registered",
+          status: "running",
+          contextSnapshot: {
+            registeredVia: "write_time_self_registration",
+            unbound: true,
+          },
+        })
+        .onConflictDoNothing()
+        .returning({ id: heartbeatRuns.id });
+      if (selfRegistered.length > 0) {
+        run = {
+          id: input.runId,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          responsibleUserId: null,
+          contextSnapshot: {
+            registeredVia: "write_time_self_registration",
+            unbound: true,
+          },
+        };
+      }
+    }
     if (
       !run ||
       run.companyId !== input.companyId ||
       run.agentId !== input.agentId
     ) {
-      throw crossIssueInfluenceRunContextError();
+      throw crossIssueInfluenceRunContextError("unrecognized");
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    // SON-1775: a recognized run with no source-issue binding (unbound wake,
+    // self-registered) has no same-issue exemption — every issue write it
+    // makes counts against the cap instead of being refused outright.
     if (
       sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      (input.targetIssueIdentifier && sourceIssueId && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
     ) {
       return null;
     }
@@ -144,6 +194,7 @@ export async function observeCrossIssueInfluence(
       details: {
         kind: input.kind,
         sourceIssueId,
+        runUnbound: !sourceIssueId,
         targetIssueId: input.targetIssueId,
         targetIssueIdentifier: input.targetIssueIdentifier ?? null,
         count: decision.count,
@@ -160,6 +211,7 @@ export async function observeCrossIssueInfluence(
       runId: input.runId,
       agentId: input.agentId,
       sourceIssueId,
+      runUnbound: !sourceIssueId,
       targetIssueId: input.targetIssueId,
       kind: input.kind,
       count: decision.count,
