@@ -1234,6 +1234,10 @@ jobs:
       - name: Open or update the release-failure tracking issue
         run: |
           set -euo pipefail
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq '.has_issues')" != "true" ]; then
+            echo "::warning::Release pipeline failed; GitHub Issues is disabled on $GITHUB_REPOSITORY, so no [release-alert] tracking issue can be opened or commented. Enable repo Issues or wire another durable alert channel."
+            exit 0
+          fi
           title="[release-alert] Release pipeline failed"
           failed_jobs="$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json jobs --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")')"
           body_file="$(mktemp)"
