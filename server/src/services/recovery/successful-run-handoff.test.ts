@@ -14,6 +14,7 @@ import {
   isPluginManagedIssueLifecycle,
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
+  successfulRunHandoffSatisfiedByState,
 } from "./successful-run-handoff.js";
 import { UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON } from "@paperclipai/adapter-utils/server-utils";
 
@@ -609,5 +610,107 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## Successful run missing issue disposition\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## This issue still needs a next step\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("Unrelated comment")).toBe(false);
+  });
+});
+
+function freshStateSignals(overrides: Partial<Parameters<typeof successfulRunHandoffSatisfiedByState>[0]> = {}) {
+  return {
+    status: "in_progress",
+    executionState: null,
+    monitorNextCheckAt: null,
+    hasActiveExecutionPath: false,
+    hasQueuedWake: false,
+    hasPendingInteractionOrApproval: false,
+    hasExplicitBlockerPath: false,
+    hasOpenRecoveryIssue: false,
+    hasPauseHold: false,
+    hasActiveRoutineContinuation: false,
+    ...overrides,
+  };
+}
+
+describe("successfulRunHandoffSatisfiedByState", () => {
+  it("does not satisfy a bare in_progress issue with no live signals (escalation proceeds)", () => {
+    expect(successfulRunHandoffSatisfiedByState(freshStateSignals())).toEqual({ satisfied: false });
+  });
+
+  it("satisfies on any non-in_progress status", () => {
+    expect(successfulRunHandoffSatisfiedByState(freshStateSignals({ status: "done" }))).toEqual({
+      satisfied: true,
+      reason: "issue status done is a valid disposition",
+    });
+    expect(successfulRunHandoffSatisfiedByState(freshStateSignals({ status: "in_review" })).satisfied).toBe(true);
+    expect(successfulRunHandoffSatisfiedByState(freshStateSignals({ status: "blocked" })).satisfied).toBe(true);
+    expect(successfulRunHandoffSatisfiedByState(freshStateSignals({ status: "cancelled" })).satisfied).toBe(true);
+  });
+
+  it("satisfies on execution policy state (in-run continuation anchor)", () => {
+    const verdict = successfulRunHandoffSatisfiedByState(
+      freshStateSignals({ executionState: { currentParticipant: "agent-1" } }),
+    );
+    expect(verdict).toEqual({ satisfied: true, reason: "issue has execution policy state" });
+  });
+
+  it("satisfies on an active execution path run", () => {
+    const verdict = successfulRunHandoffSatisfiedByState(freshStateSignals({ hasActiveExecutionPath: true }));
+    expect(verdict).toEqual({ satisfied: true, reason: "issue already has an active execution path" });
+  });
+
+  it("satisfies on a queued or deferred wake", () => {
+    const verdict = successfulRunHandoffSatisfiedByState(freshStateSignals({ hasQueuedWake: true }));
+    expect(verdict).toEqual({ satisfied: true, reason: "issue already has a queued or deferred wake" });
+  });
+
+  it("satisfies on a pending interaction or approval", () => {
+    const verdict = successfulRunHandoffSatisfiedByState(
+      freshStateSignals({ hasPendingInteractionOrApproval: true }),
+    );
+    expect(verdict).toEqual({ satisfied: true, reason: "pending interaction or approval owns the next action" });
+  });
+
+  it("satisfies on a persisted monitor", () => {
+    const verdict = successfulRunHandoffSatisfiedByState(
+      freshStateSignals({ monitorNextCheckAt: new Date("2026-09-17T00:00:00.000Z") }),
+    );
+    expect(verdict).toEqual({ satisfied: true, reason: "persisted issue monitor owns the next action" });
+  });
+
+  it("satisfies on an explicit blocker path", () => {
+    const verdict = successfulRunHandoffSatisfiedByState(freshStateSignals({ hasExplicitBlockerPath: true }));
+    expect(verdict).toEqual({ satisfied: true, reason: "explicit blocker path owns the next action" });
+  });
+
+  it("satisfies on an open recovery issue", () => {
+    const verdict = successfulRunHandoffSatisfiedByState(freshStateSignals({ hasOpenRecoveryIssue: true }));
+    expect(verdict).toEqual({ satisfied: true, reason: "open recovery issue owns the ambiguity" });
+  });
+
+  it("satisfies on an active pause hold", () => {
+    const verdict = successfulRunHandoffSatisfiedByState(freshStateSignals({ hasPauseHold: true }));
+    expect(verdict).toEqual({ satisfied: true, reason: "issue is under an active pause hold" });
+  });
+
+  it("satisfies on an active routine continuation", () => {
+    const verdict = successfulRunHandoffSatisfiedByState(
+      freshStateSignals({ hasActiveRoutineContinuation: true }),
+    );
+    expect(verdict).toEqual({ satisfied: true, reason: "active routine continuation owns the next action" });
+  });
+
+  it("keeps every satisfaction reason inside the shared valid-path skip-reason set", () => {
+    const reasons = [
+      "issue has execution policy state",
+      "issue already has an active execution path",
+      "issue already has a queued or deferred wake",
+      "pending interaction or approval owns the next action",
+      "persisted issue monitor owns the next action",
+      "explicit blocker path owns the next action",
+      "open recovery issue owns the ambiguity",
+      "issue is under an active pause hold",
+      "active routine continuation owns the next action",
+    ];
+    for (const reason of reasons) {
+      expect(isSuccessfulRunHandoffValidPathSkip({ kind: "skip", reason })).toBe(true);
+    }
   });
 });

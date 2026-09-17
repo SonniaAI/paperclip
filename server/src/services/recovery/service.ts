@@ -129,6 +129,10 @@ import {
 import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  detectSuccessfulRunHandoffValidPath,
+  resolveRequiredSuccessfulRunHandoffOnValidPath,
+} from "../successful-run-handoff-state.js";
+import {
   collectDispositionRepairSourceState,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
@@ -4172,6 +4176,7 @@ export function recoveryService(
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
       successfulRunHandoffEscalated: 0,
+      successfulRunHandoffStateResolved: 0,
       reviewParticipantRequeued: 0,
       escalated: 0,
       waitingOnReviewResolved: 0,
@@ -4983,6 +4988,38 @@ export function recoveryService(
           continue;
         }
         if (!handoffEvidence.exhausted) {
+          result.skipped += 1;
+          continue;
+        }
+
+        // SON-2251: the corrective handoff run may have recorded a valid
+        // disposition AFTER this sweep's snapshot was taken (the handoff
+        // instruction itself treats an in_progress continuation anchor as a
+        // valid disposition). The enqueue-side judge consults live issue
+        // state before firing; escalate only after re-verifying the same
+        // signals against a fresh read, so recovery cannot re-fire over a
+        // GET-verified disposition (blocked + exhausted notice + stranded
+        // recovery action over landed work).
+        const freshHandoffState = await detectSuccessfulRunHandoffValidPath(db, {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          agentId: latestRun?.agentId ?? issue.assigneeAgentId,
+          excludeRunId: latestRun?.id ?? null,
+          hasPauseHold: await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id),
+        });
+        if (freshHandoffState.issue && freshHandoffState.satisfied) {
+          const resolveAgentId = latestRun?.agentId ?? issue.assigneeAgentId ?? null;
+          if (resolveAgentId && latestRun?.id) {
+            await resolveRequiredSuccessfulRunHandoffOnValidPath(db, {
+              companyId: issue.companyId,
+              issueId: issue.id,
+              issueIdentifier: freshHandoffState.issue.identifier,
+              agentId: resolveAgentId,
+              runId: latestRun.id,
+              skipReason: freshHandoffState.reason ?? "live issue state owns the next action",
+            });
+          }
+          result.successfulRunHandoffStateResolved += 1;
           result.skipped += 1;
           continue;
         }

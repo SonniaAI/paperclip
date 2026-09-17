@@ -147,6 +147,63 @@ export function isSuccessfulRunHandoffValidPathSkip(
   return decision.kind === "skip" && SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS.has(decision.reason);
 }
 
+export type SuccessfulRunHandoffFreshStateSignals = {
+  status: string;
+  executionState: unknown;
+  monitorNextCheckAt: Date | string | null;
+  hasActiveExecutionPath: boolean;
+  hasQueuedWake: boolean;
+  hasPendingInteractionOrApproval: boolean;
+  hasExplicitBlockerPath: boolean;
+  hasOpenRecoveryIssue: boolean;
+  hasPauseHold: boolean;
+  hasActiveRoutineContinuation: boolean;
+};
+
+// SON-2251: mirror of the state-based skips in decideSuccessfulRunHandoff,
+// shared with the recovery sweep so an exhausted successful-run handoff can
+// be re-verified against a FRESH read of the issue's live state before the
+// escalation fires. Without this, the sweep escalates from the corrective
+// run's attempt counters alone and re-fires the judge over dispositions that
+// verifiably landed (comment + status/continuation write confirmed by the
+// run's own end-of-run GET). Reason strings intentionally match
+// SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS.
+export function successfulRunHandoffSatisfiedByState(
+  input: SuccessfulRunHandoffFreshStateSignals,
+): { satisfied: true; reason: string } | { satisfied: false } {
+  if (input.status !== "in_progress") {
+    return { satisfied: true, reason: "issue status " + input.status + " is a valid disposition" };
+  }
+  if (input.executionState) {
+    return { satisfied: true, reason: "issue has execution policy state" };
+  }
+  if (input.hasActiveExecutionPath) {
+    return { satisfied: true, reason: "issue already has an active execution path" };
+  }
+  if (input.hasQueuedWake) {
+    return { satisfied: true, reason: "issue already has a queued or deferred wake" };
+  }
+  if (input.hasPendingInteractionOrApproval) {
+    return { satisfied: true, reason: "pending interaction or approval owns the next action" };
+  }
+  if (input.monitorNextCheckAt !== null && input.monitorNextCheckAt !== undefined) {
+    return { satisfied: true, reason: "persisted issue monitor owns the next action" };
+  }
+  if (input.hasExplicitBlockerPath) {
+    return { satisfied: true, reason: "explicit blocker path owns the next action" };
+  }
+  if (input.hasOpenRecoveryIssue) {
+    return { satisfied: true, reason: "open recovery issue owns the ambiguity" };
+  }
+  if (input.hasPauseHold) {
+    return { satisfied: true, reason: "issue is under an active pause hold" };
+  }
+  if (input.hasActiveRoutineContinuation) {
+    return { satisfied: true, reason: "active routine continuation owns the next action" };
+  }
+  return { satisfied: false };
+}
+
 export function isSuccessfulRunHandoffRequiredNoticeBody(body: string) {
   const trimmed = body.trim();
   return trimmed === SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY ||
