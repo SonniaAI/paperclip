@@ -225,6 +225,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  hydrateStoredIssueExecutionPolicy,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -854,7 +855,7 @@ function hasScheduledMonitor(input: {
 }) {
   if (input.patchMonitorNextCheckAt instanceof Date && !Number.isNaN(input.patchMonitorNextCheckAt.getTime())) return true;
   if (input.patchMonitorNextCheckAt === undefined && input.existingMonitorNextCheckAt) return true;
-  const policy = normalizeIssueExecutionPolicy(input.executionPolicy ?? null);
+  const policy = hydrateStoredIssueExecutionPolicy(input.executionPolicy ?? null);
   return Boolean(policy?.monitor?.nextCheckAt);
 }
 
@@ -3404,7 +3405,7 @@ export function issueRoutes(
       }
     }
 
-    const monitor = summarizeIssueMonitor(issue, normalizeIssueExecutionPolicy(issue.executionPolicy ?? null));
+    const monitor = summarizeIssueMonitor(issue, hydrateStoredIssueExecutionPolicy(issue.executionPolicy ?? null));
     if (monitor.nextCheckAt && Date.parse(monitor.nextCheckAt) > Date.now()) {
       return "Recovery action became stale because the source issue now has a scheduled monitor.";
     }
@@ -7466,7 +7467,7 @@ export function issueRoutes(
             actorAgentId: actor.agentId,
             actorRunId: actor.runId,
           });
-          const executionPolicy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
+          const executionPolicy = hydrateStoredIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
           const transition = applyIssueExecutionPolicyTransition({
             issue: lockedIssue,
             policy: executionPolicy,
@@ -9586,7 +9587,7 @@ export function issueRoutes(
     const normalizedChildren = [];
     for (const child of requestedChildren) {
       const executionPolicy = applyActorMonitorScheduledBy(
-        normalizeIssueExecutionPolicy(child.executionPolicy),
+        hydrateStoredIssueExecutionPolicy(child.executionPolicy),
         actor.actorType,
       );
       await assertCanManageIssueMonitor(access, req, sourceIssue.companyId, child.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
@@ -9694,7 +9695,7 @@ export function issueRoutes(
         },
       });
 
-      const executionPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy);
+      const executionPolicy = hydrateStoredIssueExecutionPolicy(issue.executionPolicy);
       if (executionPolicy?.monitor) {
         await logActivity(db, {
           companyId: sourceIssue.companyId,
@@ -10195,7 +10196,7 @@ export function issueRoutes(
         actor.actorType,
       );
     }
-    const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+    const previousExecutionPolicy = hydrateStoredIssueExecutionPolicy(existing.executionPolicy ?? null);
     const nextExecutionPolicy =
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
@@ -10879,7 +10880,7 @@ export function issueRoutes(
       });
     }
 
-    const nextStoredExecutionPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+    const nextStoredExecutionPolicy = hydrateStoredIssueExecutionPolicy(issue.executionPolicy ?? null);
     const previousMonitor = summarizeIssueMonitor(existing, previousExecutionPolicy);
     const nextMonitor = summarizeIssueMonitor(issue, nextStoredExecutionPolicy);
     const monitorScheduledChanged = previousMonitor.nextCheckAt !== nextMonitor.nextCheckAt;
@@ -13464,7 +13465,7 @@ export function issueRoutes(
     }
 
     const currentExecutionState = parseIssueExecutionState(currentIssue.executionState);
-    const currentExecutionPolicy = normalizeIssueExecutionPolicy(currentIssue.executionPolicy ?? null);
+    const currentExecutionPolicy = hydrateStoredIssueExecutionPolicy(currentIssue.executionPolicy ?? null);
     const shouldAutoApproveReviewComment =
       currentIssue.status === "in_review" &&
       currentExecutionState?.status === "pending" &&
