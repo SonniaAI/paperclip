@@ -109,19 +109,26 @@ test.describe("Docker authenticated onboarding smoke", () => {
     await expect(nextButton).toBeEnabled({ timeout: 10_000 });
     await nextButton.click();
 
-    // Step 4: keep the default adapter and connect (hire) the lead. Connect
-    // probes the adapter environment first and blocks the hire on a `fail`. In
-    // the smoke container no agent CLI is installed, which the probe reports as
-    // a warning rather than an error, so the hire proceeds — a genuine failure
-    // here means the published artifact cannot hire on a clean machine. Allow
-    // generous time for the probe + hire + auto-approval.
-    const connectButton = page.getByRole("button", {
-      name: "Connect",
-      exact: true,
-    });
-    await expect(connectButton).toBeVisible({ timeout: 10_000 });
-    await expect(connectButton).toBeEnabled({ timeout: 30_000 });
-    await connectButton.click();
+    // Step 4: connect a model, then hire the lead. The arc's forward CTA is
+    // labelled "Next" and arrives disabled — the wizard refuses to advance the
+    // model step until a source tile is actually picked (`connectStepReady`),
+    // so the hire cannot fire against whatever a stale draft carried. Pick the
+    // default Claude Code subscription tile; the adapter probe it triggers
+    // reports the smoke container's missing agent CLI as a warning rather than
+    // a `fail`, so the hire still proceeds — a genuine failure here means the
+    // published artifact cannot hire on a clean machine. Allow generous time
+    // for the probe + hire + auto-approval.
+    const claudeTile = page
+      .getByRole("radiogroup", { name: "Model source" })
+      .getByRole("radio", { name: "Claude Code Subscription" });
+    await expect(claudeTile).toBeVisible({ timeout: 20_000 });
+    await claudeTile.click();
+
+    // "Connecting..." is the step's loading label, so exact-match "Next" only
+    // while the hire is not already running.
+    const hireButton = page.getByRole("button", { name: "Next", exact: true });
+    await expect(hireButton).toBeEnabled({ timeout: 60_000 });
+    await hireButton.click();
 
     // Step 5: review, then launch. "Get started" provisions the onboarding
     // project and first task and, only on success, drops the user into the
