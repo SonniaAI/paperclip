@@ -3013,6 +3013,55 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(listed[0]?.status).toBe("cancelled");
   });
 
+  it("clamps oversized legacy ask_user_questions payloads on read instead of failing the list (SON-3712)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Legacy oversized ask_user_questions payload");
+
+    // Simulate a row persisted before the current payload caps were enforced
+    // (older builds capped question prompts at 500 chars and option labels at
+    // 120). A hard parse throws and 400s the whole listForIssue call, bricking
+    // the interaction inbox + audit flows on the affected card (SON-3712).
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: { kind: "none" },
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "q1",
+            prompt: "P".repeat(4200),
+            selectionMode: "single",
+            options: [
+              { id: "opt-a", label: "A".repeat(1200) },
+              { id: "opt-b", label: "Valid label" },
+            ],
+          },
+        ],
+      },
+      createdByUserId: "local-board",
+    });
+
+    const listed = await interactionsSvc.listForIssue(issueId);
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.kind).toBe("ask_user_questions");
+    const payload = listed[0]?.payload as {
+      questions: Array<{
+        prompt: string;
+        options: Array<{ id: string; label: string }>;
+      }>;
+    };
+    const question = payload.questions[0];
+    expect(question.prompt.length).toBeLessThanOrEqual(4000);
+    expect(question.prompt.endsWith("...")).toBe(true);
+    expect(question.options[0]?.label.length).toBeLessThanOrEqual(1000);
+    expect(question.options[0]?.label.endsWith("...")).toBe(true);
+    // Well-formed siblings pass through untouched.
+    expect(question.options[1]?.label).toBe("Valid label");
+  });
+
   it("derives legacy pending interactions as expired on closed issues without mutating the GET", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Legacy pending interaction on closed issue");
     const created = await interactionsSvc.create({ id: issueId, companyId }, {
