@@ -1,6 +1,7 @@
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
+import { assertChurnCancelGuardAllowed } from "../services/issue-cancel-guard.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { extractIssueReferenceIdentifiers, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
@@ -12869,6 +12870,30 @@ export function issueRoutes(
       }
       const shouldCancelActiveRunForCancelledStatus =
         existing.status !== "cancelled" && updateFields.status === "cancelled";
+      if (
+        shouldCancelActiveRunForCancelledStatus &&
+        !isClosedIssueStatus(existing.status)
+      ) {
+        // SON-4111 kernel churn guard: a bare status->cancelled update on an
+        // active card must carry a driver comment and must not fire while the
+        // card has pending interactions or non-terminal children.
+        const churnGuard = await assertChurnCancelGuardAllowed(db, {
+          issue: {
+            id: existing.id,
+            companyId: existing.companyId,
+            status: existing.status,
+          },
+          driverComment: typeof commentBody === "string" ? commentBody : null,
+        });
+        if (!churnGuard.ok) {
+          res.status(409).json({
+            error: churnGuard.error,
+            code: churnGuard.code,
+            details: churnGuard.details,
+          });
+          return;
+        }
+      }
       if (resumeRequested === true && !commentBody) {
         res.status(400).json({ error: "Follow-up intent requires a comment" });
         return;
