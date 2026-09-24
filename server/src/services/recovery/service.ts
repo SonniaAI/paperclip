@@ -3275,7 +3275,15 @@ export function recoveryService(db: Db, deps: RecoveryServiceDeps) {
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
-    const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: "blocked",
+      externalBlocker: {
+        owner: "system:recovery",
+        note: "system auto-block (stranded_recovery_escalation): no live execution path after recovery attempt"
+          + (input.latestRun?.id ? " — run " + input.latestRun.id : "")
+          + ". Unblock by restoring a live execution path or recording manual resolution. (SON-3754 machine reason)",
+      },
+    });
     if (!updated) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
@@ -3491,6 +3499,14 @@ export function recoveryService(db: Db, deps: RecoveryServiceDeps) {
       // snapshotted on its run). A recovery manager may own a separate
       // recovery action, but must not become the routine's assignee.
       assigneeAgentId: routineOwnerAgentId ?? recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+      ...(blockerIds.length === 0
+        ? {
+          externalBlocker: {
+            owner: "system:recovery",
+            note: "system auto-block (routine_execution_escalation): no unresolved blocker edges at park time. (SON-3754 machine reason)",
+          },
+        }
+        : {}),
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
