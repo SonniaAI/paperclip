@@ -703,8 +703,38 @@ function clampOversizedPayloadStrings(
  *      schema max (cut marked with a trailing "...") and re-parse;
  *   3. last resort, list the interaction with its stored payload as-is
  *      rather than throwing. The create path still validates strictly, so
- *      only legacy rows can reach this branch.
+ *      only legacy rows can reach this branch. A passthrough payload still
+ *      guarantees the array fields consumers index unconditionally
+ *      (`questions`, `tasks`), so a degraded row acts like an empty list
+ *      instead of TypeError-ing on action.
  */
+/**
+ * Payload array fields that downstream code indexes unconditionally. The
+ * tier-3 read-degrade passthrough serves stored payloads that still fail
+ * strict validation, so it must still guarantee these fields are arrays:
+ * the ask_user_questions answer handler maps `questions`, and suggest-task
+ * acceptance maps `tasks`. A legacy row that lacks them would otherwise turn
+ * a read-degraded interaction into a TypeError on action instead of a clean
+ * validation error (SON-3977 review finding).
+ */
+const structuralArrayFieldsByKind: Record<string, readonly string[]> = {
+  ask_user_questions: ["questions"],
+  suggest_tasks: ["tasks"],
+};
+
+function repairStructuralPayloadArrays(
+  kind: string,
+  value: unknown,
+): unknown {
+  const fields = structuralArrayFieldsByKind[kind];
+  if (!fields || value == null || typeof value !== "object") return value;
+  const box = { ...(value as Record<PropertyKey, unknown>) };
+  for (const field of fields) {
+    if (!Array.isArray(box[field])) box[field] = [];
+  }
+  return box;
+}
+
 function parseStoredInteractionPayload<S extends z.ZodTypeAny>(
   schema: S,
   raw: unknown,
@@ -722,12 +752,22 @@ function parseStoredInteractionPayload<S extends z.ZodTypeAny>(
       );
       return clamped.data;
     }
+    // The clamp alone did not make the row valid (residual issues such as
+    // duplicate option ids remain). Serve the clamped copy rather than the
+    // original raw payload: the oversized strings are already trimmed, and
+    // the residual issues are display-level, not a reason to hand the inbox
+    // an untrimmed prompt (SON-3977 review finding).
+    console.warn(
+      `[paperclip] Clamped oversized legacy ${row.kind} interaction payload for interaction ${row.id} but residual validation issues remain; serving clamped payload`,
+      clamped.error.issues,
+    );
+    return repairStructuralPayloadArrays(row.kind, value) as z.infer<S>;
   }
   console.warn(
     `[paperclip] Passing through unparseable ${row.kind} interaction payload for interaction ${row.id}`,
     strict.error.issues,
   );
-  return raw as z.infer<S>;
+  return repairStructuralPayloadArrays(row.kind, raw) as z.infer<S>;
 }
 
 function hydrateInteraction(
