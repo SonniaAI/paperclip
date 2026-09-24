@@ -334,8 +334,16 @@ async function createApp(actor: Record<string, unknown>, db?: unknown) {
   ]);
   const app = express();
   app.use(express.json());
+  const reqLog: Record<string, unknown> = {
+    error: (...a: unknown[]) => console.error("[reqlog]", ...a),
+    warn: (...a: unknown[]) => console.warn("[reqlog]", ...a),
+    info: () => {},
+    debug: () => {},
+    child: () => reqLog,
+  };
   app.use((req, _res, next) => {
     (req as any).actor = actor;
+    (req as any).log = reqLog;
     next();
   });
   app.use("/api", issueRoutes(routeDb as any, mockStorageService as any));
@@ -390,6 +398,10 @@ function boardActor() {
  */
 import { issueApprovals, issueThreadInteractions, issues as issueRows } from "@paperclipai/db";
 
+// Fresh @paperclipai/db instances (post-vi.resetModules) used by the route
+// module; assigned in the gate describe's beforeEach, read by rowsFor below.
+let freshTables: { issueApprovals: unknown; issueThreadInteractions: unknown; issues: unknown } | null = null;
+
 function createGateDb(opts: { blockerRows?: Array<Record<string, unknown>> } = {}) {
   const runRows = [{
     id: ownerRunId,
@@ -399,6 +411,11 @@ function createGateDb(opts: { blockerRows?: Array<Record<string, unknown>> } = {
     contextSnapshot: {},
   }];
   const rowsFor = (selection: Record<string, unknown>, table: unknown) => {
+    if (table === freshTables?.issueThreadInteractions) return [];
+    if (table === freshTables?.issueApprovals) return [];
+    if (table === freshTables?.issues && Object.keys(selection).length === 1 && "id" in selection) {
+      return opts.blockerRows ?? [];
+    }
     if (table === issueThreadInteractions) return [];
     if (table === issueApprovals) return [];
     if (table === issueRows) return opts.blockerRows ?? [];
@@ -429,8 +446,11 @@ function createGateDb(opts: { blockerRows?: Array<Record<string, unknown>> } = {
 }
 
 describe("PATCH /api/issues/:id blocked-entry justification gate (SON-3754)", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
+    // Route modules re-import @paperclipai/db after resetModules, so gate-db
+    // table matching must use the fresh registry instance, not stale imports.
+    freshTables = (await import("@paperclipai/db")) as { issueApprovals: unknown; issueThreadInteractions: unknown; issues: unknown };
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
     vi.doUnmock("../services/access.js");
@@ -462,12 +482,13 @@ describe("PATCH /api/issues/:id blocked-entry justification gate (SON-3754)", ()
       explanation: "Allowed by test boundary default.",
     }));
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
-    mockIssueService.getDependencyReadiness.mockResolvedValue({ unresolvedBlockerCount: 0 });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({ unresolvedBlockerCount: 0, blockerIssueIds: [], isDependencyReady: true });
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocking: [] });
     mockIssueService.update.mockImplementation(async (_id: string, data: Record<string, unknown>) => ({
       ...makeIssue({ status: "blocked" }),
       ...(data.externalBlocker ? { externalBlocker: data.externalBlocker } : {}),
     }));
+    mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
   });
 
   it("still rejects a reason-less blocked transition with the shared-validator 400", async () => {
@@ -500,7 +521,6 @@ describe("PATCH /api/issues/:id blocked-entry justification gate (SON-3754)", ()
         status: "blocked",
         externalBlocker: expect.objectContaining({ owner: "ops" }),
       }),
-      expect.anything(),
     );
   });
 
