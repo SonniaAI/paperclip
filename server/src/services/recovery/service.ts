@@ -3282,6 +3282,7 @@ export function recoveryService(db: Db, deps: RecoveryServiceDeps) {
         note: "system auto-block (stranded_recovery_escalation): no live execution path after recovery attempt"
           + (input.latestRun?.id ? " — run " + input.latestRun.id : "")
           + ". Unblock by restoring a live execution path or recording manual resolution. (SON-3754 machine reason)",
+        since: new Date().toISOString(),
       },
     });
     if (!updated) return null;
@@ -3504,6 +3505,7 @@ export function recoveryService(db: Db, deps: RecoveryServiceDeps) {
           externalBlocker: {
             owner: "system:recovery",
             note: "system auto-block (routine_execution_escalation): no unresolved blocker edges at park time. (SON-3754 machine reason)",
+            since: new Date().toISOString(),
           },
         }
         : {}),
