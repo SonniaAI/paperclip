@@ -3119,8 +3119,9 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     // the tier-3 passthrough. The answer handler maps payload.questions, so
     // the passthrough must guarantee the array shape instead of handing a
     // missing field to the action path.
+    const interactionId = randomUUID();
     await db.insert(issueThreadInteractions).values({
-      id: randomUUID(),
+      id: interactionId,
       companyId,
       issueId,
       kind: "ask_user_questions",
@@ -3135,6 +3136,21 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const payload = listed[0]?.payload as { questions: unknown };
     expect(Array.isArray(payload.questions)).toBe(true);
     expect(payload.questions).toHaveLength(0);
+
+    // Empty answers must not resolve an interaction whose repaired question
+    // set is empty; keep it pending for explicit cleanup or replacement.
+    await expect(interactionsSvc.answerQuestions({
+      id: issueId,
+      companyId,
+    }, interactionId, { answers: [] }, { userId: "local-board" })).rejects.toThrow(
+      "Cannot answer an ask_user_questions interaction without valid questions",
+    );
+    const stored = await db
+      .select({ status: issueThreadInteractions.status })
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId))
+      .then((rows) => rows[0]);
+    expect(stored?.status).toBe("pending");
   });
 
   it("guarantees the tasks array on passthrough suggest_tasks payloads (SON-3977)", async () => {

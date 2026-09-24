@@ -4934,6 +4934,11 @@ export function issueThreadInteractionService(
       const interaction = hydrateInteraction(
         current,
       ) as AskUserQuestionsInteraction;
+      if (interaction.payload.questions.length === 0) {
+        throw unprocessable(
+          "Cannot answer an ask_user_questions interaction without valid questions",
+        );
+      }
       const normalizedAnswers = normalizeQuestionAnswers({
         questions: interaction.payload.questions,
         answers: input.answers,
