@@ -10298,8 +10298,13 @@ export function issueRoutes(
           eq(approvals.status, "pending"),
         )).limit(1).then((rows) => rows[0] ?? null),
       ]);
-      if (!hasUnresolvedBlocker && !pendingInteraction && !pendingApproval && !descriptor) {
-        res.status(422).json({ error: "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor" });
+      const requestedExternalBlocker = updateFields.externalBlocker;
+      const hasNamedExternalBlocker = Boolean(requestedExternalBlocker
+        && typeof requestedExternalBlocker === "object"
+        && typeof (requestedExternalBlocker as { owner?: unknown }).owner === "string"
+        && ((requestedExternalBlocker as { owner?: unknown }).owner as string).trim().length > 0);
+      if (!hasUnresolvedBlocker && !pendingInteraction && !pendingApproval && !descriptor && !hasNamedExternalBlocker) {
+        res.status(422).json({ error: "Entering blocked requires a named reason: pass blockedByIssueIds (a live blocker issue), externalBlocker {owner, note} for an outside dependency, unblockDescriptor {owner, action}, or have a pending interaction/approval on the issue. Reason-less blocked parking is rejected (SON-3754)." });
         return;
       }
     }
