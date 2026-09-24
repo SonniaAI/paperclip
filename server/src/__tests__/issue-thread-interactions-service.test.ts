@@ -3714,6 +3714,10 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
                 invocationSource: "manual",
                 status: sourceRunStatus,
                 startedAt: new Date("2026-05-23T21:55:00.000Z"),
+                // A running source run is only live while it produces output;
+                // quiet-TTL staleness expires rows that went silent, so pin
+                // liveness with fresh output.
+                lastOutputAt: sourceRunTerminal ? null : new Date(),
                 finishedAt: sourceRunTerminal ? new Date("2026-05-23T22:05:00.000Z") : null,
               },
             ]

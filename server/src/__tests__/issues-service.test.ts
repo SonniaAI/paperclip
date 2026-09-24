@@ -5782,6 +5782,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
         status: "running",
         invocationSource: "manual",
         startedAt: new Date("2026-06-10T10:06:00.000Z"),
+        lastOutputAt: new Date(), // fresh output keeps this run live under quiet-TTL staleness
       },
     ]);
     await db.insert(issues).values({
