@@ -10,6 +10,11 @@ export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.00
 
 const CROSS_ISSUE_INFLUENCE_ACTIVITY = "issue.cross_issue_influence_observed";
 const CROSS_ISSUE_INFLUENCE_REJECTED_ACTIVITY = "issue.cross_issue_influence_cap_rejected";
+// SON-4287: decision-controller batch wakes dispatch many interaction rulings
+// under one run registered with payload issue:null. That run row carries no
+// issue anchor, so before the batch allowance below every gated write from
+// such a run failed closed as "unbound" and no ruling could ever land.
+export const DECISION_CONTROLLER_BATCH_WAKE_REASON = "decision_controller_batch";
 // A queued heartbeat run is committed before its adapter is dispatched, but a
 // cloud/gateway wake can race the commit at the API boundary. Give that
 // registration transaction a short, bounded window to become visible without
@@ -62,6 +67,12 @@ function readRunSourceIssueId(contextSnapshot: unknown) {
     if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
   }
   return null;
+}
+
+function readRunWakeReason(contextSnapshot: unknown) {
+  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
+  const wakeReason = (contextSnapshot as Record<string, unknown>).wakeReason;
+  return typeof wakeReason === "string" && wakeReason.trim() ? wakeReason.trim() : null;
 }
 
 export function evaluateCrossIssueInfluenceLimit(input: {
@@ -173,7 +184,21 @@ export async function observeCrossIssueInfluence(
       .then((rows) => rows.length > 0);
     if (anchored) return null;
 
-    if (!sourceIssueId) {
+    // Header-variant contract at this gate (SON-4287, documented expected
+    // behavior): a call with no X-Paperclip-Run-Id fails upstream as
+    // "missing"; a header naming an unknown, finished, or foreign run fails
+    // as "unrecognized"; a recognized run with no issue anchor fails as
+    // "unbound" — EXCEPT a decision-controller batch run, whose wake is
+    // registered with payload issue:null by design. For those runs the batch
+    // itself is the attribution: the wake reason is server-stamped into the
+    // row's context snapshot at registration, the allowance only lifts the
+    // single-issue-anchor requirement, and every write still counts against
+    // the same per-run cap below. The checkout-anchored exemption above is
+    // unchanged and keeps applying first.
+    if (
+      !sourceIssueId &&
+      readRunWakeReason(run.contextSnapshot) !== DECISION_CONTROLLER_BATCH_WAKE_REASON
+    ) {
       throw crossIssueInfluenceRunContextError("unbound");
     }
 

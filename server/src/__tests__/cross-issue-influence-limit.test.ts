@@ -283,4 +283,70 @@ describe("cross-issue influence limit rollout", () => {
     expect(error.message).toContain("run is registered");
     expect(fake.inserted).toEqual([]);
   });
+
+  it("lets a decision_controller_batch run with no issue anchor land counted writes (SON-4287)", async () => {
+    const fake = counterDb(0, {
+      contextSnapshot: { wakeReason: "decision_controller_batch" },
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "interaction_resolution",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({ allowed: true, mode: "enforce", count: 1, cap: 20 });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({
+        action: "issue.cross_issue_influence_observed",
+        details: expect.objectContaining({
+          kind: "interaction_resolution",
+          sourceIssueId: null,
+          targetIssueId: "55555555-5555-4555-8555-555555555555",
+        }),
+      }),
+    ]);
+  });
+
+  it("holds the batch allowance to the same per-run cap", async () => {
+    const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT, {
+      contextSnapshot: { wakeReason: "decision_controller_batch" },
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "interaction_resolution",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({
+      allowed: false,
+      mode: "enforce",
+      count: CROSS_ISSUE_INFLUENCE_LIMIT + 1,
+    });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({ action: "issue.cross_issue_influence_cap_rejected" }),
+    ]);
+  });
+
+  it("still fails closed for unanchored runs outside the batch allowance (cron-email wake class)", async () => {
+    const fake = counterDb(0, { contextSnapshot: { wakeReason: "cron_email_digest" } });
+
+    const error = await observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    }).catch((caught) => caught);
+    expect(error).toMatchObject({
+      status: 403,
+      details: { code: "cross_issue_influence_run_context_required" },
+    });
+    expect(error.message).toContain("run is registered");
+    expect(fake.inserted).toEqual([]);
+  });
 });
