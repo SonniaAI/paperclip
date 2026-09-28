@@ -979,16 +979,6 @@ it.each([
                 (completedTerminalAck === "repeat" && epoch === 1));
             let attachment: ReturnType<typeof originalAttach> | undefined;
             let withheld: (typeof withheldTerminalFrames)[number] | undefined;
-            const pauseSync = (ms: number): void => {
-              try {
-                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-              } catch {
-                const spinDeadline = Date.now() + ms;
-                while (Date.now() < spinDeadline) {
-                  // Busy-spin fallback where Atomics.wait is disallowed.
-                }
-              }
-            };
             const shouldWithhold = (candidate: typeof direction): boolean => {
               if (
                 !inject ||
@@ -1000,64 +990,52 @@ it.each([
                 withheld.count += 1;
                 return true;
               }
-              // Under CI load the runner's durable terminal record and the
-              // control plane's persisted command status can reach disk a
-              // beat after the matching wire frame is handed over (run
-              // 36397447858 saw zero withheld frames: the first matching
-              // frame raced the handshake and was released). Re-check the
-              // handshake briefly instead: once released, the runner's ack
-              // succeeds and the withhold precondition never re-arises.
-              // Releasing unchanged remains the bounded fallback (~2s).
-              for (let attempt = 0; attempt < 80; attempt++) {
-                if (attempt > 0) pauseSync(25);
-                const runner = JSON.parse(
-                  readFileSync(join(copy, files[1]!), "utf8"),
-                );
-                const terminal = runner.pendingTerminalDelivery;
-                if (
-                  terminal?.commandType !== "runner.suspend" ||
-                  terminal.lifecycle !== "suspended"
-                )
-                  continue;
-                const result = runner.processedCommands[terminal.commandId];
-                if (
-                  result?.status !== "completed" ||
-                  result.result?.status !== "completed" ||
-                  result.commandType !== terminal.commandType ||
-                  result.controllerSeq !== terminal.controllerSeq
-                )
-                  continue;
-                const control = JSON.parse(readFileSync(this.store.path, "utf8"));
-                const command = control.commands.find(
-                  (entry: { commandId: string }) =>
-                    entry.commandId === terminal.commandId,
-                );
-                if (
-                  command?.type !== terminal.commandType ||
-                  command.controllerSeq !== terminal.controllerSeq ||
-                  command.status !==
-                    (direction === "inbound" ? "pending" : "completed")
-                )
-                  continue;
-                if (direction === "outbound")
-                  expect(command.result).toEqual(result);
-                else expect(command.result ?? null).toBeNull();
-                // Rust durably records this exact result before sending it.
-                // Withhold transport delivery only after that handshake, not
-                // after a guessed number of saves or an elapsed sleep. Pending
-                // mode loses the result; completed mode loses its outbound ACK.
-                // No retained journal/outbox bytes are removed or rewritten.
-                withheld = {
-                  epoch,
-                  direction,
-                  commandId: terminal.commandId,
-                  controllerSeq: terminal.controllerSeq,
-                  count: 1,
-                };
-                withheldTerminalFrames.push(withheld);
-                return true;
-              }
-              return false;
+              const runner = JSON.parse(
+                readFileSync(join(copy, files[1]!), "utf8"),
+              );
+              const terminal = runner.pendingTerminalDelivery;
+              if (
+                terminal?.commandType !== "runner.suspend" ||
+                terminal.lifecycle !== "suspended"
+              )
+                return false;
+              const result = runner.processedCommands[terminal.commandId];
+              if (
+                result?.status !== "completed" ||
+                result.result?.status !== "completed" ||
+                result.commandType !== terminal.commandType ||
+                result.controllerSeq !== terminal.controllerSeq
+              )
+                return false;
+              const control = JSON.parse(readFileSync(this.store.path, "utf8"));
+              const command = control.commands.find(
+                (entry: { commandId: string }) =>
+                  entry.commandId === terminal.commandId,
+              );
+              if (
+                command?.type !== terminal.commandType ||
+                command.controllerSeq !== terminal.controllerSeq ||
+                command.status !==
+                  (direction === "inbound" ? "pending" : "completed")
+              )
+                return false;
+              if (direction === "outbound")
+                expect(command.result).toEqual(result);
+              else expect(command.result ?? null).toBeNull();
+              // Rust durably records this exact result before sending it.
+              // Withhold transport delivery only after that handshake, not
+              // after a guessed number of saves or an elapsed sleep. Pending
+              // mode loses the result; completed mode loses its outbound ACK.
+              // No retained journal/outbox bytes are removed or rewritten.
+              withheld = {
+                epoch,
+                direction,
+                commandId: terminal.commandId,
+                controllerSeq: terminal.controllerSeq,
+                count: 1,
+              };
+              withheldTerminalFrames.push(withheld);
+              return true;
             };
             attachment = originalAttach.call(this, {
               sendJson(value) {
