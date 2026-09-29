@@ -1,3 +1,4 @@
+import { cancellableSandboxStartup } from "./startup-cancellation.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -63,15 +64,13 @@ import {
   isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
-  renderPaperclipWakePrompt,
   renderTemplate,
   resolvePaperclipInstanceRootForAdapter,
-  selectPaperclipTaskMarkdown,
+  selectPaperclipPromptSections,
   resolveLegacyPaperclipDesiredSkillNames,
   removeMaintainerOnlySkillSymlinks,
   rewriteWorkspaceCwdEnvVarsForExecution,
   shapePaperclipWorkspaceEnvForExecution,
-  stringifyPaperclipWakePayload,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
@@ -354,9 +353,25 @@ export interface AcpxRemoteManagedHomeResult {
   disposeStaged?: () => Promise<void>;
 }
 
+export interface AcpxTerminalSessionFailure {
+  category: string;
+  title?: string;
+  details?: string;
+}
+
+export type AcpxTerminalFailureClassification = Pick<
+  AdapterExecutionResult,
+  "errorCode" | "errorFamily" | "retryNotBefore"
+>;
+
 export interface AcpxEngineExecutorOptions {
   createRuntime?: AcpxRuntimeFactory;
   now?: () => number;
+  /** Inspect terminal provider text in memory; return only recovery labels and a timestamp. */
+  classifyTerminalSessionFailure?: (
+    failure: AcpxTerminalSessionFailure,
+    now: Date,
+  ) => AcpxTerminalFailureClassification | null;
   /**
    * The bound on how long the fail-fast seam waits for a cooperative
    * `turn.cancel()` after a latched terminal sandbox duplex-channel loss,
@@ -793,6 +808,10 @@ function resolveManagedCodexHomeDir(companyId: string): string {
   return path.join(defaultPaperclipInstanceDir(), "companies", companyId, "codex-home");
 }
 
+function resolveManagedCodexApiKeyHomeDir(companyId: string, agentId: string): string {
+  return path.join(defaultStateDir(companyId, agentId), "codex-home");
+}
+
 // Mirrors `resolveManagedGrokHomeDir` in
 // `packages/adapters/grok-local/src/server/grok-home.ts` — this package
 // cannot import that adapter package (it would invert the dependency
@@ -987,15 +1006,30 @@ async function prepareManagedCodexHome(input: {
   companyId: string;
   sourceHome: string;
   targetHome: string;
+  apiKey?: string;
   onLog: AdapterExecutionContext["onLog"];
 }): Promise<string> {
-  const { sourceHome, targetHome, onLog } = input;
+  const { sourceHome, targetHome, apiKey, onLog } = input;
   if (path.resolve(sourceHome) === path.resolve(targetHome)) return targetHome;
 
   await fs.mkdir(targetHome, { recursive: true });
 
-  const authJson = path.join(sourceHome, "auth.json");
-  if (await pathExists(authJson)) await ensureSymlink(path.join(targetHome, "auth.json"), authJson);
+  const targetAuth = path.join(targetHome, "auth.json");
+  if (apiKey) {
+    // Codex reads auth.json ahead of the process environment. Never leave a
+    // shared ChatGPT-login symlink in an API-key agent's managed home, and never
+    // write through that symlink into the operator's own Codex credentials.
+    // Atomic replacement also keeps concurrent turns from seeing a missing or
+    // partially written credential file.
+    await writeFileAtomically({
+      target: targetAuth,
+      contents: JSON.stringify({ OPENAI_API_KEY: apiKey }),
+      mode: 0o600,
+    });
+  } else {
+    const sourceAuth = path.join(sourceHome, "auth.json");
+    if (await pathExists(sourceAuth)) await ensureSymlink(targetAuth, sourceAuth);
+  }
 
   for (const name of ["config.json", "config.toml", "instructions.md"]) {
     const source = path.join(sourceHome, name);
@@ -1240,6 +1274,7 @@ async function reconcileManagedCodexSkills(input: {
 
 async function prepareCodexSkillRuntime(input: {
   companyId: string;
+  agentId: string;
   config: Record<string, unknown>;
   env: Record<string, string>;
   moduleDir: string;
@@ -1267,12 +1302,19 @@ async function prepareCodexSkillRuntime(input: {
     typeof process.env.CODEX_HOME === "string" && process.env.CODEX_HOME.trim().length > 0
       ? path.resolve(process.env.CODEX_HOME.trim())
       : path.join(os.homedir(), ".codex");
-  const managedCodexHome = resolveManagedCodexHomeDir(input.companyId);
+  const apiKey = input.env.OPENAI_API_KEY?.trim() || input.env.CODEX_API_KEY?.trim()
+    || process.env.OPENAI_API_KEY?.trim() || process.env.CODEX_API_KEY?.trim();
+  // Keep API-key auth separate from the company home used by subscription
+  // agents, so one agent cannot switch another agent's login on its next turn.
+  const managedCodexHome = apiKey
+    ? resolveManagedCodexApiKeyHomeDir(input.companyId, input.agentId)
+    : resolveManagedCodexHomeDir(input.companyId);
   const effectiveCodexHome = configuredCodexHome ??
     await prepareManagedCodexHome({
       companyId: input.companyId,
       sourceHome: sourceCodexHome,
       targetHome: managedCodexHome,
+      apiKey,
       onLog: input.onLog,
     });
   const { allSkills, selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(input.config, input.moduleDir);
@@ -1405,7 +1447,7 @@ function normalizeMode(config: Record<string, unknown>): "persistent" | "oneshot
 function normalizePermissionMode(config: Record<string, unknown>): "approve-all" | "approve-reads" | "deny-all" {
   const value = asString(config.permissionMode, DEFAULT_ACP_ENGINE_PERMISSION_MODE).trim();
   if (value === "approve-reads" || value === "deny-all") return value;
-  if (value === "default") return "approve-reads";
+  if (value === "default") return DEFAULT_ACP_ENGINE_PERMISSION_MODE;
   return "approve-all";
 }
 
@@ -1911,7 +1953,6 @@ async function buildRuntime(input: {
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
   if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
@@ -1920,7 +1961,6 @@ async function buildRuntime(input: {
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   applyPaperclipWorkspaceEnv(env, {
     workspaceCwd: shapedWorkspaceEnv.workspaceCwd,
     workspaceSource,
@@ -1967,17 +2007,6 @@ async function buildRuntime(input: {
     // them, but only hash actual adapter settings. User-supplied temp overrides
     // are absent from tempKeysApplied and keep their compatibility protection.
     if (!scratchKeys.has(key) || value !== scratch.dir) resolvedAdapterEnv[key] = value;
-  }
-  // codex-acp supports both key names, but ACP clients must select its
-  // api-key authentication method during session creation. Without this
-  // request, the server advertises authentication and rejects session/new even
-  // though the credential is present in the launched process environment.
-  if (
-    acpxAgent === "codex" &&
-    (env.OPENAI_API_KEY || env.CODEX_API_KEY) &&
-    !env.DEFAULT_AUTH_REQUEST
-  ) {
-    env.DEFAULT_AUTH_REQUEST = JSON.stringify({ methodId: "api-key" });
   }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
@@ -2044,6 +2073,7 @@ async function buildRuntime(input: {
     const preparedSkills = await measureStartupStep(input.ctx, nowMs, "codex-home.seed", () =>
       prepareCodexSkillRuntime({
         companyId: agent.companyId,
+        agentId: agent.id,
         config,
         env,
         moduleDir: input.engine.moduleDir,
@@ -2635,11 +2665,25 @@ function resolveRuntimeEnv(
     env,
     (options.platform ?? process.platform) === "win32",
   );
-  return Object.fromEntries(
+  const finalEnv = Object.fromEntries(
     Object.entries(mergedEnv).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
+  // codex-acp supports both key names, but ACP clients must select its
+  // api-key authentication method during session creation. Without this
+  // request, the server advertises authentication and rejects session/new even
+  // though the credential is present in the launched process environment. Check
+  // the final merged environment, not just the explicit run config, so a host
+  // key the local launch inherits still selects this default.
+  if (
+    acpxAgent === "codex" &&
+    (finalEnv.OPENAI_API_KEY || finalEnv.CODEX_API_KEY) &&
+    !finalEnv.DEFAULT_AUTH_REQUEST
+  ) {
+    finalEnv.DEFAULT_AUTH_REQUEST = JSON.stringify({ methodId: "api-key" });
+  }
+  return finalEnv;
 }
 
 function mergeRuntimeEnvironment(
@@ -2971,15 +3015,8 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
     !resumedSession && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
-  const taskContextNote = selectPaperclipTaskMarkdown(context, { resumedSession });
+  const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(context, { resumedSession });
   const externalChatTurn = isPaperclipExternalChatTurn(context.paperclipWake);
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
-    resumedSession,
-    conversationMode: context.conversationMode === true,
-    // The task-context markdown is the authoritative brief on this lane; keep
-    // the wake prompt's description copy out so the prompt carries it once.
-    suppressIssueDescription: taskContextNote.length > 0,
-  });
   const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
   const promptInstructionsPrefix = shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
   const renderedPrompt =
@@ -3583,12 +3620,13 @@ async function closeWarmHandle(input: {
     input.handles.delete(input.key);
   }
   clearWarmHandleTimer(input.entry);
-  await input.entry.runtime.close({
+  const stopped = await input.entry.runtime.close({
     handle: input.entry.handle,
     reason: input.reason,
     discardPersistentState: input.discardPersistentState ?? false,
-  }).catch(() => {});
+  }).then(() => true, () => false);
   flushChildStderr(input.entry.childStderrState);
+  return stopped;
 }
 
 function warmHandleMatches(
@@ -4055,6 +4093,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // `endSession` step can cancel a running turn before it closes the runtime
       // (the cancel-before-close order). The turn wrapper assigns it in `turnStart`.
       let activeTurn: AcpRuntimeTurn | null = null;
+      let terminalFailureClassification: AcpxTerminalFailureClassification | null = null;
       // How the settlement `endSession` step must release the runtime for the path
       // this run took. Each exit path that acquired the runtime records it before it
       // returns; a build or create-runtime failure never registers the runtime, so
@@ -4115,23 +4154,28 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // run inside this wrap and overrides the store, so an in-step exec still
         // parents to its step span. On a local or SSH target
         // `spanParent.parentContext` is a no-op token, so the wrap is inert.
-        prepared = await runWithRuntimeParent(spanParent.parentContext, () =>
-          buildRuntime({
-            ctx,
-            engine,
-            deps,
-            ledger: runResourceLedger,
-            stagedIdleMs: warmIdleMs,
-            spanParent,
-            getRuntimeParentContext,
-            runtimeSpan: runRuntimeSpan,
-            stageRuntimeSpan: runStageSpan,
-          }),
-        );
-        buildRuntimeSettled = true;
-        // Capture the run's staging lease release now that the runtime built. The
-        // run root `finally` releases it as the final settlement act.
-        releaseStagingLease = prepared.sessionStagingLeaseRelease;
+        const startupCancellation = cancellableSandboxStartup(ctx);
+        try {
+          prepared = await runWithRuntimeParent(spanParent.parentContext, () =>
+            buildRuntime({
+              ctx: startupCancellation.context,
+              engine,
+              deps,
+              ledger: runResourceLedger,
+              stagedIdleMs: warmIdleMs,
+              spanParent,
+              getRuntimeParentContext,
+              runtimeSpan: runRuntimeSpan,
+              stageRuntimeSpan: runStageSpan,
+            }),
+          );
+          buildRuntimeSettled = true;
+          // Capture acquired resources before the cancellation boundary so the
+          // normal settlement path also releases a just-completed build.
+          releaseStagingLease = prepared.sessionStagingLeaseRelease;
+        } finally {
+          await startupCancellation.finish();
+        }
         // Per-project staging outcomes for the referenced (mentioned) projects, surfaced back to the
         // server on the run result. A referenced project that failed to stage into the sandbox is a
         // first-class, counted failure in the requested-vs-synced observability, not only a warning. The
@@ -4730,6 +4774,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           requestId: ctx.runId,
           timeoutMs: startTimeoutMs,
           signal,
+          // The callback belongs to this turn, including when a runtime is reused.
+          // Raw provider text must never enter the result or the run log.
+          ...(deps.classifyTerminalSessionFailure
+            ? {
+                onTerminalSessionFailure: (failure: AcpxTerminalSessionFailure) => {
+                  terminalFailureClassification = deps.classifyTerminalSessionFailure!(failure, new Date(now()));
+                },
+              }
+            : {}),
         });
         activeTurn = turn;
         // A latched sandbox duplex-channel loss otherwise has no way to reach
@@ -4948,6 +5001,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? channelLostMessage
             : resultErrorMessage(terminal);
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
+        const classifiedFailure = !timedOut && !channelLost && terminal.status === "failed"
+          ? terminalFailureClassification
+          : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
           summary: channelLost ? "duplex_channel_lost" : terminal.status,
@@ -4968,8 +5024,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             : channelLost
               ? DUPLEX_CHANNEL_LOST_ERROR_CODE
               : terminal.status === "failed"
-                ? "acpx_turn_failed"
+                ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
                 : null,
+          ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
+          ...(classifiedFailure?.retryNotBefore ? { retryNotBefore: classifiedFailure.retryNotBefore } : {}),
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
           sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
           sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -4980,6 +5038,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           costUsd: turnUsage.costUsd,
           resultJson: {
             status: channelLost ? "failed" : terminal.status,
+            ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
+            ...(classifiedFailure?.retryNotBefore
+              ? {
+                  retryNotBefore: classifiedFailure.retryNotBefore,
+                  ...(classifiedFailure.errorFamily === "provider_quota"
+                    ? { providerQuotaRetryNotBefore: classifiedFailure.retryNotBefore }
+                    : {}),
+                }
+              : {}),
             stopReason: terminalStopReason,
             permissionMode: prepared.permissionMode,
             mode: prepared.mode,
@@ -5243,7 +5310,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ) {
             // A matching warm entry closes through the warm store, which also
             // clears its idle timer and flushes its child stderr.
-            await closeWarmHandle({
+            runtimeStopConfirmed = await closeWarmHandle({
               handles: warmHandles,
               key: prepared.sessionKey,
               entry: existing,
@@ -5289,12 +5356,23 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // runs, so the host mints a `traceparent` for the provider spans, and the
         // per-task restore spans parent to `sandbox.syncBack`.
         syncBack: () => timedPhase("sync_back", async () => {
-          await runRuntimeSpan("sandbox.syncBack", async () => {
-            const restoreOutcome = await syncBackManagedHome(prepared);
-            if (!restoreOutcome.ok) {
-              workspaceRestoreFailureField = { workspaceRestoreFailure: restoreOutcome.code };
-            }
-          });
+          // A transport error or terminal narrative cannot authorize collecting
+          // mutable provider files. Require the owned close or local OS handle.
+          const stopped = runtimeStopConfirmed || (!prepared.processSessionBridge && capturedProcessExited(processIdentitySink?.localProcess));
+          try {
+            if (stopped) await ctx.onProviderStopped?.();
+          } catch {
+            // Match ACP's fail-soft teardown policy without describing this as
+            // a workspace restore failure or exposing paths from a raw error.
+            await recordTeardownError("instruction-collection", new Error("Instruction collection failed after provider stop. No instruction save is claimed."));
+          } finally {
+            await runRuntimeSpan("sandbox.syncBack", async () => {
+              const restoreOutcome = await syncBackManagedHome(prepared);
+              if (!restoreOutcome.ok) {
+                workspaceRestoreFailureField = { workspaceRestoreFailure: restoreOutcome.code };
+              }
+            });
+          }
         }),
         // The staging lease releases as the run's final act, AFTER the coordinator
         // reproduces the result, in the run root `finally` below. This step stays a

@@ -19,6 +19,8 @@ const apiPrefixes: Record<string, string> = {
   "activity.ts": "/api",
   "adapters.ts": "/api",
   "agents.ts": "/api",
+  "agent-avatars.ts": "/api",
+  "announcements.ts": "/api",
   "ai-connections.ts": "/api",
   "attention.ts": "/api",
   "approvals.ts": "/api",
@@ -27,6 +29,7 @@ const apiPrefixes: Record<string, string> = {
   "board-chat.ts": "/api",
   "built-in-agents.ts": "/api",
   "chat-channels.ts": "/api",
+  "slack-tools.ts": "/api",
   "email.ts": "/api",
   "cloud.ts": "/api/cloud",
   "companies.ts": "/api/companies",
@@ -223,6 +226,26 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents personal board-only announcements and private responses", () => {
+    const { spec } = loadSpecRoutes();
+    const current = spec.paths["/api/announcements/current"].get;
+    const image = spec.paths["/api/announcements/{id}/image"].get;
+    const animation = spec.paths["/api/announcements/{id}/animation"].get;
+    const dismiss = spec.paths["/api/announcements/{id}/dismiss"].post;
+    for (const operation of [current, image, animation, dismiss]) {
+      expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+      expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board" });
+      const success = operation.responses["200"] ?? operation.responses["204"];
+      expect(success.headers["Cache-Control"].schema.enum).toEqual(["private, no-store"]);
+    }
+    expect(current.responses["200"].content["application/json"].schema.nullable).toBe(true);
+    expect(Object.keys(image.responses["200"].content)).toEqual(["image/png", "image/jpeg", "image/webp"]);
+    expect(dismiss.requestBody.content["application/json"].schema).toMatchObject({
+      required: ["companyId"], additionalProperties: false,
+    });
+    expect(dismiss.description).toContain("viewers may dismiss their own");
+  });
+
   it("documents exact failed-run selection and durable accepted retry responses", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
     const wake = res.body.paths["/api/agents/{id}/wakeup"].post;
@@ -382,6 +405,17 @@ describe("openapi routes", () => {
       ["get", "/api/companies/{companyId}/chat-endpoints"],
       ["post", "/api/companies/{companyId}/chat-endpoints"],
       ["get", "/api/chat-endpoints/{endpointId}"],
+      ["get", "/api/chat-endpoints/{endpointId}/github/configuration"],
+      ["put", "/api/chat-endpoints/{endpointId}/github/configuration"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/verify"],
+      ["put", "/api/chat-endpoints/{endpointId}/github/progress"],
+      ["get", "/api/chat-endpoints/{endpointId}/github/reviews"],
+      ["get", "/api/chat-endpoints/{endpointId}/github/personal-connections"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/identity"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/people/lookup"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/registration"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/app"],
+      ["post", "/api/chat-endpoints/{endpointId}/github/repositories/refresh"],
       ["patch", "/api/chat-endpoints/{endpointId}"],
       ["post", "/api/chat-endpoints/{endpointId}/setup"],
       ["post", "/api/chat-endpoints/{endpointId}/setup-secret"],
@@ -552,7 +586,7 @@ describe("openapi routes", () => {
     const activity =
       spec.paths["/api/chat-endpoints/{endpointId}/activity"].get.responses[
         "200"
-      ].content["application/json"].schema.items;
+      ].content["application/json"].schema.oneOf[0].items;
     expect(activity.properties.actionType.enum).toEqual([
       "slash_task_start",
       "provider_effect",
@@ -890,4 +924,42 @@ describe("openapi routes", () => {
     const codes = Object.keys(cancel.responses).sort();
     expect(codes).toEqual(["200", "401", "403", "404"]);
   });
+});
+
+
+describe("heartbeat run ID OpenAPI contract", () => {
+  it("publishes the runtime UUID constraint and 400 response on all agent-router run endpoints", async () => {
+    const response = await request(createApp()).get("/api/openapi.json");
+    expect(response.status).toBe(200);
+    const paths = response.body.paths;
+    let checked = 0;
+    for (const [path, operations] of Object.entries(paths)) {
+      if (!path.startsWith("/api/heartbeat-runs/{runId}") || path.endsWith("/issues")) continue;
+      for (const operation of Object.values(operations as Record<string, any>)) {
+        const parameter = operation.parameters.find((param: { name: string }) => param.name === "runId");
+        expect(parameter.schema.pattern).toEqual(expect.any(String));
+        const pattern = new RegExp(parameter.schema.pattern);
+        for (const id of [
+          "aaaaaaaa-aaaa-1aaa-8aaa-aaaaaaaaaaaa",
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "AAAAAAAA-AAAA-5AAA-BAAA-AAAAAAAAAAAA",
+        ]) expect(pattern.test(id), id).toBe(true);
+        for (const id of [
+          "undefined", "not-a-uuid", " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa ",
+          "aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa", "aaaaaaaa-aaaa-4aaa-0aaa-aaaaaaaaaaaa",
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n",
+        ]) expect(pattern.test(id), JSON.stringify(id)).toBe(false);
+        expect(operation.responses["400"]).toBeDefined();
+        checked++;
+      }
+    }
+    expect(checked).toBe(12);
+  });
+});
+
+it("documents the account binding required for preference reads", () => {
+  const operation = buildOpenApiSpec().paths["/api/auth/preferences"]?.get;
+  expect(operation?.parameters).toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: "expectedUserId", in: "query", required: true }),
+  ]));
 });

@@ -1,3 +1,4 @@
+import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { persistActivity } from "./activity-log.js";
@@ -69,6 +70,10 @@ export async function validateExecutionReconciliation(input: {
     throw conflict(
       "The recovery source or task owner changed. Inspect the current execution before continuing.",
     );
+  }
+  if (hasWorkspaceRestoreFailure(run.resultJson) &&
+      (!decision.workspaceRepairEvidence || decision.workspaceRepairEvidence.trim().length < 20)) {
+    throw conflict("Verify safe workspace staging or repair and record workspaceRepairEvidence before continuing this run.");
   }
   for (const pid of [
     run.processPid,
@@ -471,10 +476,13 @@ export async function settleUnrecoverableExecutions(
           (!task.executionRunId || task.executionRunId === run.id) &&
           (!task.checkoutRunId || task.checkoutRunId === run.id);
         const note = current
-          ? "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated."
+          ? hasWorkspaceRestoreFailure(run.resultJson)
+            ? "Workspace repair required. Verify safe staging or repair before continuing. Saved work and approval decisions remain in force."
+            : "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated."
           : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
-        if (current)
-          await tx
+        let nativeFailureBlock = action.evidence.nativeFailureBlock;
+        if (current) {
+          const [projected] = await tx
             .update(issues)
             .set({
               status: "blocked",
@@ -482,7 +490,13 @@ export async function settleUnrecoverableExecutions(
               checkoutRunId: null,
               updatedAt: now,
             })
-            .where(eq(issues.id, task.id));
+            .where(eq(issues.id, task.id)).returning();
+          // Only a transition owned by this failure grants a recovery receipt.
+          // An already-blocked task may have a separate human/dependency hold.
+          if (task.status !== "blocked" && run.runtimeMode === "native") {
+            nativeFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion };
+          }
+        }
         await tx
           .update(issueRecoveryActions)
           .set({
@@ -496,6 +510,7 @@ export async function settleUnrecoverableExecutions(
             monitorPolicy: null,
             evidence: {
               ...action.evidence,
+              ...(nativeFailureBlock ? { nativeFailureBlock } : {}),
               automaticRecovery: {
                 policy: "preserve_without_replay_v1",
                 runId: run.id,

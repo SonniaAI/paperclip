@@ -27,7 +27,7 @@ import {
   awaitVerifiedAcpxProviderOwnership,
 } from "./installation-integrity.js";
 import type { AcpxModelStatus } from "./model-verification.js";
-import { decideAcpxPermission } from "./permission-policy.js";
+import { AcpxApprovalRequiredError, decideAcpxPermission } from "./permission-policy.js";
 
 const VERIFIED_COMMAND_SENTINEL = "paperclip-verified-acpx-command";
 const DEFAULT_RUNTIME_CLOSE_TIMEOUT_MS = 2_000;
@@ -245,6 +245,7 @@ export async function openQualifiedAcpxRuntime(
       .filter((server) => server.runnerOwned)
       .map((server) => server.name),
   );
+  const permissionBoundary: { active: AbortController | null } = { active: null };
   const goalState: AcpxRuntimeGoalState = {
     capability: null,
     snapshot: null,
@@ -272,11 +273,15 @@ export async function openQualifiedAcpxRuntime(
     agentRegistry: createRegistry({
       // Preserve Claude's ACP capability identity. This is metadata only: the
       // spawn callback below always launches the verified command lease.
-      overrides: { [options.profile.agent]: [options.profile.agent === "claude"
-        ? "/paperclip-verified/claude-agent-acp"
-        : VERIFIED_COMMAND_SENTINEL] },
+      overrides: { [options.profile.agent]: options.profile.agent === "grok"
+        ? ["/paperclip-verified/grok", "agent", "stdio"]
+        : [options.profile.agent === "claude" ? "/paperclip-verified/claude-agent-acp" : VERIFIED_COMMAND_SENTINEL] },
     }),
-    permissionMode: options.permissionMode,
+    // ACPX does not know the Paperclip-specific mode. Exact SDK rules allow
+    // admitted actions; all remaining requests keep its closed read policy.
+    permissionMode: options.permissionMode === "approve-paperclip"
+      ? "approve-reads"
+      : options.permissionMode,
     elicitationModes: ["form"],
     nonInteractivePermissions: "fail",
     permissionPolicy: {
@@ -308,7 +313,14 @@ export async function openQualifiedAcpxRuntime(
             options.mcpServers.every((server) => server.runnerOwned),
         },
       );
-      return disposition === "delegate" ? undefined : { outcome: disposition };
+      if (disposition === "delegate") {
+        // This runtime has no interactive approval bridge. Stop the active
+        // turn instead of asking the model to recover from an unexplained
+        // denial or wait for an approval that nobody can answer.
+        permissionBoundary.active?.abort(new AcpxApprovalRequiredError());
+        return { outcome: "reject_once" };
+      }
+      return { outcome: disposition };
     },
     onAgentInitialize: (result) => {
       const capability = goalCapabilityFromAcpMessage({ result });
@@ -318,7 +330,14 @@ export async function openQualifiedAcpxRuntime(
     spawnEnvironment: () => ({
       ...definedEnvironment(options.launchEnvironment),
       ...(options.profile.agent === "claude"
-        ? { PAPERCLIP_ACPX_ISOLATED_CONTEXT: "1" }
+        ? {
+            PAPERCLIP_ACPX_ISOLATED_CONTEXT: "1",
+            // This URL comes from the runner-owned authenticated tool bridge,
+            // never provider-supplied permission-request metadata.
+            PAPERCLIP_ACPX_TASK_TOOL_BRIDGE_URL: options.mcpServers.find(
+              (server) => server.runnerOwned && server.name === "paperclip",
+            )?.url ?? "",
+          }
         : {}),
     }),
     spawnCwd: options.cwd,
@@ -434,6 +453,7 @@ export async function openQualifiedAcpxRuntime(
       runtimeCloseTimeoutMs,
       goalState,
       commandLaunches,
+      permissionBoundary,
     );
   } catch (error) {
     const cleanupReason = "ACPX runtime identity validation failed";
@@ -861,6 +881,7 @@ function runtimePort(
   runtimeCloseTimeoutMs: number,
   goalState: AcpxRuntimeGoalState,
   commandLaunches: { count: number; refreshConsumedCommand?: () => Promise<void> },
+  permissionBoundary: { active: AbortController | null },
 ): AcpxRuntimePort {
   type RuntimeCloseAttempt = {
     readonly outcome: Promise<unknown | null>;
@@ -1184,6 +1205,8 @@ function runtimePort(
         }
       : {}),
     startTurn(input) {
+      const approval = new AbortController();
+      permissionBoundary.active = approval;
       const finishOwnershipAdmission =
         children.beginLifetimeOwnershipAdmission();
       let turn: AcpxRuntimeTurn;
@@ -1193,16 +1216,50 @@ function runtimePort(
           text: input.text,
           mode: "prompt",
           requestId: input.requestId,
-          ...(input.signal ? { signal: input.signal } : {}),
+          signal: input.signal
+            ? AbortSignal.any([input.signal, approval.signal])
+            : approval.signal,
           ...(input.onElicitation
             ? { onElicitation: input.onElicitation }
             : {}),
         });
       } catch (error) {
+        if (permissionBoundary.active === approval) permissionBoundary.active = null;
         void finishOwnershipAdmission().catch(() => undefined);
         throw error;
       }
-      return turnWithVerifiedLifetimeOwnership(turn, finishOwnershipAdmission);
+      const guarded = turnWithVerifiedLifetimeOwnership(turn, finishOwnershipAdmission);
+      const result = guarded.result.then(
+        (value) => {
+          approval.signal.throwIfAborted();
+          // ACPX may resolve its own permission policy before invoking the
+          // host callback. Keep that typed denial on the same runner outcome.
+          if (value.status === "failed" && value.error?.code === "PERMISSION_PROMPT_UNAVAILABLE") {
+            throw new AcpxApprovalRequiredError();
+          }
+          return value;
+        },
+        (error: unknown) => { approval.signal.throwIfAborted(); throw error; },
+      ).finally(() => {
+        if (permissionBoundary.active === approval) permissionBoundary.active = null;
+      });
+      void result.catch(() => undefined);
+      return {
+        ...guarded,
+        result,
+        events: (async function* () {
+          try {
+            for await (const event of guarded.events) {
+              approval.signal.throwIfAborted();
+              yield event;
+            }
+          } catch (error) {
+            approval.signal.throwIfAborted();
+            throw error;
+          }
+          approval.signal.throwIfAborted();
+        })(),
+      };
     },
     close: closeRuntime,
   };

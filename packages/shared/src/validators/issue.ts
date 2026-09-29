@@ -555,6 +555,12 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "cancelled",
 ] as const;
 
+export const retryWorkspaceExportSchema = z.object({
+  actionId: z.string().guid(),
+  runId: z.string().guid(),
+  repairNote: z.string().trim().min(20).max(12000),
+}).strict();
+
 export const resolveIssueRecoveryActionSchema = z
   .object({
     executionReconciliation: z
@@ -563,6 +569,7 @@ export const resolveIssueRecoveryActionSchema = z
         providerStopped: z.literal(true),
         actionOutcome: z.enum(["completed", "not_performed", "mixed"]),
         outcomeEvidence: z.string().trim().min(20).max(12000),
+        workspaceRepairEvidence: z.string().trim().min(20).max(12000).optional(),
       })
       .strict()
       .optional(),
@@ -855,6 +862,7 @@ export const updateIssueSchema = objectWithoutDefaults(
     requestDepth: issueRequestDepthInputSchema.optional(),
     assigneeAgentId: z.string().trim().min(1).optional().nullable(),
     comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
+    commentClientRequestId: z.string().uuid().optional(),
     /** Only valid with a comment; the route binds these in the update transaction. */
     attachmentIds: issueCommentAttachmentIdsSchema.optional(),
     onBehalfOfUserId: z.string().trim().min(1).optional().nullable(),
@@ -1009,6 +1017,14 @@ export const issueCommentMetadataSchema = z
       .max(160)
       .nullable()
       .optional(),
+    recovery: z.object({
+      kind: z.literal("disposition_repair_escalated"),
+      actionId: z.string().guid(),
+      attemptCount: z.number().int().nonnegative(),
+      maxAttempts: z.number().int().positive(),
+      reason: z.string().trim().min(1).max(160),
+      assigneeAgentId: z.string().guid().nullable(),
+    }).strict().optional(),
     sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20),
   })
   .strict();
@@ -1074,6 +1090,7 @@ const connectionIntentBrandAssetSchema = z
 
 export const connectionIntentPayloadSchema = z
   .object({
+    upstreamService: z.object({ slug: z.string().min(1).max(120), name: z.string().min(1).max(160), selectionInteractionId: z.string().guid().optional() }).strict().optional(),
     purpose: z.literal("ai").optional(),
     version: z.literal(1),
     serviceSlug: z.string().trim().min(1).max(120),
@@ -1089,6 +1106,7 @@ export const connectionIntentPayloadSchema = z
 export const connectionIntentResultSchema = z
   .object({
     version: z.literal(1),
+    instruction: z.string().max(4000).optional(),
     outcome: z.enum(["connected", "declined", "superseded", "expired"]),
     connectionId: z.string().guid().nullable().optional(),
     reason: z.string().trim().max(4000).nullable().optional(),
@@ -1865,6 +1883,44 @@ const createIssueThreadInteractionCommon = {
   addresseeUserId: z.string().trim().min(1).nullable().optional(),
 };
 
+// Validate dual representations on creation, not when reading historical rows.
+// Otherwise a partial canonical form can hide required storage questions.
+const createAskUserQuestionsPayloadSchema = askUserQuestionsPayloadSchema.superRefine((value, ctx) => {
+  if (!value.questionSet) return;
+  const shown = new Set(value.questionSet.questions.map((question) => question.id));
+  const stored = new Set(value.questions.map((question) => question.id));
+  if (shown.size !== stored.size || [...shown].some((id) => !stored.has(id))) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["questionSet", "questions"],
+      message: "questionSet must present every questions entry with the same question IDs. Include choice questions as well as text questions; a partial form hides required answers.",
+    });
+  }
+  const storedById = new Map(value.questions.map((question) => [question.id, question]));
+  for (const [index, question] of value.questionSet.questions.entries()) {
+    const storage = storedById.get(question.id);
+    if (!storage) continue;
+    const mismatch = (field: string) => ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["questionSet", "questions", index, field],
+      message: `questionSet ${field} must match the corresponding questions entry.`,
+    });
+    if (question.prompt !== storage.prompt) mismatch("prompt");
+    // An omitted storage flag adds no constraint; an explicit flag must agree.
+    if (storage.required !== undefined && question.required !== storage.required) mismatch("required");
+    const mode = question.answerMode === "multi_select" ? "multi" : "single";
+    if (storage.selectionMode !== mode) mismatch("answerMode");
+    if (question.answerMode === "text") {
+      if (storage.options.length !== 1 || !storage.options[0].freeText) mismatch("answerMode");
+    } else {
+      // Text/custom-answer sentinels are storage compatibility, not visible choices.
+      const choices = storage.options.filter((option) => !option.freeText);
+      const canonical = new Map((question.options ?? []).map((option) => [option.id, option.label]));
+      if (choices.length !== canonical.size || choices.some((option) => canonical.get(option.id) !== option.label)) mismatch("options");
+    }
+  }
+});
+
 export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
   z.object({
     ...createIssueThreadInteractionCommon,
@@ -1890,7 +1946,7 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     continuationPolicy: issueThreadInteractionContinuationPolicySchema
       .optional()
       .default("wake_assignee"),
-    payload: askUserQuestionsPayloadSchema,
+    payload: createAskUserQuestionsPayloadSchema,
   }),
   z.object({
     ...createIssueThreadInteractionCommon,

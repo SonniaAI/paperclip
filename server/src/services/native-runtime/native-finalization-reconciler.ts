@@ -1,3 +1,4 @@
+import { recoverLegacyUnsafeWorkspaceExports } from "./native-workspace-export-recovery.js";
 import { dismissAutomaticCompletionReviews, decisionHasRetiredAutomaticReview } from "./automatic-completion-reviews.js";
 import { logger } from "../../middleware/logger.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -32,6 +33,7 @@ import {
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueService } from "../issues.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
+import { reportRunFailure } from "../run-failure-report.js";
 import { resumeNativeWorkspaceFinalization } from "./native-workspace-finalizer.js";
 import { dismissObsoleteNativePolicyReviews } from "./obsolete-policy-reviews.js";
 import {
@@ -461,10 +463,14 @@ export async function claimNativeSessionResumptions(input: {
             : "Persisted native session state is ambiguous and cannot be resumed safely",
           updatedAt: now,
         }).where(eq(heartbeatRuns.id, row.run.id)).returning();
-        terminalRunToEmit = updatedRun ?? null;
+        // Only a genuine transition into "failed" is a new terminal failure.
+        // A candidate that is already "failed" (the filter above admits
+        // both "running" and "failed") must not send a second Sentry event.
+        terminalRunToEmit =
+          updatedRun && updatedRun.status !== row.run.status ? updatedRun : null;
         await issueService(tx as unknown as Db).update(
           row.coordinator.issueId,
-          { status: "in_review" },
+          { status: "blocked" },
           tx,
         );
         await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
@@ -520,6 +526,7 @@ export async function claimNativeSessionResumptions(input: {
     // the remaining candidates in this loop, so fire it and do not await it.
     if (terminalRunToEmit) {
       void emitAgentTaskRun(input.db, terminalRunToEmit);
+      void reportRunFailure(input.db, terminalRunToEmit);
     }
     if (claimed) claims.push({ runId: candidate.runId, leaseOwner });
   }
@@ -540,6 +547,9 @@ export async function reconcileNativeFinalizations(
     }) => Promise<void>;
   } = {},
 ) {
+  await recoverLegacyUnsafeWorkspaceExports(db, runIds).catch((err) => {
+    logger.warn({ err }, "Historical unsafe export recovery remains pending");
+  });
   await dismissObsoleteNativePolicyReviews(db, runIds).catch((err) => {
     logger.warn({ err }, "Obsolete native policy review lookup failed; continuing native reconciliation");
   });
@@ -849,6 +859,8 @@ export async function reconcileNativeFinalizations(
         runId: row.runId,
         environmentRuntime: options.environmentRuntime,
       });
+      // Busy is ownership, not another failed export or retry-budget debit.
+      if (!operation) continue;
       const workspaceFinalizeStatus =
         operation.status === "succeeded" ? "succeeded" : "failed";
       if (workspaceFinalizeStatus === "failed") {

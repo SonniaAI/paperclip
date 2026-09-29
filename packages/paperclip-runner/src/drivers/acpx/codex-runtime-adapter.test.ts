@@ -28,6 +28,69 @@ const HANDLE: AcpRuntimeHandle = {
 };
 
 describe("Codex ACPX runtime adapter", () => {
+  it.each(["approve-reads", "approve-paperclip"] as const)("%s stops unassigned operations when approval has no handler", async (permissionMode) => {
+    const runtime = fakeRuntime();
+    let runtimeOptions: AcpRuntimeOptions | undefined;
+    let signal: AbortSignal | undefined;
+    let settle!: () => void;
+    const finished = new Promise<void>((resolve) => { settle = resolve; });
+    vi.mocked(runtime.startTurn).mockImplementation((input) => {
+      signal = input.signal;
+      signal?.addEventListener("abort", settle, { once: true });
+      return {
+        requestId: "permission-test",
+        promptStarted: Promise.resolve(),
+        events: (async function* () { await finished; })(),
+        result: finished.then(() => ({ status: "cancelled" as const })),
+        cancel: async () => settle(),
+        closeStream: async () => settle(),
+      } as ReturnType<AcpRuntime["startTurn"]>;
+    });
+    const options = openOptions(fakeCommand());
+    options.permissionMode = permissionMode;
+    const port = await openCodexAcpxRuntime(options, {
+      createRegistry: () => registry(),
+      createStore: () => store(),
+      createRuntime: (created) => { runtimeOptions = created; return runtime; },
+    });
+    expect(runtimeOptions!.permissionMode).toBe("approve-reads");
+    expect(runtimeOptions!.permissionPolicy).toMatchObject({ defaultAction: "escalate" });
+    const turn = port.startTurn({ text: "Attempt a write.", requestId: "permission-test" });
+    try {
+      await runtimeOptions!.onPermissionRequest!({
+        sessionId: "backend-1", inferredKind: "write", raw: {},
+      }, { signal: new AbortController().signal });
+      expect(signal?.aborted).toBe(true);
+      await expect(turn.result).rejects.toThrow("Approval required");
+      await expect((async () => { for await (const _event of turn.events) { /* drain */ } })())
+        .rejects.toThrow("Approval required");
+    } finally {
+      settle();
+      await port.close({ reason: "permission failure verified" });
+    }
+  });
+
+  it.each(["PERMISSION_PROMPT_UNAVAILABLE", "AGENT_DISCONNECTED"])("preserves the meaning of ACPX terminal failure %s", async (code) => {
+    const runtime = fakeRuntime();
+    const result = { status: "failed" as const, error: { code, message: "Provider failed" } };
+    vi.mocked(runtime.startTurn).mockReturnValue({
+      requestId: "permission-fallback", promptStarted: Promise.resolve(),
+      events: { async *[Symbol.asyncIterator]() {} }, result: Promise.resolve(result),
+      cancel: vi.fn(), closeStream: vi.fn(),
+    });
+    const port = await openCodexAcpxRuntime(openOptions(fakeCommand()), {
+      createRegistry: () => registry(), createStore: () => store(), createRuntime: () => runtime,
+    });
+    try {
+      const turn = port.startTurn({ text: "Attempt a write", requestId: "permission-fallback" });
+      if (code === "PERMISSION_PROMPT_UNAVAILABLE") {
+        await expect(turn.result).rejects.toMatchObject({ code: "approval_required" });
+      } else {
+        await expect(turn.result).resolves.toEqual(result);
+      }
+    } finally { await port.close({ reason: "terminal permission outcome verified" }); }
+  });
+
   it("rejects a pre-aborted admission before constructing or spawning ACPX", async () => {
     const cancellation = new Error("runtime admission cancelled");
     const controller = new AbortController();
@@ -129,6 +192,7 @@ describe("Codex ACPX runtime adapter", () => {
       expect(runtimeOptions?.spawnEnvironment?.()).toEqual({
         PATH: "/verified/bin",
         PAPERCLIP_ACPX_ISOLATED_CONTEXT: "1",
+        PAPERCLIP_ACPX_TASK_TOOL_BRIDGE_URL: "",
       });
       expect(runtime.ensureSession).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -136,6 +200,32 @@ describe("Codex ACPX runtime adapter", () => {
           sessionOptions: expect.objectContaining({ model: providerModel }),
         }),
       );
+    },
+  );
+
+  it.each(["runner-owned", "unowned", "absent"])(
+    "pins Claude completion authority to the %s task bridge",
+    async (binding) => {
+      const options = openOptions(fakeCommand());
+      options.profile = resolveQualifiedAcpxProfile("claude", "claude-sonnet-5");
+      options.launchEnvironment = { PAPERCLIP_ACPX_TASK_TOOL_BRIDGE_URL: "http://untrusted.invalid/mcp" };
+      options.mcpServers = binding === "absent" ? [] : [{
+        name: "paperclip", url: "http://127.0.0.1:3210/mcp",
+        bearerToken: "bridge-secret", runnerOwned: binding === "runner-owned",
+      }];
+      let runtimeOptions: AcpRuntimeOptions | undefined;
+      await openCodexAcpxRuntime(options, {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: (created) => {
+          runtimeOptions = created;
+          return fakeRuntime();
+        },
+      });
+      expect(runtimeOptions?.spawnEnvironment?.()).toEqual({
+        PAPERCLIP_ACPX_ISOLATED_CONTEXT: "1",
+        PAPERCLIP_ACPX_TASK_TOOL_BRIDGE_URL: binding === "runner-owned" ? "http://127.0.0.1:3210/mcp" : "",
+      });
     },
   );
 
@@ -1307,7 +1397,7 @@ describe("Codex ACPX runtime adapter", () => {
       text: "Complete the task.",
       mode: "prompt",
       requestId: "turn-1",
-      signal,
+      signal: expect.any(AbortSignal),
       onElicitation,
     });
   });
@@ -1537,7 +1627,7 @@ describe("Codex ACPX runtime adapter", () => {
     await port.close({ reason: "complete" });
   });
 
-  it("delegates permissions that require an unavailable coordinator", async () => {
+  it("rejects permissions that require an unavailable coordinator", async () => {
     const runtime = fakeRuntime();
     let runtimeOptions: AcpRuntimeOptions | undefined;
     const port = await openCodexAcpxRuntime(openOptions(fakeCommand()), {
@@ -1558,16 +1648,17 @@ describe("Codex ACPX runtime adapter", () => {
         },
         { signal: new AbortController().signal },
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ outcome: "reject_once" });
     await port.close({ reason: "complete" });
   });
 
   it.each([
     ["codex", "gpt-5.6-sol", "approve-all", { outcome: "allow_once" }],
-    ["codex", "gpt-5.6-sol", "approve-reads", undefined],
+    ["codex", "gpt-5.6-sol", "approve-reads", { outcome: "reject_once" }],
     ["codex", "gpt-5.6-sol", "deny-all", { outcome: "reject_once" }],
     ["claude", "claude-sonnet-5", "approve-all", { outcome: "allow_once" }],
-    ["claude", "claude-sonnet-5", "approve-reads", undefined],
+    ["claude", "claude-sonnet-5", "approve-reads", { outcome: "reject_once" }],
+    ["claude", "claude-sonnet-5", "approve-paperclip", { outcome: "reject_once" }],
     ["claude", "claude-sonnet-5", "deny-all", { outcome: "reject_once" }],
   ] as const)(
     "applies the %s/%s ACPX profile's %s mode without an implicit prompt bridge",

@@ -9,6 +9,7 @@ import {
   buildSkillMentionHref,
 } from "@paperclipai/shared";
 import { parseRunnerGoalCommand, TaskChatComposer } from "./TaskChatComposer";
+import { ComposerAddMenu } from "./ComposerAddMenu";
 import { QuestionForm } from "./QuestionForm";
 import { DRAFT_DEBOUNCE_MS } from "../../lib/composer-draft";
 import {
@@ -248,6 +249,12 @@ function pressKey(
   });
 }
 
+function openComposerAddMenu() {
+  const add = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-add"]')!;
+  flushSync(() => add.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 })));
+  return add;
+}
+
 function pasteFiles(files: File[]) {
   const paste = new Event("paste", { bubbles: true, cancelable: true });
   Object.defineProperty(paste, "clipboardData", {
@@ -290,6 +297,108 @@ function autocompleteOption(matchText: string) {
 }
 
 describe("TaskChatComposer", () => {
+  it("settles an acknowledged submission after navigating away", async () => {
+    const key = "navigate-before-save";
+    let resolveSend!: () => void;
+    const onAdd = vi.fn().mockReturnValue(new Promise<void>(resolve => { resolveSend = resolve; }));
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    typeText("Please write a motto");
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+    const intent = loadDraftSubmission(key)!;
+    expect(onAdd.mock.calls[0]?.[4]).toBe(intent.attemptId);
+    render(<div>Another task</div>);
+    resolveSend();
+    await flushAsync();
+    expect(loadDraftSubmission(key)).toBeNull();
+    expect(localStorage.getItem(key)).toBeNull();
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    expect(container.textContent).not.toContain("couldn’t confirm");
+    expect(editable().textContent).toBe("");
+  });
+
+  it("automatically reconciles a restored submission by its server receipt, not its text", async () => {
+    const key = "saved-receipt";
+    const attemptId = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
+    saveDraft(key, "Already answered");
+    saveDraftSubmission(key, { attemptId, reviewed: false });
+    const onAdd = vi.fn();
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key}
+      confirmedSubmissionIds={new Set(["another-request"])} />);
+    expect(loadDraftSubmission(key)).not.toBeNull();
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key}
+      confirmedSubmissionIds={new Set([attemptId])} />);
+    await flushAsync();
+    expect(loadDraftSubmission(key)).toBeNull();
+    expect(editable().textContent).toBe("");
+    expect(onAdd).not.toHaveBeenCalled();
+  });
+
+  it("preserves the next draft when an uncertain submission is later confirmed after reload", async () => {
+    const key = "uncertain-with-next-draft";
+    let rejectSend!: (error: Error) => void;
+    const onAdd = vi.fn().mockReturnValue(new Promise<void>((_resolve, reject) => { rejectSend = reject; }));
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    typeText("First request");
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+    const attemptId = loadDraftSubmission(key)!.attemptId;
+    typeText("Keep this next draft");
+    rejectSend(new CommentSubmissionUnknownError());
+    await flushAsync();
+    render(<div>Another task</div>);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key}
+      confirmedSubmissionIds={new Set([attemptId])} />);
+    await flushAsync();
+    expect(editable().textContent).toBe("Keep this next draft");
+    expect(localStorage.getItem(key)).toBe("Keep this next draft");
+    expect(loadDraftSubmission(key)).toBeNull();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["acknowledgment", "receipt after reload"])("preserves a next draft across navigation before %s", async (confirmation) => {
+    const key = "navigate-with-next-draft";
+    let resolveSend!: () => void;
+    const onAdd = vi.fn().mockReturnValue(new Promise<void>(resolve => { resolveSend = resolve; }));
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    typeText("First request");
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+    const attemptId = loadDraftSubmission(key)!.attemptId;
+    typeText("Keep the unsent next request");
+    render(<div>Another task</div>);
+    if (confirmation === "acknowledgment") {
+      resolveSend();
+      await flushAsync();
+    }
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key}
+      confirmedSubmissionIds={new Set([attemptId])} />);
+    await flushAsync();
+    expect(editable().textContent).toBe("Keep the unsent next request");
+    expect(localStorage.getItem(key)).toBe("Keep the unsent next request");
+    expect(loadDraftSubmission(key)).toBeNull();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    resolveSend();
+    await flushAsync();
+    expect(localStorage.getItem(key)).toBe("Keep the unsent next request");
+  });
+
+  it("does not copy another task's draft into a late acknowledged submission", async () => {
+    let resolveSend!: () => void;
+    const onAdd = vi.fn().mockReturnValue(new Promise<void>(resolve => { resolveSend = resolve; }));
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey="first-task" />);
+    typeText("First request");
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey="second-task" />);
+    typeText("Second task draft");
+    resolveSend();
+    await flushAsync();
+    expect(loadDraftSubmission("first-task")).toBeNull();
+    expect(localStorage.getItem("first-task")).toBeNull();
+    expect(editable().textContent).toBe("Second task draft");
+  });
+
   it.each(["success", "unknown"])(
     "does not overwrite another retained attempt after an older %s",
     async (outcome) => {
@@ -497,7 +606,7 @@ describe("TaskChatComposer", () => {
     );
     flushSync(() => sendButton().click());
     await flushAsync();
-    expect(onAdd.mock.calls[0]).toHaveLength(3);
+    expect(onAdd.mock.calls[0]?.[3]).toBeUndefined();
   });
 
   it("submits multiple retained file and image receipts but not removed selections", async () => {
@@ -632,7 +741,7 @@ describe("TaskChatComposer", () => {
     expect(localStorage.getItem("removed-pending:attachments:v1")).toBeNull();
     flushSync(() => sendButton().click());
     await flushAsync();
-    expect(onAdd.mock.calls[0]).toHaveLength(3);
+    expect(onAdd.mock.calls[0]?.[3]).toBeUndefined();
   });
   it("adds 10px to the composer's original 8px interior padding", () => {
     render(<TaskChatComposer onAdd={async () => {}} workMode="standard" />);
@@ -674,7 +783,7 @@ describe("TaskChatComposer", () => {
       />,
     );
 
-    const composer = container.firstElementChild as HTMLElement;
+    const composer = container.querySelector<HTMLElement>(".paperclip-task-chat-composer")!;
     const mode = container.querySelector<HTMLElement>(
       '[data-testid="task-chat-composer-mode"]',
     )!;
@@ -690,8 +799,8 @@ describe("TaskChatComposer", () => {
     expect(composer.classList).toContain("dark:bg-muted");
     expect(composer.classList).toContain("dark:shadow-none");
     expect(composer.className).not.toContain("focus-within:ring");
-    expect(mode.classList).not.toContain("border");
-    expect(mode.className).not.toContain("ring-");
+    expect(mode.classList).toContain("rounded-full");
+    expect(mode.getAttribute("aria-label")).toBe("Remove Plan mode");
     expect(runner.classList).toContain("border-0");
     expect(runner.classList).not.toContain("border");
     expect(runner.className).not.toContain("ring-2");
@@ -700,7 +809,7 @@ describe("TaskChatComposer", () => {
   it("scopes the wrapping placeholder override to the task-chat composer", () => {
     render(<TaskChatComposer onAdd={vi.fn()} workMode="standard" />);
 
-    expect(container.firstElementChild?.classList).toContain(
+    expect(container.querySelector("[data-testid='task-chat-composer-input']")?.parentElement?.classList).toContain(
       "paperclip-task-chat-composer",
     );
   });
@@ -724,7 +833,7 @@ describe("TaskChatComposer", () => {
     await flushAsync();
     await flushAsync();
 
-    expect(onAdd).toHaveBeenCalledWith("hello there", undefined, undefined);
+    expect(onAdd).toHaveBeenCalledWith("hello there", undefined, undefined, undefined, expect.any(String));
     expect(editable().textContent).toBe("");
   });
 
@@ -736,7 +845,7 @@ describe("TaskChatComposer", () => {
     pressKey("Enter", { ctrlKey: true });
     await flushAsync();
 
-    expect(onAdd).toHaveBeenCalledWith("hello", undefined, undefined);
+    expect(onAdd).toHaveBeenCalledWith("hello", undefined, undefined, undefined, expect.any(String));
   });
 
   it("does not submit on plain Enter or Shift+Enter (newline stays with the editor)", async () => {
@@ -763,13 +872,13 @@ describe("TaskChatComposer", () => {
       />,
     );
 
+    expect(container.querySelector('[data-testid="task-chat-composer-add"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-composer-mode"]')).toBeNull();
+
+    pressKey("Tab", { shiftKey: true });
     const chip = container.querySelector<HTMLButtonElement>(
       '[data-testid="task-chat-composer-mode"]',
     )!;
-    expect(chip.getAttribute("data-pending-work-mode")).toBe("standard");
-    expect(chip.textContent).toContain("Auto");
-
-    pressKey("Tab", { shiftKey: true });
     expect(chip.getAttribute("data-pending-work-mode")).toBe("planning");
     expect(chip.textContent).toContain("Plan");
 
@@ -778,7 +887,7 @@ describe("TaskChatComposer", () => {
     await flushAsync();
 
     expect(onWorkModeChange).toHaveBeenCalledWith("planning");
-    expect(onAdd).toHaveBeenCalledWith("do the plan", undefined, undefined);
+    expect(onAdd).toHaveBeenCalledWith("do the plan", undefined, undefined, undefined, expect.any(String));
   });
 
   it("cycles Auto, Plan, and Ask modes with Cmd+Period while focused", () => {
@@ -791,13 +900,10 @@ describe("TaskChatComposer", () => {
       />,
     );
 
-    const chip = container.querySelector<HTMLButtonElement>(
-      '[data-testid="task-chat-composer-mode"]',
-    )!;
     editable().focus();
 
-    expect(chip.getAttribute("aria-keyshortcuts")).toContain("Meta+Period");
-    expect(chip.getAttribute("data-pending-work-mode")).toBe("standard");
+    expect(container.querySelector('[data-testid="task-chat-composer-add"]')?.getAttribute("aria-keyshortcuts")).toContain("Meta+Period");
+    expect(container.querySelector('[data-testid="task-chat-composer-mode"]')).toBeNull();
 
     const cycleMode = () => {
       const event = new KeyboardEvent("keydown", {
@@ -812,6 +918,7 @@ describe("TaskChatComposer", () => {
     };
 
     cycleMode();
+    const chip = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-mode"]')!;
     expect(chip.getAttribute("data-pending-work-mode")).toBe("planning");
     expect(chip.textContent).toContain("Plan");
 
@@ -820,9 +927,77 @@ describe("TaskChatComposer", () => {
     expect(chip.textContent).toContain("Ask");
 
     cycleMode();
-    expect(chip.getAttribute("data-pending-work-mode")).toBe("standard");
-    expect(chip.textContent).toContain("Auto");
+    expect(container.querySelector('[data-testid="task-chat-composer-mode"]')).toBeNull();
     expect(onWorkModeChange).not.toHaveBeenCalled();
+  });
+
+  it("selects exclusive modes from the add menu and removes the active chip", () => {
+    render(<TaskChatComposer onAdd={vi.fn()} workMode="standard" onWorkModeChange={vi.fn()} />);
+    openComposerAddMenu();
+    expect(document.querySelector('[data-testid="composer-add-file"]')).toBeNull();
+    flushSync(() => (document.querySelector('[data-testid="composer-add-plan"]') as HTMLElement).click());
+    expect(container.querySelector('[data-testid="task-chat-composer-mode"]')?.textContent).toContain("Plan mode");
+
+    openComposerAddMenu();
+    flushSync(() => (document.querySelector('[data-testid="composer-add-ask"]') as HTMLElement).click());
+    expect(container.querySelector('[data-testid="task-chat-composer-mode"]')?.textContent).toContain("Ask mode");
+
+    flushSync(() => (container.querySelector('[data-testid="task-chat-composer-mode"]') as HTMLElement).click());
+    expect(container.querySelector('[data-testid="task-chat-composer-mode"]')).toBeNull();
+  });
+
+  it("opens a mobile Add dialog while keeping Send at the end of the footer", () => {
+    render(<TaskChatComposer onAdd={vi.fn()} workMode="standard" onWorkModeChange={vi.fn()}
+      onAttachImage={vi.fn().mockResolvedValue(undefined)} mobile enableReassign
+      reassignOptions={[{ id: "agent:codex", label: "Codie" }]}
+      currentAssigneeValue="agent:codex" />);
+
+    const actions = container.querySelector<HTMLElement>('[data-testid="task-chat-composer-actions"]')!;
+    expect(actions.lastElementChild?.lastElementChild).toBe(sendButton());
+    expect(actions.firstElementChild?.contains(sendButton())).toBe(false);
+    expect(actions.lastElementChild?.querySelector('[data-testid="task-chat-composer-assignee"]')).not.toBeNull();
+    expect(actions.querySelector('[data-testid="task-chat-composer-assignee"] [data-slot="agent-avatar"] img')).not.toBeNull();
+
+    flushSync(() => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-add"]')!.click());
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog?.textContent).toContain("Files and images");
+    expect(dialog?.textContent).toContain("Plan mode");
+    expect(dialog?.textContent).toContain("Ask mode");
+
+    flushSync(() => document.querySelector<HTMLButtonElement>('[data-testid="composer-add-plan"]')!.click());
+    const mode = container.querySelector<HTMLElement>('[data-testid="task-chat-composer-mode"]')!;
+    expect(mode.textContent).toContain("Plan mode");
+    expect(actions.contains(mode)).toBe(true);
+    expect(mode.querySelector(".sr-only")?.textContent).toBe("Plan mode");
+    expect(document.querySelector('[role="dialog"][data-state="open"]')).toBeNull();
+  });
+
+  it("opens the mobile file picker from the Add dialog", () => {
+    render(<TaskChatComposer onAdd={vi.fn()} workMode="standard" mobile
+      onAttachImage={vi.fn().mockResolvedValue(undefined)} />);
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const openPicker = vi.spyOn(input, "click").mockImplementation(() => {});
+    flushSync(() => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-add"]')!.click());
+    flushSync(() => document.querySelector<HTMLButtonElement>('[data-testid="composer-add-file"]')!.click());
+    expect(openPicker).toHaveBeenCalledOnce();
+  });
+
+  it("uses the Add dialog through the mobile shell's tablet breakpoint", () => {
+    const matchMedia = vi.fn((query: string) => ({
+      media: query,
+      matches: query === "(max-width: 767px)",
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as MediaQueryList));
+    vi.stubGlobal("matchMedia", matchMedia);
+    try {
+      render(<ComposerAddMenu mode="standard" onModeChange={vi.fn()} />);
+      flushSync(() => container.querySelector<HTMLButtonElement>('[aria-label="Add to composer"]')!.click());
+      expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+      expect(matchMedia).toHaveBeenCalledWith("(max-width: 767px)");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("uses the borderless Paper controls and inverse circular send button", () => {
@@ -837,18 +1012,17 @@ describe("TaskChatComposer", () => {
       />,
     );
 
-    const mode = container.querySelector<HTMLButtonElement>(
-      '[data-testid="task-chat-composer-mode"]',
+    const add = container.querySelector<HTMLButtonElement>(
+      '[data-testid="task-chat-composer-add"]',
     )!;
     const assignee = container.querySelector<HTMLButtonElement>(
       '[data-testid="task-chat-composer-assignee"]',
     )!;
     const send = sendButton();
 
-    expect(mode.classList).not.toContain("border");
-    expect(mode.classList).toContain("border-0");
-    expect(mode.classList).toContain("status-chip");
-    expect(mode.style.getPropertyValue("--sc")).toBe("var(--tc-mode-agent)");
+    expect(add.classList).not.toContain("border");
+    expect(add.getAttribute("aria-label")).toBe("Add to composer");
+    expect(container.querySelector('[data-testid="task-chat-composer-mode"]')).toBeNull();
     expect(assignee.classList).toContain("border-0");
     expect(assignee.classList).toContain("shadow-none");
     expect(send.classList).toContain("rounded-full");
@@ -872,13 +1046,13 @@ describe("TaskChatComposer", () => {
     pressKey("Enter", { metaKey: true });
     await flushAsync();
 
-    expect(onAdd).toHaveBeenCalledWith("wake up", true, undefined);
+    expect(onAdd).toHaveBeenCalledWith("wake up", true, undefined, undefined, expect.any(String));
   });
 
-  it("hides the attach button without an upload handler and shows it with one", () => {
+  it("shows the add menu only when at least one action is available", () => {
     render(<TaskChatComposer onAdd={vi.fn()} workMode="standard" />);
     expect(
-      container.querySelector('[data-testid="task-chat-composer-attach"]'),
+      container.querySelector('[data-testid="task-chat-composer-add"]'),
     ).toBeNull();
 
     render(
@@ -889,8 +1063,18 @@ describe("TaskChatComposer", () => {
       />,
     );
     expect(
-      container.querySelector('[data-testid="task-chat-composer-attach"]'),
+      container.querySelector('[data-testid="task-chat-composer-add"]'),
     ).not.toBeNull();
+  });
+
+  it("opens the file picker from the add menu", () => {
+    render(<TaskChatComposer onAdd={vi.fn()} workMode="standard"
+      onAttachImage={vi.fn().mockResolvedValue(undefined)} />);
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const openPicker = vi.spyOn(input, "click").mockImplementation(() => {});
+    openComposerAddMenu();
+    flushSync(() => document.querySelector<HTMLElement>('[data-testid="composer-add-file"]')!.click());
+    expect(openPicker).toHaveBeenCalledOnce();
   });
 
   it("wires the editor's inline image upload to onAttachImage and returns the attachment URL", async () => {
@@ -965,11 +1149,7 @@ describe("TaskChatComposer", () => {
     expect(send.disabled).toBe(false);
     flushSync(() => send.click());
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith(
-      "[notes.txt](/attachments/notes.txt)",
-      undefined,
-      undefined,
-    );
+    expect(onAdd).toHaveBeenCalledWith("[notes.txt](/attachments/notes.txt)", undefined, undefined, undefined, expect.any(String));
     // Chips clear once the message posts.
     expect(
       container.querySelector('[data-testid="task-chat-composer-attachments"]'),
@@ -999,11 +1179,7 @@ describe("TaskChatComposer", () => {
     )!;
     flushSync(() => send.click());
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith(
-      "Please review this.\n\n[notes.txt](/attachments/notes.txt)",
-      undefined,
-      undefined,
-    );
+    expect(onAdd).toHaveBeenCalledWith("Please review this.\n\n[notes.txt](/attachments/notes.txt)", undefined, undefined, undefined, expect.any(String));
   });
 
   it("blocks send while a file upload is pending, then includes the file once it lands", async () => {
@@ -1046,11 +1222,7 @@ describe("TaskChatComposer", () => {
     expect(sendButton().disabled).toBe(false);
     flushSync(() => sendButton().click());
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith(
-      "Here is the file.\n\n[notes.txt](/attachments/notes.txt)",
-      undefined,
-      undefined,
-    );
+    expect(onAdd).toHaveBeenCalledWith("Here is the file.\n\n[notes.txt](/attachments/notes.txt)", undefined, undefined, undefined, expect.any(String));
   });
 
   it("blocks send while a failed attachment chip remains, then sends after it is removed", async () => {
@@ -1082,11 +1254,7 @@ describe("TaskChatComposer", () => {
     expect(sendButton().disabled).toBe(false);
     flushSync(() => sendButton().click());
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith(
-      "Here is the file.",
-      undefined,
-      undefined,
-    );
+    expect(onAdd).toHaveBeenCalledWith("Here is the file.", undefined, undefined, undefined, expect.any(String));
   });
 
   it("removes an attachment chip via its remove button", async () => {
@@ -1196,7 +1364,7 @@ describe("TaskChatComposer", () => {
 
     pressKey("Enter", { metaKey: true });
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith(expected.trim(), undefined, undefined);
+    expect(onAdd).toHaveBeenCalledWith(expected.trim(), undefined, undefined, undefined, expect.any(String));
   });
 
   it("inserts a /-command from the autocomplete menu", async () => {
@@ -1310,6 +1478,27 @@ describe("TaskChatComposer", () => {
       expect(editable().textContent).toBe("");
     });
 
+    it("shows Goal in the add menu only for a supported agent and prepares the command", async () => {
+      const onRunnerGoalCommand = vi.fn();
+      render(<TaskChatComposer onAdd={vi.fn()} workMode="standard"
+        onWorkModeChange={vi.fn()} runnerGoalCapability={capability} onRunnerGoalCommand={onRunnerGoalCommand} />);
+      typeText("Ship the feature");
+      openComposerAddMenu();
+      const goal = document.querySelector<HTMLElement>('[data-testid="composer-add-goal"]');
+      expect(goal).not.toBeNull();
+      flushSync(() => goal!.click());
+      await flushAsync();
+      expect(editable().textContent).toBe("/goal Ship the feature");
+      expect(onRunnerGoalCommand).not.toHaveBeenCalled();
+
+      render(<TaskChatComposer onAdd={vi.fn()} workMode="standard"
+        onWorkModeChange={vi.fn()}
+        runnerGoalCapability={{ ...capability, availability: "unsupported" }}
+        onRunnerGoalCommand={onRunnerGoalCommand} />);
+      openComposerAddMenu();
+      expect(document.querySelector('[data-testid="composer-add-goal"]')).toBeNull();
+    });
+
     it("commits a pending agent reassignment before starting the goal", async () => {
       const order: string[] = [];
       const onAdd = vi.fn().mockResolvedValue(undefined);
@@ -1345,6 +1534,10 @@ describe("TaskChatComposer", () => {
       expect(option).toBeDefined();
       flushSync(() => option!.click());
       await flushAsync();
+
+      openComposerAddMenu();
+      expect(document.querySelector('[data-testid="composer-add-goal"]')).not.toBeNull();
+      flushSync(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
 
       typeText("/goal Ship the feature");
       pressKey("Enter", { metaKey: true });
@@ -1596,11 +1789,7 @@ describe("TaskChatComposer", () => {
       pressKey("Enter", { metaKey: true });
       await flushAsync();
 
-      expect(onAdd).toHaveBeenCalledWith(
-        "queued message",
-        undefined,
-        undefined,
-      );
+      expect(onAdd).toHaveBeenCalledWith("queued message", undefined, undefined, undefined, expect.any(String));
       expect(editable().textContent).toBe("");
       expect(localStorage.getItem(draftKey)).toBe("queued message");
       expect(localStorage.getItem(`${draftKey}:submission:v1`)).toContain(
@@ -1631,7 +1820,7 @@ describe("TaskChatComposer", () => {
       await flushAsync();
       await flushAsync();
 
-      expect(onAdd).toHaveBeenCalledWith("first message", undefined, undefined);
+      expect(onAdd).toHaveBeenCalledWith("first message", undefined, undefined, undefined, expect.any(String));
       expect(editable().textContent).toBe("next message");
       expect(localStorage.getItem(draftKey)).toBe("next message");
     });
@@ -1665,7 +1854,7 @@ describe("TaskChatComposer", () => {
       await flushAsync();
       await flushAsync();
 
-      expect(onAdd).toHaveBeenCalledWith("first message", undefined, undefined);
+      expect(onAdd).toHaveBeenCalledWith("first message", undefined, undefined, undefined, expect.any(String));
       expect(
         container.querySelector(
           '[data-testid="task-chat-composer-attachments"]',
@@ -1757,7 +1946,7 @@ describe("TaskChatComposer", () => {
       act(() => root!.render(<TaskChatComposer {...props} />));
       expect(editable().textContent).toBe("Please check mobile too.");
       await act(async () => sendButton().click());
-      expect(onAdd).toHaveBeenCalledWith("Please check mobile too.", undefined, undefined);
+      expect(onAdd).toHaveBeenCalledWith("Please check mobile too.", undefined, undefined, undefined, expect.any(String));
     });
 
     it("takes precedence over pending questions and queued-message edits", () => {
@@ -1880,7 +2069,54 @@ describe("TaskChatComposer", () => {
   });
 
   describe("composer takeovers", () => {
-    it("replaces the editor with one action surface and exposes Skip", async () => {
+    it.each([false, true])("keeps the interaction card visible while sending a normal message (mobile=%s)", async (mobile) => {
+      const onAdd = vi.fn().mockResolvedValue(undefined);
+      render(
+        <TaskChatComposer
+          onAdd={onAdd}
+          workMode="standard"
+          mobile={mobile}
+          takeover={{
+            id: "question-1",
+            label: "Question",
+            pendingCount: 1,
+            content: <p>Which environment?</p>,
+            onDismiss: vi.fn(),
+            onSkip: vi.fn(),
+          }}
+        />,
+      );
+
+      typeText("Continue investigating while I decide.");
+      expect(container.querySelector('[data-testid="task-chat-composer-takeover"]')?.textContent).toContain("Which environment?");
+      await act(async () => sendButton().click());
+      expect(onAdd).toHaveBeenCalledWith("Continue investigating while I decide.", undefined, undefined, undefined, expect.any(String));
+      expect(container.querySelector('[data-testid="task-chat-composer-takeover"]')?.textContent).toContain("Which environment?");
+      expect(editable().textContent).toBe("");
+    });
+
+    it("keeps the composer mode shortcut available beneath an open question", () => {
+      render(
+        <TaskChatComposer
+          onAdd={vi.fn()}
+          workMode="standard"
+          onWorkModeChange={vi.fn()}
+          takeover={{
+            id: "question-1",
+            label: "Question",
+            pendingCount: 1,
+            content: <p>Which environment?</p>,
+            onDismiss: vi.fn(),
+            onSkip: vi.fn(),
+          }}
+        />,
+      );
+      pressKey(".", { metaKey: true });
+      expect(container.querySelector('[data-testid="task-chat-composer-mode"]')?.textContent).toContain("Plan");
+      expect(container.querySelector('[data-testid="task-chat-composer-takeover"]')).not.toBeNull();
+    });
+
+    it("shows a separate card above a usable editor and exposes Skip", async () => {
       const onSkip = vi.fn().mockResolvedValue(undefined);
       render(
         <TaskChatComposer
@@ -1902,7 +2138,11 @@ describe("TaskChatComposer", () => {
         container.querySelector('[data-testid="task-chat-composer-takeover"]')
           ?.textContent,
       ).toContain("Which environment should receive this?");
-      expect(container.querySelector('[data-testid="mdx-editor"]')).toBeNull();
+      const card = container.querySelector('[data-testid="task-chat-composer-takeover"]')!;
+      const composer = container.querySelector('.paperclip-task-chat-composer')!;
+      expect(card.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(container.querySelector('[data-testid="mdx-editor"]')).not.toBeNull();
+      expect(container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-send"]')).not.toBeNull();
       expect(container.textContent).not.toContain("Input needed");
       expect(container.textContent).not.toContain("Write instead");
       const skip = Array.from(
@@ -2083,7 +2323,7 @@ describe("TaskChatComposer", () => {
       });
     });
 
-    it("advances single selections, preserves answers when going back, and skips optional answers", async () => {
+    it("advances on Next, preserves answers when going back, and skips optional answers", async () => {
       const onSubmit = vi.fn();
       render(
         <TaskChatComposer
@@ -2137,17 +2377,24 @@ describe("TaskChatComposer", () => {
       const byLabel = (label: string) =>
         buttons().find((button) => button.textContent?.trim() === label);
 
-      // Page 1: required, so no Skip; Next waits for an answer.
+      // Page 1: required, so no Skip; Next waits for an answer. Answering
+      // enables Next but stays put — only Next moves on.
       expect(byLabel("Skip")).toBeUndefined();
       expect(byLabel("Next")?.disabled).toBe(true);
       flushSync(() => byLabel("Staging")?.click());
+      await flushAsync();
+      expect(container.textContent).toContain("Where?");
+      expect(byLabel("Next")?.disabled).toBe(false);
+      flushSync(() => byLabel("Next")?.click());
       await flushAsync();
       expect(onSubmit).not.toHaveBeenCalled();
       expect(container.textContent).toContain("When?");
       expect(document.activeElement?.textContent).toBe("When?");
 
-      // Page 2: pick advances. Go back to confirm it is saved, then skip.
+      // Page 2: answer, then Next. Go back to confirm it is saved, then skip.
       flushSync(() => byLabel("Today")?.click());
+      await flushAsync();
+      flushSync(() => byLabel("Next")?.click());
       await flushAsync();
       expect(container.textContent).toContain("Who?");
       flushSync(() => container.querySelector<HTMLButtonElement>('button[aria-label="Previous question"]')?.click());
@@ -2171,7 +2418,7 @@ describe("TaskChatComposer", () => {
       expect(response.answers.who).toEqual({ selectedOptionIds: ["me"] });
     });
 
-    it.each(["click", "keyboard"])("advances a single choice by %s, while Other and multi-select stay put", async (input) => {
+    it.each(["click", "keyboard"])("records a single choice by %s without leaving the question", async (input) => {
       const onSubmit = vi.fn();
       render(<QuestionForm
         id="selection-modes"
@@ -2202,6 +2449,13 @@ describe("TaskChatComposer", () => {
         else byLabel("SQLite").dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
       });
       await flushAsync();
+      // Answering re-enables Next and closes Other, but the reader stays here.
+      expect(container.textContent).toContain("1 of 3");
+      expect(container.querySelector('[data-testid="question-other-answer-composer"]')).toBeNull();
+      expect(byLabel("SQLite").getAttribute("aria-checked")).toBe("true");
+      expect(byLabel("Next").disabled).toBe(false);
+      flushSync(() => byLabel("Next").click());
+      await flushAsync();
       expect(container.textContent).toContain("2 of 3");
       expect(document.activeElement?.textContent).toBe("Features?");
       flushSync(() => document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: "1", repeat: true, bubbles: true })));
@@ -2223,71 +2477,130 @@ describe("TaskChatComposer", () => {
       });
     });
 
-    describe("single-choice confirmation animation", () => {
+    describe("single-choice selection stays on the page", () => {
       const questionSet = {
         schema: "paperclip.question_set.v1" as const,
         questions: ["First", "Second", "Third"].map((prompt) => ({
           id: prompt, prompt, required: true, answerMode: "single_select" as const,
-          options: [{ id: "yes", label: "Yes" }], customAnswer: { enabled: true as const },
+          options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }],
+          customAnswer: { enabled: true as const },
         })),
       };
-      const form = (disabled = false) => (
-        <QuestionForm id="animated" questionSet={questionSet} disabled={disabled} onSubmit={vi.fn()} />
+      const form = () => (
+        <QuestionForm id="stationary" questionSet={questionSet} onSubmit={vi.fn()} />
       );
       const click = (selector: string) => act(() => {
         flushSync(() => container.querySelector<HTMLButtonElement>(selector)!.click());
       });
-      beforeEach(() => {
-        vi.useFakeTimers();
-        document.documentElement.style.setProperty("--motion-question-confirm", "160ms");
-      });
-      afterEach(() => {
-        render(<div />);
-        vi.useRealTimers();
-        document.documentElement.style.removeProperty("--motion-question-confirm");
-      });
+      const buttonByText = (text: string) =>
+        Array.from(container.querySelectorAll("button")).find(
+          (button) => button.textContent?.trim() === text,
+        );
 
-      it("shows the selected radio before advancing exactly one page", () => {
+      it("records the answer without navigating", () => {
         render(form());
         click('[role="radio"]');
         expect(container.querySelector('[role="radio"]')?.getAttribute("aria-checked")).toBe("true");
-        expect(container.querySelector(".tc-question-choice-confirm")).not.toBeNull();
         expect(container.textContent).toContain("1 of 3");
-        act(() => vi.advanceTimersByTime(159));
+        expect(container.textContent).toContain("First");
+      });
+
+      it("lets the reader change their mind before moving on", () => {
+        render(form());
+        click('[role="radio"]');
+        const radios = () => Array.from(container.querySelectorAll('[role="radio"]'));
+        act(() => { flushSync(() => (radios()[1] as HTMLButtonElement).click()); });
+        expect(radios()[0]?.getAttribute("aria-checked")).toBe("false");
+        expect(radios()[1]?.getAttribute("aria-checked")).toBe("true");
         expect(container.textContent).toContain("1 of 3");
-        act(() => vi.advanceTimersByTime(1));
+      });
+
+      it("advances only on an explicit Next", () => {
+        render(form());
+        click('[role="radio"]');
+        expect(container.textContent).toContain("1 of 3");
+        act(() => { flushSync(() => buttonByText("Next")!.click()); });
         expect(container.textContent).toContain("2 of 3");
         expect(document.activeElement?.textContent).toBe("Second");
-        act(() => vi.advanceTimersByTime(160));
-        expect(container.textContent).toContain("2 of 3");
       });
 
-      it.each(["navigation", "custom answer", "disabled", "unmount"])("cancels the pending advance on %s", (reason) => {
+      it("keeps number-key selection on the same question", () => {
         render(form());
-        click('[role="radio"]');
-        if (reason === "navigation") {
-          click('[aria-label="Next question"]');
-          click('[aria-label="Next question"]');
-        } else if (reason === "custom answer") {
-          click('#animated-First-custom');
-        } else if (reason === "disabled") {
-          render(form(true));
-          render(form(false));
-        } else {
-          render(<div>Closed</div>);
-        }
-        act(() => vi.advanceTimersByTime(160));
-        expect(container.textContent).toContain(
-          reason === "navigation" ? "3 of 3" : reason === "unmount" ? "Closed" : "1 of 3",
+        const page = container.querySelector<HTMLElement>(".tc-question-page")!;
+        act(() => {
+          flushSync(() => page.dispatchEvent(
+            new KeyboardEvent("keydown", { key: "2", bubbles: true }),
+          ));
+        });
+        expect(Array.from(container.querySelectorAll('[role="radio"]'))[1]?.getAttribute("aria-checked"))
+          .toBe("true");
+        expect(container.textContent).toContain("1 of 3");
+      });
+
+      // Selection now clears the form error, which it did not do on the last
+      // page before. A failed send has to outlive it: the answers are still
+      // unsent, so wiping the message would leave no sign of that at all.
+      it("keeps a failed send visible while the reader changes their answer", async () => {
+        const onSubmit = vi.fn().mockRejectedValue(new Error("Network unreachable"));
+        render(
+          <QuestionForm
+            id="failed-send"
+            questionSet={{
+              schema: "paperclip.question_set.v1" as const,
+              questions: [{
+                id: "only", prompt: "Only", required: true,
+                answerMode: "single_select" as const,
+                options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }],
+              }],
+            }}
+            onSubmit={onSubmit}
+          />,
         );
+        const radios = () => Array.from(container.querySelectorAll<HTMLButtonElement>('[role="radio"]'));
+        act(() => { flushSync(() => radios()[0]!.click()); });
+        act(() => { flushSync(() => buttonByText("Submit answers")!.click()); });
+        await flushAsync();
+        expect(onSubmit).toHaveBeenCalledOnce();
+        expect(container.textContent).toContain("Network unreachable");
+        act(() => { flushSync(() => radios()[1]!.click()); });
+        expect(radios()[1]?.getAttribute("aria-checked")).toBe("true");
+        expect(container.textContent).toContain("Network unreachable");
       });
 
-      it("advances immediately when the motion token is zero", () => {
-        document.documentElement.style.setProperty("--motion-question-confirm", "0ms");
-        render(form());
-        click('[role="radio"]');
-        expect(container.textContent).toContain("2 of 3");
-        expect(container.querySelector(".tc-question-choice-confirm")).toBeNull();
+      // The other half of the same rule: the one complaint a selection does
+      // answer still goes away when it is answered.
+      it("clears a missing-answer complaint once that question is answered", async () => {
+        render(
+          <QuestionForm
+            id="missing-answer"
+            questionSet={{
+              schema: "paperclip.question_set.v1" as const,
+              questions: [
+                {
+                  id: "First", prompt: "First", required: true,
+                  answerMode: "single_select" as const,
+                  options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }],
+                },
+                {
+                  id: "Second", prompt: "Second", required: false,
+                  answerMode: "single_select" as const,
+                  options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }],
+                },
+              ],
+            }}
+            onSubmit={vi.fn()}
+          />,
+        );
+        const radios = () => Array.from(container.querySelectorAll<HTMLButtonElement>('[role="radio"]'));
+        // The pagination arrow browses without validating, so the reader can
+        // reach the end with the first question still blank. Skip on the last
+        // question then sends, which is where the complaint comes from.
+        click('[aria-label="Next question"]');
+        act(() => { flushSync(() => buttonByText("Skip")!.click()); });
+        await flushAsync();
+        expect(container.textContent).toContain("Question 1 needs an answer");
+        act(() => { flushSync(() => radios()[0]!.click()); });
+        expect(container.textContent).not.toContain("Question 1 needs an answer");
       });
     });
 
@@ -2337,6 +2650,8 @@ describe("TaskChatComposer", () => {
           container.querySelectorAll<HTMLButtonElement>("button"),
         ).find((button) => button.textContent?.trim() === label);
       flushSync(() => byLabel("Staging")?.click());
+      await flushAsync();
+      flushSync(() => byLabel("Next")?.click());
       await flushAsync();
       expect(container.textContent).toContain("Anything else?");
       flushSync(() => byLabel("Skip")?.click());
@@ -2608,7 +2923,7 @@ describe("composer Stop", () => {
     const onStop = vi.fn(async () => {});
     const onAdd = vi.fn(async () => {});
     render(<TaskChatComposer workMode="standard" onAdd={onAdd} onStop={onStop} stopScope="subtree" />);
-    expect(stopButton()?.title).toBe("Stop and pause subtree");
+    expect(stopButton()?.title).toBe("Stop response");
     pressKey("Enter", { metaKey: true });
     expect(onStop).not.toHaveBeenCalled();
     expect(onAdd).not.toHaveBeenCalled();
@@ -2617,7 +2932,7 @@ describe("composer Stop", () => {
     expect(sendButton().disabled).toBe(false);
     flushSync(() => sendButton().click());
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith("Check mobile too.", undefined, undefined);
+    expect(onAdd).toHaveBeenCalledWith("Check mobile too.", undefined, undefined, undefined, expect.any(String));
     expect(onStop).not.toHaveBeenCalled();
     typeText(" \n ");
     expect(stopButton()?.disabled).toBe(false);

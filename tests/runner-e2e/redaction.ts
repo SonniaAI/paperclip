@@ -14,11 +14,27 @@ const SENSITIVE_JSON_KEY =
 
 export function normalizedSecrets(values: readonly (string | undefined)[]) {
   return [
-    ...new Set(
-      values
-        .map((value) => value?.trim())
-        .filter((value): value is string => Boolean(value)),
-    ),
+    ...new Set(values.flatMap((value) => {
+      const trimmed = value?.trim();
+      if (!trimmed) return [];
+      if (trimmed.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(trimmed) as unknown;
+          // Subscription credentials are structured JSON. A log may contain an
+          // individual token or identity rather than the whole serialized file.
+          const leaves = (value: unknown, depth = 0): string[] => {
+            if (depth > 8) return [];
+            if (typeof value === "string") return value.length >= 8 ? [value] : [];
+            if (!value || typeof value !== "object") return [];
+            return Object.entries(value).flatMap(([key, child]) => [
+              ...(key.includes("::") ? [key] : []), ...leaves(child, depth + 1),
+            ]);
+          };
+          return [trimmed, ...leaves(parsed)];
+        } catch { /* Preserve ordinary non-JSON secrets. */ }
+      }
+      return [trimmed];
+    })),
   ].sort((left, right) => right.length - left.length);
 }
 
@@ -155,6 +171,14 @@ export function assertSecretFree(
 export function isEphemeralPostgresPidFile(paperclipHome: string, file: string): boolean {
   const relative = path.relative(paperclipHome, file).split(path.sep).join("/");
   return /^instances\/[^/]+\/db\/postmaster\.pid$/.test(relative);
+}
+
+export function isEphemeralPostgresScanFile(paperclipHome: string, file: string): boolean {
+  const relative = path.relative(paperclipHome, file).split(path.sep).join("/");
+  // A relation can be unlinked during PostgreSQL shutdown/checkpoint. Existing
+  // files are always scanned; this predicate only permits ENOENT after readdir.
+  return isEphemeralPostgresPidFile(paperclipHome, file) ||
+    /^instances\/[^/]+\/db\/base\/\d+\/\d+(?:_(?:fsm|vm|init))?(?:\.\d+)?$/.test(relative);
 }
 
 export async function findSecretLeakInDirectory(

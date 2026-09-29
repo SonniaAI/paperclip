@@ -1,5 +1,6 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -19,6 +20,7 @@ import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokab
 import { budgetService } from "../../../services/budgets.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../../../services/heartbeat-policy.js";
 import { collectDispositionRepairSourceState } from "../../../services/recovery/disposition-repair.js";
+import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../../services/recovery/legacy-continuation.js";
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
 import { issueService } from "../../../services/issues.js";
@@ -106,6 +108,17 @@ const NO_REVIEW_PARTICIPANT: ReviewParticipantFacts = {
   currentParticipant: null,
 };
 
+async function readNativeReviewParticipantFacts(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; contextSnapshot: unknown;
+}): Promise<ReviewParticipantFacts | null> {
+  const review = await getNativeReviewAssignment(db, input);
+  return review ? {
+    isInReview: true, hasParticipant: true, participantIsAgent: true,
+    participantAgentId: input.agentId, currentStageType: "native_completion_review",
+    currentParticipant: { type: "agent", agentId: input.agentId, interactionId: review.interaction.id },
+  } : null;
+}
+
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
@@ -113,6 +126,7 @@ function readNonEmptyString(value: unknown): string | null {
 function classifyRetryReasonKind(retryReason: string | null): RetryReasonKind {
   if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) return "max_turn_continuation";
   if (retryReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON) return "disposition_repair";
+  if (retryReason === "ai_connection_busy") return "ai_connection_wait";
   if (retryReason === "native_safe_replacement") return "native_safe_replacement";
   return "other";
 }
@@ -274,7 +288,7 @@ export function createPostgresRunDispatchAdapter(
       runAgentId: input.agentId,
       issueId,
       retryReasonKind,
-      enforceIssueExecutionLock: retryReasonKind === "max_turn_continuation",
+      enforceIssueExecutionLock: retryReasonKind === "max_turn_continuation" || retryReasonKind === "ai_connection_wait",
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, input.contextSnapshot),
       budgetBlock: null,
       agentInvokable: true,
@@ -359,7 +373,10 @@ export function createPostgresRunDispatchAdapter(
       ]);
       facts.pendingResponse = interactions.length > 0 ? "interaction" : linkedApprovals.length > 0 ? "approval" : null;
     }
-    facts.reviewParticipant = buildReviewParticipantFacts({
+    facts.reviewParticipant = await readNativeReviewParticipantFacts(dbOrTx, {
+      companyId: input.companyId, issueId, agentId: input.agentId,
+      contextSnapshot: input.contextSnapshot,
+    }) ?? buildReviewParticipantFacts({
       isInReview: issue.status === "in_review",
       executionState: parseIssueExecutionState(issue.executionState),
     });
@@ -375,13 +392,31 @@ export function createPostgresRunDispatchAdapter(
         excludeRunId: input.runId,
         excludeWakeupRequestId: input.wakeupRequestId,
       });
+      let currentFingerprint = sourceState.fingerprint;
+      let validSource = true;
+      if (readNonEmptyString(parseObject(input.contextSnapshot.legacyDispositionEpisode).id)) {
+        // Legacy repair reserves a slot in a persisted episode. Its fingerprint
+        // identifies that episode, not the older parked-summary state snapshot.
+        // Still recheck every active/wait/ownership gate before promotion.
+        const episode = legacyDispositionEpisode({ id: input.runId, contextSnapshot: input.contextSnapshot });
+        const sourceId = readNonEmptyString(input.contextSnapshot.dispositionRepairSourceRunId)
+          ?? readNonEmptyString(input.contextSnapshot.retryOfRunId);
+        const source = sourceId ? await dbOrTx.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, sourceId), eq(heartbeatRuns.companyId, input.companyId),
+        )).limit(1).then(rows => rows[0]) : null;
+        validSource = Boolean(source && source.status === "succeeded" && source.agentId === input.agentId
+          && (source.contextSnapshot?.issueId ?? source.contextSnapshot?.taskId) === issueId
+          && legacyDispositionEpisode(source).id === episode.id
+          && episode.attempt >= 1 && episode.attempt <= episode.maxAttempts);
+        currentFingerprint = legacyDispositionFingerprint(input.companyId, issueId, input.agentId, episode.id);
+      }
       facts.dispositionRepair = {
         expectedFingerprintPresent: expectedFingerprint !== null,
-        fingerprintMatches: sourceState.fingerprint === expectedFingerprint,
+        fingerprintMatches: validSource && currentFingerprint === expectedFingerprint,
         hasActiveExecutionPath: sourceState.hasActiveExecutionPath,
         hasDurableWaitingPath: sourceState.hasDurableWaitingPath,
         expectedFingerprint,
-        currentFingerprint: sourceState.fingerprint,
+        currentFingerprint,
         durablePathReason: sourceState.durablePathReason,
       };
     }
@@ -545,11 +580,21 @@ export function createPostgresRunDispatchAdapter(
             .then((rows) => Boolean(rows[0]))
         : false;
 
+    const retryReasonKind = classifyRetryReasonKind(retryReason);
+    // Dependency edges can change after scheduled promotion without changing
+    // the displayed status. Read them again under the queued/final issue lock.
+    const readiness = issue && retryReasonKind === "native_safe_replacement"
+      ? (await issueService(dbOrTx).listDependencyReadiness(input.companyId, [issueId])).get(issueId)
+      : null;
     return {
       runId: input.runId,
       runAgentId: input.agentId,
       issueId,
-      retryReasonKind: classifyRetryReasonKind(retryReason),
+      retryReasonKind,
+      dependenciesBlocked: readiness && !readiness.isDependencyReady ? {
+        unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+        unresolvedBlockerCount: readiness.unresolvedBlockerCount,
+      } : null,
       issueFound: issue !== null,
       issueStatus: issue?.status ?? null,
       issueAssigneeAgentId: issue?.assigneeAgentId ?? null,
@@ -569,7 +614,10 @@ export function createPostgresRunDispatchAdapter(
       wakeReason,
       retryReason,
       reviewParticipant: issue
-        ? buildReviewParticipantFacts({
+        ? await readNativeReviewParticipantFacts(dbOrTx, {
+            companyId: input.companyId, issueId, agentId: input.agentId,
+            contextSnapshot: context,
+          }) ?? buildReviewParticipantFacts({
             isInReview: issue.status === "in_review",
             executionState: issue.status === "in_review" ? parseIssueExecutionState(issue.executionState) : null,
           })
@@ -897,9 +945,9 @@ export function createPostgresRunDispatchAdapter(
   async function decideCurrentRunStaleness(tx: Db, run: HeartbeatRun, now: Date) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
-    if (!issueId) return { issueId: null, decision: { stale: false as const } };
+    if (!issueId) return { issueId: null, facts: null, decision: { stale: false as const } };
     const recovery = await getExecutionBlocker(tx, run.companyId, issueId, { conversationResetCommentId: deriveCommentId(contextSnapshot) });
-    if (recovery) return { issueId, decision: { stale: true as const,
+    if (recovery) return { issueId, facts: null, decision: { stale: true as const,
       errorCode: "execution_reconciliation_required" as const, reason: recovery.nextAction,
       details: { issueId, recoveryActionId: recovery.recoveryActionId },
     } };
@@ -915,7 +963,7 @@ export function createPostgresRunDispatchAdapter(
       now,
       tx,
     );
-    return { issueId, decision: decideQueuedRunStaleness(facts, now) };
+    return { issueId, facts, decision: decideQueuedRunStaleness(facts, now) };
   }
 
   async function cancelStaleQueuedRun(
@@ -923,8 +971,21 @@ export function createPostgresRunDispatchAdapter(
   ): Promise<CancelStaleQueuedRunOutcome> {
     const cancelLockedRun = async (tx: Db, run: HeartbeatRun) => {
       if (run.status !== input.expectedStatus) return { outcome: "lost_race" as const };
-      const { issueId, decision } = await decideCurrentRunStaleness(tx, run, input.now);
-      if (!decision.stale || !issueId) return { outcome: "not_stale" as const };
+      const { issueId, facts, decision } = await decideCurrentRunStaleness(tx, run, input.now);
+      if (!decision.stale || !issueId) {
+        if (input.expectedStatus === "queued" && facts?.isInteractionWake) {
+          // Preserve the authority accepted under the issue/run locks. Later
+          // preflight reads can observe a reassignment; they must not turn an
+          // assignee comment into a non-assignee subscription-wait exception.
+          await tx.update(heartbeatRuns).set({
+            runnerProfileJson: {
+              ...parseObject(run.runnerProfileJson),
+              aiConnectionNonAssigneeCommentWake: facts.issueAssigneeAgentId !== run.agentId,
+            },
+          }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
+        }
+        return { outcome: "not_stale" as const };
+      }
       return cancelStaleRunInTx(tx, run, issueId, decision, input.expectedStatus, input.now);
     };
 

@@ -227,12 +227,15 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       enableNativeRunner: parsed.data.enableNativeRunner ?? true,
       enableManagedSandboxOnly: parsed.data.enableManagedSandboxOnly ?? false,
       enableIsolatedWorkspaces: parsed.data.enableIsolatedWorkspaces ?? false,
+      enableIsolatedWorkspacesByDefault: parsed.data.enableIsolatedWorkspacesByDefault ?? false,
       enableStreamlinedLeftNavigation: parsed.data.enableStreamlinedLeftNavigation ?? true,
       enableStreamlinedUi: parsed.data.enableStreamlinedUi ?? true,
       // Apps graduated from Experimental. Ignore historical off values while
       // continuing to accept the compatibility key in stored settings.
       enableApps: true,
+      enableMcpAggregators: true,
       enableChatConnectors: parsed.data.enableChatConnectors ?? false,
+      enableMemoryConnectors: parsed.data.enableMemoryConnectors ?? false,
       enablePipelines: parsed.data.enablePipelines ?? false,
       enableCases: parsed.data.enableCases ?? false,
       enableAgentChat: parsed.data.enableAgentChat ?? false,
@@ -269,10 +272,13 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableNativeRunner: true,
     enableManagedSandboxOnly: false,
     enableIsolatedWorkspaces: false,
+    enableIsolatedWorkspacesByDefault: false,
     enableStreamlinedLeftNavigation: true,
     enableStreamlinedUi: true,
     enableApps: true,
+    enableMcpAggregators: true,
     enableChatConnectors: false,
+    enableMemoryConnectors: false,
     enablePipelines: false,
     enableCases: false,
     enableAgentChat: false,
@@ -328,9 +334,9 @@ export function applyManagedExperimentalOverlay(
   for (const [key, value] of Object.entries(managedConfig.features) as Array<
     [ManagedExperimentalFeatureKey, boolean]
   >) {
-    // Existing Cloud stack configs may still carry enableApps. Accept the
-    // document during rollout, but never let the retired flag disable Apps.
-    if (key === "enableApps") continue;
+    // Existing Cloud stack configs may still carry retired flags. Accept the
+    // document during rollout, but never let retired flags disable Apps or MCP aggregators.
+    if (key === "enableApps" || key === "enableMcpAggregators") continue;
     next[key] = value;
     managedKeys[key] = { managed: true, managedBy: PAPERCLIP_CLOUD_MANAGED_BY };
   }

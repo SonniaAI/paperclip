@@ -271,6 +271,8 @@ export const issuesApi = {
       `/issues/${id}/stalled-review-decision`,
       data,
     ),
+  retryWorkspaceExport: (id: string, data: { actionId: string; runId: string; repairNote: string }) =>
+    api.post<{ runId: string; resultId: string; leaseId: string; status: "queued" }>(`/issues/${id}/recovery-actions/retry-workspace-export`, data),
   resolveRecoveryAction: (
     id: string,
     data: {
@@ -386,8 +388,17 @@ export const issuesApi = {
     ),
   interruptQueuedComments: (
     id: string,
-    data: { queueId: string; targetRunId: string; revision: string },
+    data: { queueId: string; targetRunId: string | null; revision: string },
   ) => api.post<IssueQueuedCommentQueue>(`/issues/${id}/queued-comments/interrupt`, data),
+  interruptLatestQueuedComments: async (id: string, expectedTargetRunId: string | null): Promise<IssueQueuedCommentQueue> => {
+    const queue = await issuesApi.getQueuedComments(id);
+    if (!queue.queueId || (queue.targetRunId && queue.targetRunId !== expectedTargetRunId)) {
+      throw new Error("The queued messages changed. Refresh and try again.");
+    }
+    return issuesApi.interruptQueuedComments(id, {
+      queueId: queue.queueId, revision: queue.revision, targetRunId: queue.targetRunId,
+    });
+  },
   steerQueuedComment: (
     id: string,
     commentId: string,

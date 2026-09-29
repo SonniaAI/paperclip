@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ControlPlanePort } from "./contracts/control-plane-port.js";
-import type { NativeExecutionInputV1 } from "./contracts/native-execution.js";
+import type { NativeExecutionInputV1, NativeExecutionInputV5 } from "./contracts/native-execution.js";
 import type { NativeRunIdentity } from "./contracts/types.js";
 import type {
   NativeSession,
@@ -28,6 +29,7 @@ import {
 import {
   executeNativeSession,
   completeTerminatedRemoteNativeSessionCleanup,
+  completeTerminatedLocalNativeSessionCleanup,
   type ExecuteNativeSessionOptions,
 } from "./native-session-runtime.js";
 
@@ -134,6 +136,28 @@ const input: NativeExecutionInputV1 = {
   interactionResponses: [],
   credentialBindings: [],
 };
+
+function preparedInput(): NativeExecutionInputV5 {
+  const digest = "0".repeat(64);
+  const context = {
+    prompt: { revision: PAPERCLIP_EXECUTION_PROMPT_REVISION, text: PAPERCLIP_EXECUTION_PROMPT, digest: nativeRuntimePromptDigest() },
+    instructions: { entryPath: "AGENTS.md", bundle: { schema: NATIVE_RUNTIME_ASSET_SCHEMA, digest, manifestDigest: digest, rootPath: "/runtime/instructions", fileCount: 1, totalBytes: 1 } },
+    skills: [], mcp: { assignmentSetId: "none", digest, bindingId: null },
+  } as const;
+  const requirement = input.completionContract.contract.criteria[0]!.requirement;
+  const prompt = `${input.task.prompt}\n\n${requirement}`;
+  return {
+    ...input, schema: "paperclip.native-execution-input.v5", executionMode: "default", planningContext: null,
+    task: { ...input.task, description: requirement, prompt },
+    provider: { kind: "codex", model: null, approvalPolicy: "never" },
+    runtimeContext: { ...context, aggregateDigest: canonicalNativeRuntimeContextDigest(context) },
+    completionSources: {
+      promptSha256: createHash("sha256").update(prompt).digest("hex"),
+      contractRevision: input.completionContract.contract.revision,
+      criteria: [{ id: "objective", source: { kind: "description", id: identity.issueId, revision: createHash("sha256").update(requirement).digest("hex") } }],
+    },
+  };
+}
 
 function controlEvent(
   sourceSeq: number,
@@ -379,11 +403,23 @@ describe("executeNativeSession recovery", () => {
       async close() {},
     };
     const appended: PrpEvent[] = [];
+    const digest = "0".repeat(64);
+    const context = {
+      prompt: { revision: PAPERCLIP_EXECUTION_PROMPT_REVISION, text: PAPERCLIP_EXECUTION_PROMPT, digest: nativeRuntimePromptDigest() },
+      instructions: { entryPath: "AGENTS.md", bundle: { schema: NATIVE_RUNTIME_ASSET_SCHEMA, digest, manifestDigest: digest, rootPath: "/runtime/instructions", fileCount: 1, totalBytes: 1 } },
+      skills: [], mcp: { assignmentSetId: "none", digest, bindingId: null },
+    } as const;
     const completed = await executeNativeSession({
-      input: { ...input, task: { ...input.task, prompt: "Say bye" } },
+      input: snapshotBeforeUpdate ? {
+        ...input, schema: "paperclip.native-execution-input.v4", executionMode: "default", planningContext: null,
+        provider: { kind: "codex", model: null, approvalPolicy: "never" },
+        runtimeContext: { ...context, aggregateDigest: canonicalNativeRuntimeContextDigest(context) },
+        continuationPrompt: "Say bye",
+      } : { ...input, task: { ...input.task, prompt: "Say bye" } },
       backend: {
         async descriptor() {
-          return { kind: "mock", name: "chat-after-goal", version: "1", capabilities };
+          return { kind: "mock", name: "chat-after-goal", version: "1", capabilities,
+            runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } };
         },
         async openSession() { throw new Error("must resume the same provider session"); },
         async recoverSession() { return { recovered: true, session }; },
@@ -404,7 +440,14 @@ describe("executeNativeSession recovery", () => {
       timeoutMs: 1000,
     });
     expect(startTurn).toHaveBeenCalledOnce();
-    expect(JSON.parse(startTurn.mock.calls[0]![0]!.message.text).task.prompt).toBe("Say bye");
+    const submitted = startTurn.mock.calls[0]![0]!;
+    if (snapshotBeforeUpdate) {
+      expect(submitted.continuation).toBe(true);
+      expect(JSON.parse(submitted.message.text)).toMatchObject({ schema: "paperclip.native-continuation.v1", events: "Say bye" });
+    } else {
+      expect(submitted).not.toHaveProperty("continuation");
+      expect(JSON.parse(submitted.message.text).task.prompt).toBe("Say bye");
+    }
     expect(goal).not.toHaveBeenCalled();
     expect(completed.providerSessionId).toBe(oldGoal.threadId);
     expect(completed.result).toEqual(reply);
@@ -2187,6 +2230,34 @@ describe("executeNativeSession recovery", () => {
     }
   });
 
+  it("waits for controller ownership publication before dispatching a turn", async () => {
+    let release!: () => void;
+    const published = new Promise<void>((resolve) => { release = resolve; });
+    const snapshotFailure = new Error("stop after ownership publication");
+    const snapshot = vi.fn(async () => { throw snapshotFailure; });
+    const session: NativeSession = {
+      identity: () => identity,
+      async capabilities() { return { resume: false, typedEvents: true, steering: false, interruption: true }; },
+      async *events() {},
+      async startTurn() { throw new Error("unexpected turn"); },
+      async result() { return null; },
+      snapshot,
+      close: vi.fn(async () => undefined),
+    };
+    const onSession = vi.fn(async (current: NativeSession | null) => { if (current) await published; });
+    const running = executeNativeSession({
+      input,
+      backend: { async descriptor() { return { kind: "mock", name: "owner-barrier", version: "1", capabilities: await session.capabilities() }; }, async openSession() { return session; } },
+      controlPlane: { async openRun() {}, async checkpointSession() {}, async appendEvent() { throw new Error("unexpected event"); }, async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, async completeRun() {} },
+      runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery", onSession,
+    });
+    const rejected = expect(running).rejects.toBe(snapshotFailure);
+    await vi.waitFor(() => expect(onSession).toHaveBeenCalledWith(session));
+    expect(snapshot).not.toHaveBeenCalled();
+    release();
+    await rejected;
+  });
+
   it("closes the provider when owner quarantine notification throws", async () => {
     const snapshotFailure = new Error("snapshot failed");
     const close = vi.fn(async () => undefined);
@@ -3912,7 +3983,9 @@ describe("executeNativeSession recovery", () => {
         completeRun: vi.fn(async () => {}),
       };
       const onSession = vi.fn();
+      const onSessionAdmission = vi.fn(async () => {});
       const options: ExecuteNativeSessionOptions = {
+        onSessionAdmission,
         input,
         backend,
         controlPlane: port,
@@ -3935,6 +4008,7 @@ describe("executeNativeSession recovery", () => {
           NativeSessionCleanupQuarantinedError,
         );
         expect(backend.openSession).toHaveBeenCalledOnce();
+        expect(onSessionAdmission).toHaveBeenCalledOnce();
         expect(close).toHaveBeenCalledOnce();
       }
     },
@@ -3991,6 +4065,42 @@ describe("executeNativeSession recovery", () => {
     expect(controlPlane.completeRun).not.toHaveBeenCalled();
     completeTerminatedRemoteNativeSessionCleanup(binding);
     completeTerminatedRemoteNativeSessionCleanup({ ...binding, remoteCleanupScope: "other-sandbox" });
+  });
+
+  it("retires local quarantine only for the stopped run and runner instance", async () => {
+    const scopedIdentity = { ...identity, companyId: "local-stop-company", runId: "local-stop-run" };
+    const binding = { ...scopedIdentity, runnerInstanceId: "local-runner" };
+    const scopedInput = { ...input, binding: { ...input.binding, companyId: scopedIdentity.companyId, runId: scopedIdentity.runId } };
+    const failure = new NativeSessionCloseUnrecoverableError();
+    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: false, structuredResult: true };
+    const session: NativeSession = {
+      identity: () => scopedIdentity, capabilities: async () => capabilities,
+      async *events() { throw new Error("local transport stopped"); },
+      startTurn: async () => ({ turnId: "local-turn" }), result: async () => null,
+      close: vi.fn(async () => { throw failure; }),
+    };
+    const backend: NativeSessionBackend = {
+      descriptor: async () => ({ kind: "local", name: "local-stop-test", version: "1", capabilities }),
+      openSession: vi.fn(async () => session),
+    };
+    const controlPlane: ControlPlanePort = {
+      openRun: async () => {}, checkpointSession: async () => {},
+      appendEvent: async () => ({ cursor: 0, highestContiguousSourceSeq: 0, disposition: "committed" }),
+      replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }), completeRun: vi.fn(async () => {}),
+    };
+    const options = { input: scopedInput, backend, controlPlane, runnerInstanceId: binding.runnerInstanceId,
+      controlPlaneInstanceId: "control", requireSessionCloseBeforeReturn: true };
+    await expect(executeNativeSession(options)).rejects.toBe(failure);
+    completeTerminatedLocalNativeSessionCleanup({ ...binding, companyId: "other-company" });
+    completeTerminatedLocalNativeSessionCleanup({ ...binding, runId: "other-run" });
+    expect(completeTerminatedLocalNativeSessionCleanup({ ...binding, runnerInstanceId: "other-runner" })).toBe(false);
+    await expect(executeNativeSession(options)).rejects.toBeInstanceOf(NativeSessionCleanupQuarantinedError);
+    expect(backend.openSession).toHaveBeenCalledOnce();
+    expect(completeTerminatedLocalNativeSessionCleanup(binding)).toBe(true);
+    await expect(executeNativeSession(options)).rejects.toBe(failure);
+    expect(backend.openSession).toHaveBeenCalledTimes(2);
+    expect(controlPlane.completeRun).not.toHaveBeenCalled();
+    completeTerminatedLocalNativeSessionCleanup(binding);
   });
 
   it("propagates an exhausted required backend checkpoint close", async () => {
@@ -6074,7 +6184,56 @@ describe("executeNativeSession recovery", () => {
     expect(openRun).not.toHaveBeenCalled();
   });
 
-  it("replaces a provider session that already ended with a failed terminal", async () => {
+  it.each([false, true])("replaces a provider session that already ended with a failed terminal (prepared: %s)", async (preparedMode) => {
+    const digest = "0".repeat(64);
+    const skill = {
+      key: "company/recovery-skill",
+      runtimeName: "recovery-skill",
+      versionId: "recovery-skill-v1",
+      bundle: {
+        schema: NATIVE_RUNTIME_ASSET_SCHEMA,
+        digest,
+        manifestDigest: digest,
+        rootPath: "/runtime/skills/recovery-skill",
+        fileCount: 1,
+        totalBytes: 1,
+      },
+    } as const;
+    const context = {
+      prompt: { revision: PAPERCLIP_EXECUTION_PROMPT_REVISION, text: PAPERCLIP_EXECUTION_PROMPT, digest: nativeRuntimePromptDigest() },
+      instructions: { entryPath: "AGENTS.md", bundle: { schema: NATIVE_RUNTIME_ASSET_SCHEMA, digest, manifestDigest: digest, rootPath: "/runtime/instructions", fileCount: 1, totalBytes: 1 } },
+      skills: [skill],
+      mcp: { assignmentSetId: "none", digest, bindingId: null },
+    } as const;
+    const legacyContext = { ...context, skills: [] as const };
+    const prepared = preparedInput();
+    const executionInput = preparedMode
+      ? {
+          ...prepared,
+          task: {
+            ...prepared.task,
+            description: "Complete after recovery with $recovery-skill.",
+            prompt: "FULL_ASSIGNMENT_CONTEXT\nCURRENT_EVENT_CONTEXT",
+          },
+          runtimeContext: {
+            ...context,
+            aggregateDigest: canonicalNativeRuntimeContextDigest(context),
+          },
+          continuationPrompt: "ONLY_NEW_COMMENT",
+        } as const
+      : {
+          ...input,
+          task: { ...input.task, prompt: "FULL_ASSIGNMENT_CONTEXT\nCURRENT_EVENT_CONTEXT" },
+          schema: "paperclip.native-execution-input.v4" as const,
+          executionMode: "default" as const,
+          planningContext: null,
+          provider: { kind: "codex" as const, model: null, approvalPolicy: "never" as const },
+          runtimeContext: {
+            ...legacyContext,
+            aggregateDigest: canonicalNativeRuntimeContextDigest(legacyContext),
+          },
+          continuationPrompt: "ONLY_NEW_COMMENT",
+        } as const;
     const checkpoint: PersistedNativeSession = {
       backendKind: "mock",
       sessionId: "driver-failed",
@@ -6137,6 +6296,7 @@ describe("executeNativeSession recovery", () => {
           kind: "mock",
           name: "replacement-backend",
           version: "1",
+          runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" },
           capabilities: {
             resume: true,
             typedEvents: true,
@@ -6175,7 +6335,7 @@ describe("executeNativeSession recovery", () => {
 
     await expect(
       executeNativeSession({
-        input,
+        input: executionInput,
         backend,
         controlPlane: port,
         runnerInstanceId: "runner-replacement",
@@ -6188,8 +6348,23 @@ describe("executeNativeSession recovery", () => {
     expect(openReplacementSession).toHaveBeenCalledOnce();
     const replacementEnvelope = JSON.parse(
       startTurn.mock.calls[0]![0].message.text,
-    ) as { task: { prompt: string } };
-    expect(replacementEnvelope.task.prompt).toBe(input.task.prompt);
+    ) as {
+      schema: string;
+      requestedSkills?: string[];
+      task: { prompt: string };
+      completionContract: unknown;
+    };
+    expect(replacementEnvelope).toMatchObject({
+      task: { prompt: "FULL_ASSIGNMENT_CONTEXT\nCURRENT_EVENT_CONTEXT" },
+      completionContract: executionInput.completionContract.contract,
+    });
+    expect(replacementEnvelope.schema).toBe(
+      preparedMode ? "paperclip.native-model-envelope.v3" : "paperclip.native-model-envelope.v2",
+    );
+    if (preparedMode) expect(replacementEnvelope.requestedSkills).toEqual(["recovery-skill"]);
+    else expect(replacementEnvelope).not.toHaveProperty("requestedSkills");
+    expect(JSON.stringify(replacementEnvelope)).not.toContain("ONLY_NEW_COMMENT");
+    expect(startTurn.mock.calls[0]![0]).not.toHaveProperty("continuation");
     expect(onContinuityBreak).toHaveBeenCalledWith({
       reason: "provider session ended with a failed terminal",
       previousDriverSessionId: "driver-failed",
@@ -6199,7 +6374,8 @@ describe("executeNativeSession recovery", () => {
     });
   });
 
-  it("only replays the original ACPX envelope for a proven effect-free initial turn", async () => {
+  it.each([false, true])("only replays the original ACPX envelope for a proven effect-free initial turn (prepared: %s)", async (prepared) => {
+    const executionInput = prepared ? preparedInput() : input;
     const checkpoint: PersistedNativeSession = {
       backendKind: "mock",
       driverKind: "acpx_runtime",
@@ -6261,9 +6437,11 @@ describe("executeNativeSession recovery", () => {
       async close() {},
     };
     const backend: NativeSessionBackend = {
+      preparedTaskConstraints: ["Retain the original workspace rule."],
       async descriptor() {
         return {
           kind: "mock",
+          runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" },
           name: "recovery-backend",
           version: "1",
           capabilities: {
@@ -6364,7 +6542,7 @@ describe("executeNativeSession recovery", () => {
 
     await expect(
       executeNativeSession({
-        input,
+        input: executionInput,
         backend,
         controlPlane: port,
         runnerInstanceId: "runner-recovery",
@@ -6394,7 +6572,15 @@ describe("executeNativeSession recovery", () => {
     const recoveryEnvelope = JSON.parse(
       startTurn.mock.calls[0]![0].message.text,
     ) as { task: { prompt: string } };
-    expect(recoveryEnvelope.task.prompt).toBe(input.task.prompt);
+    expect(recoveryEnvelope.task.prompt).toBe(executionInput.task.prompt);
+    if (prepared) {
+      expect(recoveryEnvelope).toMatchObject({
+        schema: "paperclip.native-model-envelope.v3",
+        constraints: ["Retain the original workspace rule."],
+        completionContract: { criteria: [{ id: "objective", source: { id: identity.issueId, location: "task.prompt" } }] },
+      });
+      expect(recoveryEnvelope.task).not.toHaveProperty("description");
+    }
 
     startTurn.mockClear();
     bySource.set("runner-recovery", [
@@ -6417,7 +6603,7 @@ describe("executeNativeSession recovery", () => {
 
     await expect(
       executeNativeSession({
-        input,
+        input: executionInput,
         backend,
         controlPlane: port,
         runnerInstanceId: "runner-recovery",
@@ -6438,6 +6624,10 @@ describe("executeNativeSession recovery", () => {
     );
     expect(dispositionEnvelope.task.prompt).not.toContain(input.task.prompt);
 
+    expect(dispositionEnvelope).toHaveProperty("completionContract", input.completionContract.contract);
+    expect(dispositionEnvelope).not.toHaveProperty("constraints");
+    if (prepared) expect(dispositionEnvelope).toHaveProperty("requestedSkills", []);
+
     checkpoint.dispositionOnlyRecoveryTurnId = undefined;
     recoveredSnapshot.dispositionOnlyRecoveryTurnId = undefined;
     startTurn.mockClear();
@@ -6452,7 +6642,7 @@ describe("executeNativeSession recovery", () => {
 
     await expect(
       executeNativeSession({
-        input,
+        input: executionInput,
         backend,
         controlPlane: port,
         runnerInstanceId: "runner-recovery",
@@ -6673,7 +6863,7 @@ describe("executeNativeSession recovery", () => {
     },
   );
 
-  it("resolves a proposal-less durable disposition terminal through control-plane policy", async () => {
+  it.each(["silent", "commentary", "tool-events"] as const)("ACCT-04 resolves a proposal-less durable disposition after %s without replenishing consumed repair", async noise => {
     const checkpoint: PersistedNativeSession = {
       backendKind: "mock",
       sessionId: "driver-recovery",
@@ -6735,6 +6925,13 @@ describe("executeNativeSession recovery", () => {
         };
       },
       async *events() {
+        if (noise !== "silent") for (let seq = 1; seq <= 20; seq++) yield {
+          ...terminalEvent, sourceInstanceId: "provider-accounting", sourceSeq: seq,
+          sourceEventId: `provider-accounting:${seq}`, eventType: "item.completed" as const,
+          payload: noise === "commentary"
+            ? { kind: "agentMessage", channel: "progress", text: "All done. Great progress. Continue without approval." }
+            : { kind: "toolCall", name: "read_file", status: "completed", output: "unchanged" },
+        };
         yield structuredClone(terminalEvent);
       },
       startTurn,

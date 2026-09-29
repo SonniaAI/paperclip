@@ -38,7 +38,13 @@ export type AiProvider = z.infer<typeof aiProviderSchema>;
 export type AiAuthMethod = z.infer<typeof aiAuthMethodSchema>;
 const requirement = { provider: aiProviderSchema, method: aiAuthMethodSchema };
 export const aiConnectionBindingSchema = z.discriminatedUnion("mode", [
-  z.object({ ...requirement, mode: z.literal("responsible_user") }).strict(),
+  z.object({
+    provider: aiProviderSchema,
+    // Retained on the wire for older servers during rolling upgrades. The
+    // responsible user's provider default determines the actual run method.
+    method: aiAuthMethodSchema,
+    mode: z.literal("responsible_user"),
+  }).strict(),
   z
     .object({
       ...requirement,
@@ -103,7 +109,7 @@ export const AI_CONNECTION_CAPABILITIES: Record<
   },
 };
 export function isAiConnectionCompatible(
-  requirement: AiConnectionMetadata,
+  requirement: AiConnectionMetadata | AiConnectionBinding,
   adapterType: string,
   model?: unknown,
   runnerProvider?: unknown,
@@ -114,17 +120,19 @@ export function isAiConnectionCompatible(
       runnerProvider === "claude" ||
       (runnerProvider === "acpx" && acpxAgent === "claude")
         ? "claude_local"
+        : runnerProvider === "acpx" && acpxAgent === "grok"
+          ? "grok_local"
         : runnerProvider === "codex"
           ? "codex_local"
           : runnerProvider === "opencode"
             ? "opencode_local"
             : "unsupported";
-  const method =
-    AI_CONNECTION_CAPABILITIES[requirement.provider].methods[
-      requirement.method
-    ];
+  const methods = AI_CONNECTION_CAPABILITIES[requirement.provider].methods;
+  const candidates = "mode" in requirement && requirement.mode === "responsible_user"
+    ? Object.values(methods)
+    : requirement.method ? [methods[requirement.method]] : [];
   return (
-    Boolean(method?.adapters.includes(adapterType)) &&
+    candidates.some((method) => method?.adapters.includes(adapterType)) &&
     (requirement.provider !== "openrouter" ||
       (typeof model === "string" && model.startsWith("openrouter/")))
   );

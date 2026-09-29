@@ -14,8 +14,8 @@ export type NativeToolExecutionTargetKind = "local" | "remote";
  * Persisted provider threads retain their dynamic-tool declarations. This
  * fingerprint is part of checkpoint compatibility and must change whenever
  * the server-authorized native tool definitions or advertisement policy
- * changes. The execution target is included because register_deliverable is
- * intentionally absent for remote workspaces.
+ * changes. The execution target remains part of compatibility because local and
+ * remote files use different server-bound readers.
  */
 export function nativeToolContractFingerprintForTarget(
   executionTargetKind: NativeToolExecutionTargetKind,
@@ -23,7 +23,7 @@ export function nativeToolContractFingerprintForTarget(
   return `sha256:${createHash("sha256")
     .update(
       JSON.stringify({
-        schema: "paperclip.native-tool-contract.v12",
+        schema: "paperclip.native-tool-contract.v13",
         executionTargetKind,
         advertisementPolicy: {
           // Direct provider threads retain declarations from thread/start.
@@ -32,17 +32,18 @@ export function nativeToolContractFingerprintForTarget(
           readCurrentWakeComments: "always_advertised_binding_gated.v1",
           historicalChatAttachments:
             "always_advertised_conversation_binding_gated.v1",
-          registerDeliverable: "local_workspace_only.v1",
+          registerDeliverable: "verified_local_or_remote_workspace.v2",
           readChatAttachment: "always_advertised_run_scope_local_staging.v1",
           structuredHumanInput:
             "always_advertised_run_issue_agent_binding_gated_current_task_description.v2",
-          semanticCompletion: "finish_response_wake_user_facing_summary.v3",
+          semanticCompletion: "finish_accessible_deliverable_evidence.v4",
           connectorTools: "assigned_resources_and_pinned_skill_bundle.v1",
+          ...(executionTargetKind === "remote"
+            ? { assignedMcpTools: "codex_server_gateway_prp_relay.v1" }
+            : {}),
         },
         tools: [
-          ...(executionTargetKind === "local"
-            ? [{ name: "register_deliverable", version: 1 }]
-            : []),
+          { name: "register_deliverable", version: 2 },
           {
             name: "read_current_wake_comments",
             semanticContract: "paperclip.server-current-wake-comments.v1",
@@ -221,6 +222,7 @@ export async function findNativeSessionResumeRun(
       processGroupId: heartbeatRuns.processGroupId,
       processStartedAt: heartbeatRuns.processStartedAt,
       runnerProfileJson: heartbeatRuns.runnerProfileJson,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
     })
     .from(heartbeatRuns)
     .where(
@@ -397,6 +399,22 @@ export function buildNativeExecutionWithCheckpoint(input: {
     normalizedSessionId: input.normalizedSessionId,
     resumedSession: input.previousRun !== null,
   });
+  // A presentation-only upgrade must not rotate a healthy provider session or
+  // lose a durable goal. Keep its v4/v5 format until that session naturally ends.
+  // All ordinary identity, workspace, provider, tool and recovery checks still apply.
+  if (input.previousRun && (execution.schema === "paperclip.native-execution-input.v4" || execution.schema === "paperclip.native-execution-input.v5")) {
+    const previousSchema = record(record(input.previousRun.runnerProfileJson).nativeExecutionInput).schema;
+    if ((previousSchema === "paperclip.native-execution-input.v4" || previousSchema === "paperclip.native-execution-input.v5") && previousSchema !== execution.schema) {
+      const { completionSources: _sources, ...common } = execution as typeof execution & { completionSources?: unknown };
+      const retainedFormat = parseNativeExecutionInput({ ...common, schema: previousSchema });
+      const retainedCheckpoint = rebindNativeSessionCheckpoint({
+        previousRun: input.previousRun,
+        currentExecution: retainedFormat,
+        executionTargetKind: input.executionTargetKind,
+      });
+      if (retainedCheckpoint) return { execution: retainedFormat, checkpoint: retainedCheckpoint, normalizedSessionId: input.normalizedSessionId };
+    }
+  }
   const checkpoint = input.previousRun
     ? rebindNativeSessionCheckpoint({
         previousRun: input.previousRun,

@@ -132,6 +132,7 @@ conditions before model disposition:
 | --- | --- | --- |
 | Issue is already `done` or `cancelled` | Preserve | `terminal_status_preserved` |
 | Workspace finalization failed | Preserve | Record a retryable finalization error |
+| Run performs a named native completion review | Preserve | The recorded review decision controls the child; unresolved review records a reviewer recovery action |
 | Run was cancelled | Preserve | Release run resources |
 | Run failed | Preserve | Schedule recovery |
 | Approval, interaction, or execution stage is pending | `in_review` | Materialize/bind the governance gate and notify its owner |
@@ -213,7 +214,10 @@ commit, and retryable or terminal failure.
 
 Examples:
 
-- a workspace-finalization failure preserves the claim and records a retryable
+- an unsafe workspace archive triggers one automatic export of confined entries,
+  omitting unsafe links; if it remains unsafe, discard the export and settle the saved
+  result with an informational run-log entry and no task warning or repair action;
+- other workspace-finalization failures preserve the claim and record a retryable
   error rather than falsely completing the issue;
 - a failed provider run preserves partial evidence and schedules recovery;
 - a status-version race causes bounded reassessment against current issue
@@ -311,3 +315,46 @@ run's result, with the same task status/version and completion contract and no
 newer execution owner. It applies normal governance and dependency checks and
 appends a decision; it never marks every affected task done blindly. A persisted
 withdrawal marker makes restart between cleanup and reassessment retryable.
+
+
+### Agent review handoff
+
+A review request and its next action must be saved together. For a native
+completion review addressed to an agent, the status transaction saves both the
+review card and one durable wake for that agent. The wake identifies the card
+and the status decision. Retrying the transaction does not create another wake.
+
+The reviewer runs on the child task, even when the reviewer's own parent task
+is blocked on that child. The worker remains the child task's assignee. This
+review role gives access to the child context, history, and documents, plus
+`resolve_review`. It does not give access to ordinary task mutation tools.
+The usual company, invokability, budget, and workspace gates still apply.
+Human-only requests and governed actions do not acquire this review role.
+
+This restriction applies to Paperclip tools. It is not a read-only filesystem
+boundary. The reviewer retains the configured agent and environment permissions,
+including the ability to run tests and create temporary files. An operator who
+needs filesystem isolation must configure it in the execution environment.
+The review role does not raise the provider permission mode or bypass a sandbox.
+
+Admission claims the reviewer run, its wake, and the child execution lock in
+one transaction. If another run holds the lock, the reviewer stays queued.
+The provider does not start without this claim.
+
+`resolve_review` accepts or rejects the one card assigned to the run. Rejection
+requires specific requested changes. The server checks the reviewer, report,
+and current task version again before it accepts a decision. It also checks that
+the acting run is running, holds the execution lock, and names this exact card
+and decision. Another run for the same agent cannot resolve the card. An old or
+reassigned review does not grant access to newer work.
+
+The final required acceptance completes the child through the existing review
+resolution path and makes its blocked dependents eligible to run. Rejection
+returns the requested changes to the worker. A reviewer must record that decision
+before calling `paperclip_finish`. Finishing the review run cannot turn rejected
+work into Done. If the reviewer cannot act, `paperclip_block` preserves the task
+and records a recovery action for the reviewer without an automatic retry loop.
+
+Both Codex and ACPX providers wait for server completion feedback before their
+terminal tool call succeeds. A rejected completion report stays correctable in
+the same provider turn. The runner does not latch it as an accepted result.

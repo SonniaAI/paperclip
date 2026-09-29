@@ -1,7 +1,8 @@
+import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -20,6 +21,8 @@ export function legacyExecutionNeedsReconciliation(
     !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
   )
     return false;
+  // A fresh model turn cannot repair or verify unrestored files.
+  if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive") return true;
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;
@@ -31,10 +34,17 @@ export function legacyExecutionNeedsReconciliation(
       && evidence.providerStopped === true && evidence.sessionPreserved === true
       && evidence.actionOutcomes === "settled"
       && (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged") return false;
-  // Waiting for a live workspace holder precedes provider execution. It is a
-  // resource wait, not a failed provider attempt or permission to replay work.
+  // Waiting for a subscription or workspace precedes provider execution. It is
+  // a resource wait, not a failed provider attempt or permission to replay work.
+  if (run.status === "cancelled" && run.errorCode === "ai_connection_busy" &&
+      evidence?.kind === "ai_connection_wait" && evidence.providerWorkStarted === false) return false;
   if (run.status === "cancelled" && run.errorCode === "workspace_busy" &&
       evidence?.kind === "workspace_wait" && evidence.providerWorkStarted === false) return false;
+  // Setup owns the bounded retry budget for temporary workspace scans. Its
+  // exhaustion needs workspace repair, not reconciliation of provider actions
+  // that the bootstrap evidence proves never started. Keep unknown outcomes held.
+  if ((run.errorCode === "workspace_git_scan_timeout" || run.errorCode === "workspace_git_scan_saturated") &&
+      evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false
@@ -109,13 +119,21 @@ export async function terminalizeLegacyExecution(input: {
       !["done", "cancelled"].includes(task.status)
     ) {
       // Periodic stranded-work checks may revisit this terminal run before its
-      // reconciled continuation is dispatched. Preserve the recorded decision.
+      // reconciled continuation is dispatched. Preserve the recorded decision
+      // and an existing unsafe-workspace hold instead of creating another one.
       const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
         .from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.companyId, run.companyId),
           eq(issueRecoveryActions.sourceIssueId, task.id),
           eq(issueRecoveryActions.status, "resolved"),
-          sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+          or(
+            sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+            and(
+              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+              sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+            ),
+          ),
         )).limit(1);
       if (reconciled) return updated;
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
@@ -130,11 +148,13 @@ export async function terminalizeLegacyExecution(input: {
           runId: run.id,
           ...(isCurrentReviewer ? { reviewParticipantAgentId: run.agentId } : {}),
           originalFailureCode: updated.errorCode,
+          ...(hasWorkspaceRestoreFailure(updated.resultJson) ? { workspaceRestoreFailure: updated.resultJson!.workspaceRestoreFailure } : {}),
           adapterRecovery: "unsupported_or_unknown",
           attempt: executionFailureRetryCount(run) + 1,
         },
-        nextAction:
-          "Inspect the stopped provider and recorded actions, then reconcile their outcomes before continuing. This adapter has not established a safe resume checkpoint.",
+        nextAction: hasWorkspaceRestoreFailure(updated.resultJson)
+          ? "Verify safe workspace staging or repair, then reconcile the stopped run before continuing. Saved work and approval decisions remain in force."
+          : "Inspect the stopped provider and recorded actions, then reconcile their outcomes before continuing. This adapter has not established a safe resume checkpoint.",
         maxAttempts: 3,
         wakePolicy: null,
         supersedeOnIdentityChange: true,
