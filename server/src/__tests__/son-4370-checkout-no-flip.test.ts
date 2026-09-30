@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, createDb, issues } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { issueService } from "../services/issues.js";
 
@@ -67,6 +67,16 @@ describe("SON-4370 checkout records the run without flipping a parked blocked ca
     const svc = issueService(db);
     const runId = randomUUID();
     const before = new Date();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      responsibleUserId: "responsible-user",
+      createdAt: before,
+      startedAt: before,
+    });
     const checkedOut = await svc.checkout(
       blockedIssueId,
       agentId,
@@ -99,6 +109,16 @@ describe("SON-4370 checkout records the run without flipping a parked blocked ca
     const svc = issueService(db);
     const runId = randomUUID();
     const before = new Date();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      responsibleUserId: "responsible-user",
+      createdAt: before,
+      startedAt: before,
+    });
     const checkedOut = await svc.checkout(
       controlIssueId,
       agentId,

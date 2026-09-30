@@ -375,7 +375,10 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       actorId: agentId,
       agentId,
       runId: progressRunId,
-      action: "issue.comment_added",
+      // SON-4370: a run-authored comment is no longer issue-visible
+      // progress (keep-alive comments cannot reset the no-progress
+      // streak), so progress here is a real board mutation.
+      action: "issue.updated",
       entityType: "issue",
       entityId: issueId,
       createdAt: new Date(Date.now() - 11_000),

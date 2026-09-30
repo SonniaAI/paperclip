@@ -423,6 +423,7 @@ export function decideScheduledRetryGate(
   // already started may finish its own infrastructure retry.
   if (
     facts.issueStatus === "blocked" &&
+    facts.retryReasonKind !== "max_turn_continuation" &&
     facts.unblockingEventPresent !== true &&
     facts.retryRecoversRunLifecycle !== true
   ) {
@@ -645,6 +646,7 @@ export function decideQueuedRunStaleness(
     );
   if (
     facts.issueStatus === "blocked" &&
+    facts.retryReasonKind !== "max_turn_continuation" &&
     !unblockingEvent &&
     facts.retryRecoversRunLifecycle !== true
   ) {

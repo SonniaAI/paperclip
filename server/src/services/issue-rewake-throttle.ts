@@ -100,6 +100,12 @@ export const ISSUE_PROGRESS_ACTIVITY_ACTIONS: string[] = [
  */
 export const ISSUE_NEW_INPUT_ACTIVITY_ACTIONS: string[] = [
   ...ISSUE_PROGRESS_ACTIVITY_ACTIONS,
+  // SON-4370: comments are deliberately absent from the progress set above
+  // (a run-authored keep-alive comment is not progress) but remain new
+  // external input — a board comment on the issue must still admit the next
+  // wake (AC2). The agent-authored exclusion for agent comment wakes is
+  // applied by the caller's query, not by this set.
+  "issue.comment_added",
   "issue.thread_interaction_accepted",
   "issue.thread_interaction_answered",
   "issue.thread_interaction_item_verdicts_submitted",
