@@ -5,6 +5,8 @@
 // then packs the result into a facts object. This file only branches on
 // that facts object; it never queries a database or reads the clock.
 
+import { hasIssueUnblockingEvent } from "./wake-context.js";
+
 /** The retry reason a run carries, reduced to the kinds a gate cares about. */
 export type RetryReasonKind =
   | "max_turn_continuation"
@@ -416,27 +418,6 @@ export function decideScheduledRetryGate(
       details: { issueId: facts.issueId } };
   }
 
-  // SON-4370: parked `blocked` cards are inert to auto re-dispatch. Only an
-  // unblocking event (new comment/interaction, status or assignee change,
-  // explicit manual dispatch, or a wake naming the issue) may re-dispatch.
-  // Bounded transient lifecycle recovery is not re-dispatch: a run that
-  // already started may finish its own infrastructure retry.
-  if (
-    facts.issueStatus === "blocked" &&
-    facts.retryReasonKind !== "max_turn_continuation" &&
-    facts.unblockingEventPresent !== true &&
-    facts.retryRecoversRunLifecycle !== true
-  ) {
-    return {
-      allowed: false,
-      issueId: facts.issueId,
-      errorCode: "issue_blocked",
-      reason:
-        "Scheduled retry suppressed because the issue is parked blocked and no unblocking event has occurred (new comment/interaction, status or assignee change, explicit dispatch, or a wake naming the issue)",
-      details: { issueId: facts.issueId, currentStatus: facts.issueStatus },
-    };
-  }
-
   if (facts.retryReasonKind === "native_safe_replacement" &&
       [facts.issueExecutionRunId, facts.issueCheckoutRunId].some(id => id != null && id !== facts.runId)) {
     return { allowed: false, issueId: facts.issueId, errorCode: "issue_execution_lock_changed",
@@ -546,6 +527,28 @@ export function decideScheduledRetryGate(
     };
   }
 
+  // SON-4370: parked `blocked` cards are inert to auto re-dispatch. Only an
+  // unblocking event (new comment/interaction, status or assignee change,
+  // explicit manual dispatch, or a wake naming the issue) may re-dispatch.
+  // Dependency readiness is checked first so a real dependency blocker keeps
+  // its specific suppression reason. Bounded transient lifecycle recovery is
+  // not re-dispatch: a started run may finish its own infrastructure retry.
+  if (
+    facts.issueStatus === "blocked" &&
+    facts.retryReasonKind !== "max_turn_continuation" &&
+    facts.unblockingEventPresent !== true &&
+    facts.retryRecoversRunLifecycle !== true
+  ) {
+    return {
+      allowed: false,
+      issueId: facts.issueId,
+      errorCode: "issue_blocked",
+      reason:
+        "Scheduled retry suppressed because the issue is parked blocked and no unblocking event has occurred (new comment/interaction, status or assignee change, explicit manual dispatch, or a wake naming the issue)",
+      details: { issueId: facts.issueId, currentStatus: facts.issueStatus },
+    };
+  }
+
   if (facts.pendingResponse) {
     return {
       allowed: false,
@@ -583,7 +586,14 @@ export function decideQueuedRunStaleness(
       requiresInProgress: facts.issueStatus !== "in_review",
       terminalBypass: true,
     });
-    if (earlyStatus === "not_in_progress") {
+    const explicitlyUnblockedParkedInteraction =
+      facts.issueStatus === "blocked" &&
+      facts.isResolvedInteractionContinuation &&
+      !facts.isConnectionContinuation;
+    if (
+      earlyStatus === "not_in_progress" &&
+      !explicitlyUnblockedParkedInteraction
+    ) {
       return {
         stale: true,
         errorCode: "issue_not_in_progress",
@@ -637,12 +647,13 @@ export function decideQueuedRunStaleness(
   // interaction continuation, or an event the caller folded into
   // unblockingEventPresent.
   const unblockingEvent =
-    facts.unblockingEventPresent ??
+    facts.unblockingEventPresent === true ||
     Boolean(
       facts.resumeIntent ||
         facts.wakeCommentIdPresent ||
         facts.isInteractionWake ||
-        facts.isResolvedInteractionContinuation,
+        facts.isResolvedInteractionContinuation ||
+        hasIssueUnblockingEvent({ wakeReason: facts.wakeReason }),
     );
   if (
     facts.issueStatus === "blocked" &&

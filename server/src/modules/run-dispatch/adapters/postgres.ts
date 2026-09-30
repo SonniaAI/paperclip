@@ -50,6 +50,7 @@ import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   allowsIssueInteractionWake,
   deriveCommentId,
+  hasIssueUnblockingEvent,
   isNonAssigneeWorkspaceBusyRetry,
   isResolvedInteractionContinuationWakeContext,
 } from "../domain/wake-context.js";
@@ -294,6 +295,7 @@ export function createPostgresRunDispatchAdapter(
       issueId,
       retryReasonKind,
       retryRecoversRunLifecycle: isRunLifecycleRetryReason(retryReason),
+      unblockingEventPresent: hasIssueUnblockingEvent(input.contextSnapshot),
       enforceIssueExecutionLock: retryReasonKind === "max_turn_continuation" || retryReasonKind === "ai_connection_wait",
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, input.contextSnapshot),
       budgetBlock: null,
@@ -310,7 +312,21 @@ export function createPostgresRunDispatchAdapter(
       dependenciesBlocked: null,
       dispositionRepair: null,
     };
-    const isBlocked = () => !decideScheduledRetryGate(facts, now).allowed;
+    const isBlockedBeforeDependencies = () => {
+      const decision = decideScheduledRetryGate(facts, now);
+      // A generic parked-blocked decision must wait until dependency readiness
+      // is loaded so a still-unresolved dependency reports its specific cause.
+      // Native safe replacements keep their earlier, explicit blocked result.
+      if (
+        !decision.allowed &&
+        decision.errorCode === "issue_blocked" &&
+        facts.issueStatus === "blocked" &&
+        facts.retryReasonKind !== "native_safe_replacement"
+      ) {
+        return false;
+      }
+      return !decision.allowed;
+    };
 
     const budgetBlock = await budgetsForRead.getInvocationBlock(input.companyId, input.agentId, {
       issueId,
@@ -426,13 +442,13 @@ export function createPostgresRunDispatchAdapter(
         durablePathReason: sourceState.durablePathReason,
       };
     }
-    if (isBlocked()) return { agentFound: true, facts };
+    if (isBlockedBeforeDependencies()) return { agentFound: true, facts };
 
     const activePauseHold = await treeControlForRead.getActivePauseHoldGate(input.companyId, issueId);
     facts.activePauseHold = activePauseHold
       ? { holdId: activePauseHold.holdId, rootIssueId: activePauseHold.rootIssueId }
       : null;
-    if (isBlocked()) return { agentFound: true, facts };
+    if (isBlockedBeforeDependencies()) return { agentFound: true, facts };
 
     const dependencyReadiness = await issuesSvcForRead.listDependencyReadiness(input.companyId, [issueId]);
     const readiness = dependencyReadiness.get(issueId);
@@ -619,6 +635,7 @@ export function createPostgresRunDispatchAdapter(
         companyId: input.companyId, issueId, agentId: input.agentId,
         reason: wakeReason, contextSnapshot: context,
       }),
+      unblockingEventPresent: hasIssueUnblockingEvent(context),
       continuationParkApplies,
       continuationParksExecutor,
       continuationSummaryBody,
