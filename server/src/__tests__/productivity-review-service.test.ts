@@ -18,6 +18,9 @@ import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 import {
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+  DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_HOURLY,
+  DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_STREAK_RUNS,
+  DEFAULT_PRODUCTIVITY_REVIEW_LIVENESS_BLOCKED_CONSECUTIVE_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
@@ -158,6 +161,68 @@ describeEmbeddedPostgres("productivity review service", () => {
     }
 
     return runs;
+  }
+
+  // SON-1612-C: flexible run seeder for continuation-scope / material-action
+  // detector cases (per-run status, liveness, nextAction, wake/retry reason).
+  async function insertContinuationRuns(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    now: Date;
+    runs: Array<{
+      ageMinutes: number;
+      status?: (typeof heartbeatRuns.$inferInsert)["status"];
+      livenessState?: string | null;
+      nextAction?: string | null;
+      wakeReason?: string | null;
+      retryReason?: string | null;
+      comment?: boolean;
+    }>;
+  }) {
+    const rows: Array<typeof heartbeatRuns.$inferInsert> = [];
+    for (const spec of input.runs) {
+      const runId = randomUUID();
+      const createdAt = new Date(input.now.getTime() - spec.ageMinutes * 60_000);
+      const contextSnapshot: Record<string, unknown> = {
+        issueId: input.issueId,
+        taskId: input.issueId,
+      };
+      if (spec.wakeReason) contextSnapshot.wakeReason = spec.wakeReason;
+      if (spec.retryReason) contextSnapshot.retryReason = spec.retryReason;
+      rows.push({
+        id: runId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        status: spec.status ?? "no_op",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt: createdAt,
+        finishedAt: new Date(createdAt.getTime() + 30_000),
+        contextSnapshot,
+        livenessState: spec.livenessState ?? null,
+        nextAction: spec.nextAction ?? null,
+        createdAt,
+        updatedAt: createdAt,
+      });
+    }
+    await db.insert(heartbeatRuns).values(rows);
+
+    const commentedRows = rows.filter((_, index) => input.runs[index]?.comment);
+    if (commentedRows.length > 0) {
+      await db.insert(issueComments).values(
+        commentedRows.map((run, index) => ({
+          companyId: input.companyId,
+          issueId: input.issueId,
+          authorAgentId: input.agentId,
+          createdByRunId: run.id,
+          body: `Tick update ${index}`,
+          createdAt: run.createdAt as Date,
+          updatedAt: run.createdAt as Date,
+        })),
+      );
+    }
+    return rows;
   }
 
   async function listProductivityReviews(companyId: string) {
@@ -758,5 +823,165 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.failed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  it("fires a no-material review for a comment-only continuation loop even though every run posts a comment", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertContinuationRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      now,
+      runs: Array.from({ length: DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_HOURLY }, (_, index) => ({
+        ageMinutes: 5 + index * 5,
+        status: "no_op" as const,
+        livenessState: "blocked",
+        wakeReason: "issue_continuation_needed",
+        comment: true,
+      })),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_material_streak`");
+    expect(review?.description).toContain(
+      `${DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_HOURLY} material-less continuation runs in 1h`,
+    );
+  });
+
+  it("fires the no-material streak at ten continuation runs even when hourly churn stays below the cap", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertContinuationRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      now,
+      runs: Array.from({ length: DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_STREAK_RUNS }, (_, index) => ({
+        ageMinutes: 20 + index * 20,
+        status: "no_op" as const,
+        livenessState: "blocked",
+        wakeReason: "issue_continuation_needed",
+        comment: true,
+      })),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_material_streak`");
+    expect(review?.description).toContain(
+      `${DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_STREAK_RUNS} consecutive continuation runs without a material action`,
+    );
+  });
+
+  it("fires on three consecutive liveness-blocked continuation runs within one hour", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertContinuationRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      now,
+      runs: Array.from({ length: DEFAULT_PRODUCTIVITY_REVIEW_LIVENESS_BLOCKED_CONSECUTIVE_RUNS }, (_, index) => ({
+        ageMinutes: 10 + index * 10,
+        status: "succeeded" as const,
+        livenessState: "blocked",
+        wakeReason: "issue_monitor_due",
+        comment: true,
+      })),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_material_streak`");
+    expect(review?.description).toContain(
+      `${DEFAULT_PRODUCTIVITY_REVIEW_LIVENESS_BLOCKED_CONSECUTIVE_RUNS} consecutive liveness-blocked continuations within 1h`,
+    );
+  });
+
+  it("resets the no-material streak when a run performs a material action", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertContinuationRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      now,
+      runs: [
+        ...Array.from({ length: 5 }, (_, index) => ({
+          ageMinutes: 5 + index * 5,
+          status: "no_op" as const,
+          livenessState: "blocked",
+          wakeReason: "issue_continuation_needed",
+          comment: true,
+        })),
+        {
+          ageMinutes: 30,
+          status: "succeeded" as const,
+          livenessState: "advanced",
+          wakeReason: "issue_continuation_needed",
+          comment: true,
+        },
+        ...Array.from({ length: 5 }, (_, index) => ({
+          ageMinutes: 70 + index * 10,
+          status: "no_op" as const,
+          livenessState: "blocked",
+          wakeReason: "issue_continuation_needed",
+          comment: true,
+        })),
+      ],
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("fires on repeated self-reported no-material-action next actions", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertContinuationRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      now,
+      runs: [15, 30, 45].map((ageMinutes) => ({
+        ageMinutes,
+        status: "succeeded" as const,
+        livenessState: "needs_followup",
+        nextAction: "No material action this run; waiting on external review.",
+        comment: true,
+      })),
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_action_self_report`");
+    expect(review?.description).toContain('3 runs in 1h / 3 runs in 6h self-reported "no material action"');
   });
 });

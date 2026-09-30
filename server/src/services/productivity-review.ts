@@ -24,6 +24,13 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS = 6;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY = 10;
 export const DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS = 30;
+// SON-1612-C: material-action anti-gaming thresholds. Liveness passes and
+// state transitions are material; comments are NOT.
+export const DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_STREAK_RUNS = 10;
+export const DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_HOURLY = 6;
+export const DEFAULT_PRODUCTIVITY_REVIEW_LIVENESS_BLOCKED_CONSECUTIVE_RUNS = 3;
+export const DEFAULT_PRODUCTIVITY_REVIEW_NO_ACTION_SELF_REPORT_HOURLY = 3;
+export const DEFAULT_PRODUCTIVITY_REVIEW_NO_ACTION_SELF_REPORT_SIX_HOURS = 6;
 export const DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS = 6 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
@@ -31,7 +38,10 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 100
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
 
-const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+// SON-1612-C: `no_op` MUST stay in the terminal set — the original detector
+// missed every no_op continuation run, so all streaks stayed at zero while
+// comment-only loops ran (SON-1309 recurrence).
+const TERMINAL_RUN_STATUSES = ["succeeded", "no_op", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
@@ -46,14 +56,29 @@ type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type ProductivityRunSample = Pick<
   HeartbeatRunRow,
   "id" | "agentId" | "status" | "livenessState" | "createdAt" | "nextAction" | "usageJson"
->;
-type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
+> & {
+  // SON-1612-C: continuation scoping for the material-action streak (SQL
+  // field reads; not full-row detoasts).
+  wakeReason: string | null;
+  retryReason: string | null;
+};
+type ProductivityReviewTrigger =
+  | "no_material_streak"
+  | "no_action_self_report"
+  | "no_comment_streak"
+  | "long_active_duration"
+  | "high_churn";
 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
   longActiveMs: number;
   highChurnHourly: number;
   highChurnSixHours: number;
+  noMaterialStreakRuns: number;
+  noMaterialHourly: number;
+  livenessBlockedConsecutiveRuns: number;
+  noActionSelfReportHourly: number;
+  noActionSelfReportSixHours: number;
   resolvedSnoozeMs: number;
   refreshIntervalMs: number;
   maxRefreshComments: number;
@@ -68,6 +93,11 @@ type ProductivityReviewEvidence = {
   sourceIssue: IssueRow;
   sourceAgent: AgentRow;
   noCommentStreak: number;
+  noMaterialStreak: number;
+  materialLessRunCountLastHour: number;
+  consecutiveLivenessBlocked: number;
+  noActionSelfReportCountLastHour: number;
+  noActionSelfReportCountLastSixHours: number;
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
@@ -109,6 +139,62 @@ function issueRunScopeSql(issueId: string) {
     or ${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueId}
     or ${heartbeatRuns.contextSnapshot}->>'taskKey' = ${issueId}
   )`;
+}
+
+// SON-1612-C: continuation-scoped wake/retry reasons — mirrors the recovery
+// A-gate scope (recovery/service.ts isNoMaterialContinuationRun).
+const CONTINUATION_SCOPED_WAKE_REASONS = new Set([
+  "issue_continuation_needed",
+  "issue_monitor_due",
+  "run_liveness_continuation",
+]);
+
+function isContinuationScopedRunSample(run: {
+  wakeReason: string | null;
+  retryReason: string | null;
+}) {
+  return (
+    run.retryReason === "issue_continuation_needed" ||
+    CONTINUATION_SCOPED_WAKE_REASONS.has(run.wakeReason ?? "")
+  );
+}
+
+/**
+ * SON-1612-C: mirror of the recovery-side A-gate predicate so the detector
+ * and the requeue gate cannot drift. A run is material-less when it is
+ * continuation-scoped AND recorded as `no_op` or classified liveness-blocked.
+ * Per-tick comments never reset this streak — only a material run does.
+ */
+function isNoMaterialContinuationRunSample(run: {
+  status: string;
+  livenessState: string | null;
+  wakeReason: string | null;
+  retryReason: string | null;
+}) {
+  if (!isContinuationScopedRunSample(run)) return false;
+  if (run.status === "no_op") return true;
+  return run.status === "succeeded" && run.livenessState === "blocked";
+}
+
+function isLivenessBlockedContinuationRunSample(run: {
+  status: string;
+  livenessState: string | null;
+  wakeReason: string | null;
+  retryReason: string | null;
+}) {
+  return (
+    isContinuationScopedRunSample(run) &&
+    run.status === "succeeded" &&
+    run.livenessState === "blocked"
+  );
+}
+
+// SON-1612-C: self-reported "no material action" next-actions (SON-1309
+// logged 20+ hits with no detector firing).
+const NO_ACTION_SELF_REPORT_PATTERN = /no[\s_-]*material[\s_-]*action/i;
+
+function isNoActionSelfReportSample(run: { nextAction: string | null }) {
+  return run.nextAction !== null && NO_ACTION_SELF_REPORT_PATTERN.test(run.nextAction);
 }
 
 function msToHuman(ms: number | null) {
@@ -163,6 +249,26 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
       overrides?.highChurnSixHours ?? DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
       DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
     ),
+    noMaterialStreakRuns: readPositiveInteger(
+      overrides?.noMaterialStreakRuns ?? DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_STREAK_RUNS,
+      DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_STREAK_RUNS,
+    ),
+    noMaterialHourly: readPositiveInteger(
+      overrides?.noMaterialHourly ?? DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_HOURLY,
+      DEFAULT_PRODUCTIVITY_REVIEW_NO_MATERIAL_HOURLY,
+    ),
+    livenessBlockedConsecutiveRuns: readPositiveInteger(
+      overrides?.livenessBlockedConsecutiveRuns ?? DEFAULT_PRODUCTIVITY_REVIEW_LIVENESS_BLOCKED_CONSECUTIVE_RUNS,
+      DEFAULT_PRODUCTIVITY_REVIEW_LIVENESS_BLOCKED_CONSECUTIVE_RUNS,
+    ),
+    noActionSelfReportHourly: readPositiveInteger(
+      overrides?.noActionSelfReportHourly ?? DEFAULT_PRODUCTIVITY_REVIEW_NO_ACTION_SELF_REPORT_HOURLY,
+      DEFAULT_PRODUCTIVITY_REVIEW_NO_ACTION_SELF_REPORT_HOURLY,
+    ),
+    noActionSelfReportSixHours: readPositiveInteger(
+      overrides?.noActionSelfReportSixHours ?? DEFAULT_PRODUCTIVITY_REVIEW_NO_ACTION_SELF_REPORT_SIX_HOURS,
+      DEFAULT_PRODUCTIVITY_REVIEW_NO_ACTION_SELF_REPORT_SIX_HOURS,
+    ),
     resolvedSnoozeMs: readPositiveInteger(
       overrides?.resolvedSnoozeMs ?? DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
       DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
@@ -191,10 +297,16 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
 }
 
 function choosePrimaryTrigger(input: {
+  noMaterial: boolean;
+  noActionSelfReport: boolean;
   noComment: boolean;
   longActive: boolean;
   highChurn: boolean;
 }): ProductivityReviewTrigger | null {
+  // SON-1612-C: the anti-gaming triggers outrank the legacy signals they
+  // supersede; the legacy triggers stay as secondary evidence.
+  if (input.noMaterial) return "no_material_streak";
+  if (input.noActionSelfReport) return "no_action_self_report";
   if (input.noComment) return "no_comment_streak";
   if (input.highChurn) return "high_churn";
   if (input.longActive) return "long_active_duration";
@@ -202,10 +314,17 @@ function choosePrimaryTrigger(input: {
 }
 
 function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
-  return trigger === "no_comment_streak" || trigger === "high_churn";
+  return (
+    trigger === "no_material_streak" ||
+    trigger === "no_action_self_report" ||
+    trigger === "no_comment_streak" ||
+    trigger === "high_churn"
+  );
 }
 
 function formatTrigger(trigger: ProductivityReviewTrigger) {
+  if (trigger === "no_material_streak") return "No-material-action streak";
+  if (trigger === "no_action_self_report") return "Repeated no-action self-reports";
   if (trigger === "no_comment_streak") return "No-comment streak";
   if (trigger === "high_churn") return "High churn";
   return "Long active duration";
@@ -458,6 +577,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         createdAt: heartbeatRuns.createdAt,
         nextAction: heartbeatRuns.nextAction,
         usageJson: heartbeatRuns.usageJson,
+        wakeReason: sql<string | null>`${heartbeatRuns.contextSnapshot}->>'wakeReason'`,
+        retryReason: sql<string | null>`${heartbeatRuns.contextSnapshot}->>'retryReason'`,
       })
       .from(heartbeatRuns)
       .where(
@@ -496,6 +617,35 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       if (commentRunIds.has(run.id)) break;
       noCommentStreak += 1;
     }
+
+    // SON-1612-C: material-action streak. Per-tick comments do NOT reset it;
+    // only a material run (liveness pass / state transition) does. `no_op`
+    // runs participate now that the terminal set includes them.
+    let noMaterialStreak = 0;
+    for (const run of terminalRuns) {
+      if (!isNoMaterialContinuationRunSample(run)) break;
+      noMaterialStreak += 1;
+    }
+    const materialLessRunCountLastHour = terminalRuns.filter(
+      (run) => run.createdAt.getTime() >= oneHourAgo.getTime() && isNoMaterialContinuationRunSample(run),
+    ).length;
+    let consecutiveLivenessBlocked = 0;
+    let livenessBlockedStreakOldestAt: Date | null = null;
+    for (const run of terminalRuns) {
+      if (!isLivenessBlockedContinuationRunSample(run)) break;
+      consecutiveLivenessBlocked += 1;
+      livenessBlockedStreakOldestAt = run.createdAt;
+    }
+    const livenessBlockedStreakWithinHour =
+      consecutiveLivenessBlocked > 0 &&
+      livenessBlockedStreakOldestAt !== null &&
+      now.getTime() - livenessBlockedStreakOldestAt.getTime() <= 60 * 60 * 1000;
+    const noActionSelfReportCountLastHour = terminalRuns.filter(
+      (run) => run.createdAt.getTime() >= oneHourAgo.getTime() && isNoActionSelfReportSample(run),
+    ).length;
+    const noActionSelfReportCountLastSixHours = terminalRuns.filter(
+      (run) => run.createdAt.getTime() >= sixHoursAgo.getTime() && isNoActionSelfReportSample(run),
+    ).length;
 
     const [
       runCountLastHour,
@@ -550,10 +700,32 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
-    const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn });
+    // SON-1612-C anti-gaming triggers: comment-only loops (SON-1309 pattern)
+    // must fire a review within ~1h and ≤ ~12 continuation runs.
+    const noMaterial =
+      noMaterialStreak >= thresholds.noMaterialStreakRuns ||
+      materialLessRunCountLastHour >= thresholds.noMaterialHourly ||
+      (consecutiveLivenessBlocked >= thresholds.livenessBlockedConsecutiveRuns &&
+        livenessBlockedStreakWithinHour);
+    const noActionSelfReport =
+      noActionSelfReportCountLastHour >= thresholds.noActionSelfReportHourly ||
+      noActionSelfReportCountLastSixHours >= thresholds.noActionSelfReportSixHours;
+    const trigger = choosePrimaryTrigger({ noMaterial, noActionSelfReport, noComment, longActive, highChurn });
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
+    if (noMaterial) {
+      triggerReasons.push(
+        `${noMaterialStreak} consecutive continuation runs without a material action (comments do not reset); ` +
+          `${materialLessRunCountLastHour} material-less continuation runs in 1h; ` +
+          `${consecutiveLivenessBlocked} consecutive liveness-blocked continuations${livenessBlockedStreakWithinHour ? " within 1h" : ""}`,
+      );
+    }
+    if (noActionSelfReport) {
+      triggerReasons.push(
+        `${noActionSelfReportCountLastHour} runs in 1h / ${noActionSelfReportCountLastSixHours} runs in 6h self-reported "no material action"`,
+      );
+    }
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment`);
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
     if (highChurn) {
@@ -568,6 +740,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       sourceIssue,
       sourceAgent,
       noCommentStreak,
+      noMaterialStreak,
+      materialLessRunCountLastHour,
+      consecutiveLivenessBlocked,
+      noActionSelfReportCountLastHour,
+      noActionSelfReportCountLastSixHours,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
@@ -655,6 +832,10 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
+      `- No-material-action streak (comments do not reset): ${evidence.noMaterialStreak}`,
+      `- Material-less continuation runs 1h: ${evidence.materialLessRunCountLastHour}`,
+      `- Consecutive liveness-blocked continuations: ${evidence.consecutiveLivenessBlocked}`,
+      `- Self-reported no-material-action runs: ${evidence.noActionSelfReportCountLastHour}/1h, ${evidence.noActionSelfReportCountLastSixHours}/6h`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
@@ -666,6 +847,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- No-comment streak: ${evidence.thresholds.noCommentStreakRuns} completed runs`,
       `- Long active duration: ${msToHuman(evidence.thresholds.longActiveMs)}`,
       `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h runs/assignee-run comments`,
+      `- No-material streak: ${evidence.thresholds.noMaterialStreakRuns} continuation runs, or ${evidence.thresholds.noMaterialHourly} material-less/1h, or ${evidence.thresholds.livenessBlockedConsecutiveRuns} consecutive liveness-blocked/1h`,
+      `- No-action self-reports: ${evidence.thresholds.noActionSelfReportHourly}/1h or ${evidence.thresholds.noActionSelfReportSixHours}/6h`,
       `- Resolved-review snooze: ${msToHuman(evidence.thresholds.resolvedSnoozeMs)}`,
       "",
       "## Latest Runs",
@@ -696,6 +879,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Trigger: \`${evidence.trigger}\` (${formatTrigger(evidence.trigger)})`,
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
+      `- No-material streak: ${evidence.noMaterialStreak} (material-less 1h: ${evidence.materialLessRunCountLastHour}; liveness-blocked streak: ${evidence.consecutiveLivenessBlocked})`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
     ].join("\n");
@@ -729,6 +913,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           sourceIssueId: evidence.sourceIssue.id,
           trigger: evidence.trigger,
           noCommentStreak: evidence.noCommentStreak,
+          noMaterialStreak: evidence.noMaterialStreak,
           runCountLastHour: evidence.runCountLastHour,
           commentCountLastHour: evidence.commentCountLastHour,
         },
