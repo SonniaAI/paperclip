@@ -1820,6 +1820,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       const churnSkipRows = await db
         .select({
           id: agentWakeupRequests.id,
+          agentId: agentWakeupRequests.agentId,
           payload: agentWakeupRequests.payload,
           requestedAt: agentWakeupRequests.requestedAt,
         })
@@ -1846,10 +1847,44 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         ) continue;
         latestChurnSkipByIssue.set(issueId, row);
       }
-      const churnIssueMap = await issueSummaryMap(db, companyId, [...latestChurnSkipByIssue.keys()]);
+      const churnSkipIssueIds = [...latestChurnSkipByIssue.keys()];
+      const churnSkipAgentIds = [
+        ...new Set(churnSkipRows.map((row) => readString(row.agentId)).filter((value): value is string => Boolean(value))),
+      ];
+      const oldestChurnSkipAt = churnSkipRows.reduce<Date | null>((oldest, row) => {
+        if (!oldest || row.requestedAt < oldest) return row.requestedAt;
+        return oldest;
+      }, null);
+      // A skip receipt is only actionable while the issue still looks stalled.
+      // A newer run for the same issue (the wake eventually dispatched, or the
+      // agent was re-woken) or a terminal status means the flag is stale.
+      const [churnIssueMap, churnNewerRuns] = await Promise.all([
+        issueSummaryMap(db, companyId, churnSkipIssueIds),
+        oldestChurnSkipAt && churnSkipAgentIds.length > 0
+          ? db
+            .select({
+              createdAt: heartbeatRuns.createdAt,
+              runIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+            })
+            .from(heartbeatRuns)
+            .where(and(
+              eq(heartbeatRuns.companyId, companyId),
+              inArray(heartbeatRuns.agentId, churnSkipAgentIds),
+              gt(heartbeatRuns.createdAt, oldestChurnSkipAt),
+            ))
+          : Promise.resolve([]),
+      ]);
+      const churnLatestRunAtByIssue = new Map<string, Date>();
+      for (const run of churnNewerRuns) {
+        if (!run.runIssueId) continue;
+        const latest = churnLatestRunAtByIssue.get(run.runIssueId);
+        if (!latest || run.createdAt > latest) churnLatestRunAtByIssue.set(run.runIssueId, run.createdAt);
+      }
       for (const [issueId, row] of latestChurnSkipByIssue) {
         const issue = churnIssueMap.get(issueId);
         if (!issue) continue;
+        const hasNewerRun = (churnLatestRunAtByIssue.get(issueId)?.getTime() ?? 0) > row.requestedAt.getTime();
+        if (hasNewerRun || issue.status === "done" || issue.status === "cancelled") continue;
         const heartbeatSkip = readRecord(readRecord(row.payload).heartbeatSkip);
         const noProgressStreak = Number(heartbeatSkip.noProgressStreak);
         const nextAllowedAt = readString(heartbeatSkip.nextAllowedAt);
@@ -1873,7 +1908,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           ),
           inlineResolvable: true,
           entryRule: "A skipped issue_rewake_throttled wake has churnGuardAttentionFlag=true and is within the 6h lookback.",
-          exitRule: "The flagged wakeup receipt ages out of the 6h lookback or the row is dismissed.",
+          exitRule: "A newer run starts for the issue, the issue reaches a terminal status, the receipt ages out of the 6h lookback, or the row is dismissed.",
           dedupKey,
           severity: "high",
           activityAt: toIso(row.requestedAt),

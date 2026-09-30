@@ -338,6 +338,85 @@ describeEmbeddedPostgres("attention service", () => {
     expect(feed.items.some((item) => item.subject.id === controlIssueId)).toBe(false);
   });
 
+  it("clears the rewake-throttle alert when a newer run exists for the issue", async () => {
+    const { companyId, workerId } = await seedCompany("ATR");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATR-1",
+      title: "Recovered issue",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const now = new Date("2026-09-30T14:30:00.000Z");
+    const skippedAt = new Date(now.getTime() - 60_000);
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: workerId,
+      source: "on_demand",
+      reason: "issue_rewake_throttled",
+      payload: {
+        issueId,
+        heartbeatSkip: {
+          reason: "issue_rewake_throttled",
+          noProgressStreak: 4,
+          cooldownMs: 120_000,
+          nextAllowedAt: new Date(now.getTime() + 30_000).toISOString(),
+          churnGuardAttentionFlag: true,
+        },
+      },
+      status: "skipped",
+      requestedAt: skippedAt,
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: workerId,
+      invocationSource: "automation",
+      status: "succeeded",
+      contextSnapshot: { issueId },
+      createdAt: new Date(now.getTime() - 15_000),
+      updatedAt: new Date(now.getTime() - 10_000),
+      finishedAt: new Date(now.getTime() - 10_000),
+    });
+
+    const feed = await attentionService(db, { now: () => now.getTime() }).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter((item) => item.sourceKind === "issue_rewake_throttle")).toEqual([]);
+  });
+
+  it("clears the rewake-throttle alert when the issue reached a terminal status", async () => {
+    const { companyId, workerId } = await seedCompany("ATS");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATS-1",
+      title: "Completed issue",
+      status: "done",
+      assigneeAgentId: workerId,
+    });
+    const now = new Date("2026-09-30T14:30:00.000Z");
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: workerId,
+      source: "on_demand",
+      reason: "issue_rewake_throttled",
+      payload: {
+        issueId,
+        heartbeatSkip: {
+          reason: "issue_rewake_throttled",
+          noProgressStreak: 4,
+          cooldownMs: 120_000,
+          nextAllowedAt: new Date(now.getTime() + 30_000).toISOString(),
+          churnGuardAttentionFlag: true,
+        },
+      },
+      status: "skipped",
+      requestedAt: new Date(now.getTime() - 30_000),
+    });
+
+    const feed = await attentionService(db, { now: () => now.getTime() }).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter((item) => item.sourceKind === "issue_rewake_throttle")).toEqual([]);
+  });
+
   it("returns ranked decision-only items for every active source and excludes non-human or transient rows", async () => {
     const { companyId, workerId, reviewerId } = await seedCompany("ATN");
     const baseTime = new Date("2026-07-09T12:00:00.000Z");
