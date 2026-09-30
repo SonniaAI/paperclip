@@ -21298,8 +21298,21 @@ export function heartbeatService(
         let livenessClassification: RunLivenessClassification | null = null;
         let livenessInput: RunLivenessClassificationInput | null = null;
         if (outcome === "succeeded" && !lateNoOp) {
+          // Classify against the row exactly as this finalization is about to
+          // persist it. The in-memory `run` was fetched before the terminal
+          // write, so its stdout/stderr/error columns are still null/stale;
+          // classifying that stale row made every excerpt-bearing success look
+          // empty-output and scheduled spurious liveness continuations
+          // (SON-1631 review regression on the wake-batching suite).
           livenessInput = await buildRunLivenessInput(
-            { ...run, status: "succeeded" },
+            {
+              ...run,
+              status: "succeeded",
+              error: runErrorMessage ?? null,
+              errorCode: runErrorCode ?? null,
+              stdoutExcerpt,
+              stderrExcerpt,
+            },
             persistedResultJson,
           );
           livenessClassification = classifyRunLiveness(livenessInput);
