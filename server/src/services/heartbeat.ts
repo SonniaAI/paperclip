@@ -378,7 +378,7 @@ import {
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
 } from "./issue-rewake-throttle.js";
-import { hasIssueUnblockingEvent } from "../modules/run-dispatch/domain/wake-context.js";
+import { hasIssueUnblockingEvent } from "../modules/run-dispatch/index.js";
 import {
   logActivity,
   publishPluginDomainEvent,
