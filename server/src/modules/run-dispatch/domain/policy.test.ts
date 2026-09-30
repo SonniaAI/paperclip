@@ -497,6 +497,19 @@ describe("decideQueuedRunStaleness", () => {
     }, NOW)).toEqual({ stale: false });
   });
 
+  it("does not reuse comment, resume, or interaction markers copied into an automatic retry", () => {
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      issueStatus: "blocked",
+      retryReason: "workspace_busy",
+      wakeReason: "issue_commented",
+      wakeCommentIdPresent: true,
+      resumeIntent: true,
+      isInteractionWake: true,
+      unblockingEventPresent: false,
+    }, NOW)).toMatchObject({ stale: true, errorCode: "issue_blocked" });
+  });
+
   it("allows a resolved interaction to resume a parked blocked issue", () => {
     expect(decideQueuedRunStaleness({
       ...baseStalenessFacts(),

@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  agentWakeupRequests,
   agents,
   approvals,
   assets,
@@ -65,6 +66,7 @@ import {
   decisionRetentionService,
   DEFAULT_DECISION_SHELF_DAYS,
 } from "./decision-retention.js";
+import { ISSUE_REWAKE_ATTENTION_FLAG_STREAK, ISSUE_REWAKE_LOOKBACK_MS } from "./issue-rewake-throttle.js";
 
 const ATTENTION_SOURCE_KINDS: AttentionSourceKind[] = [
   "approval",
@@ -76,6 +78,7 @@ const ATTENTION_SOURCE_KINDS: AttentionSourceKind[] = [
   "blocker_attention",
   "review",
   "failed_run",
+  "issue_rewake_throttle",
   "budget_alert",
   "agent_error_alert",
 ];
@@ -90,15 +93,16 @@ const SEVERITY_RANK: Record<AttentionSeverity, number> = {
 const SOURCE_RANK: Record<AttentionSourceKind, number> = {
   failed_run: 0,
   recovery_action: 1,
-  blocker_attention: 2,
-  budget_alert: 3,
-  agent_error_alert: 4,
-  approval: 5,
-  decision: 6,
-  issue_thread_interaction: 7,
-  review: 8,
-  productivity_review: 9,
-  join_request: 10,
+  issue_rewake_throttle: 2,
+  blocker_attention: 3,
+  budget_alert: 4,
+  agent_error_alert: 5,
+  approval: 6,
+  decision: 7,
+  issue_thread_interaction: 8,
+  review: 9,
+  productivity_review: 10,
+  join_request: 11,
 };
 
 const PENDING_INTERACTION_STATUSES = ["pending"] as const;
@@ -1806,6 +1810,81 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             amountLimit: incident.amountLimit,
             images: [],
           },
+        }));
+      }
+
+      // One current alert per issue, even if several attempted wakes were
+      // skipped. Receipt payloads are durable and carry the streak/cooldown
+      // facts that triggered the churn guard; keeping the lookback bounded
+      // avoids turning old historical skips into permanent inbox rows.
+      const churnSkipRows = await db
+        .select({
+          id: agentWakeupRequests.id,
+          payload: agentWakeupRequests.payload,
+          requestedAt: agentWakeupRequests.requestedAt,
+        })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.status, "skipped"),
+          gt(agentWakeupRequests.requestedAt, new Date(now - ISSUE_REWAKE_LOOKBACK_MS)),
+          sql`${agentWakeupRequests.payload} -> 'heartbeatSkip' ->> 'churnGuardAttentionFlag' = 'true'`,
+        ))
+        .orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.id));
+      const latestChurnSkipByIssue = new Map<string, (typeof churnSkipRows)[number]>();
+      for (const row of churnSkipRows) {
+        const payload = readRecord(row.payload);
+        const issueId = readString(payload.issueId);
+        const heartbeatSkip = readRecord(payload.heartbeatSkip);
+        const noProgressStreak = Number(heartbeatSkip.noProgressStreak);
+        if (
+          !issueId ||
+          heartbeatSkip.reason !== "issue_rewake_throttled" ||
+          !Number.isFinite(noProgressStreak) ||
+          noProgressStreak < ISSUE_REWAKE_ATTENTION_FLAG_STREAK ||
+          latestChurnSkipByIssue.has(issueId)
+        ) continue;
+        latestChurnSkipByIssue.set(issueId, row);
+      }
+      const churnIssueMap = await issueSummaryMap(db, companyId, [...latestChurnSkipByIssue.keys()]);
+      for (const [issueId, row] of latestChurnSkipByIssue) {
+        const issue = churnIssueMap.get(issueId);
+        if (!issue) continue;
+        const heartbeatSkip = readRecord(readRecord(row.payload).heartbeatSkip);
+        const noProgressStreak = Number(heartbeatSkip.noProgressStreak);
+        const nextAllowedAt = readString(heartbeatSkip.nextAllowedAt);
+        const nextAllowedDate = nextAllowedAt ? new Date(nextAllowedAt) : null;
+        const nextAllowedLabel = nextAllowedDate && Number.isFinite(nextAllowedDate.getTime())
+          ? `${new Intl.DateTimeFormat("en-GB", {
+            dateStyle: "medium",
+            timeStyle: "medium",
+            timeZone: "UTC",
+          }).format(nextAllowedDate)} UTC`
+          : null;
+        const dedupKey = `issue_rewake_throttle:${issue.id}`;
+        add(createItem({
+          companyId,
+          sourceKind: "issue_rewake_throttle",
+          subject: issueSubject(prefix, issue),
+          whyNow: `Automatic wakes are being throttled after ${noProgressStreak} consecutive successful runs with no issue-visible progress.`,
+          decisionVerbs: decisionVerbs(
+            { id: "inspect", label: "Inspect", description: "Inspect the stalled issue." },
+            { id: "dismiss", label: "Dismiss", description: "Dismiss this churn alert." },
+          ),
+          inlineResolvable: true,
+          entryRule: "A skipped issue_rewake_throttled wake has churnGuardAttentionFlag=true and is within the 6h lookback.",
+          exitRule: "The flagged wakeup receipt ages out of the 6h lookback or the row is dismissed.",
+          dedupKey,
+          severity: "high",
+          activityAt: toIso(row.requestedAt),
+          createdAt: toIso(row.requestedAt),
+          updatedAt: toIso(row.requestedAt),
+          relatedIssue: null,
+          ...issueContext(issue),
+          detail: genericDetail(
+            `No-progress streak: ${noProgressStreak}${nextAllowedLabel ? `. Next eligible wake: ${nextAllowedLabel}.` : "."}`,
+            [],
+          ),
         }));
       }
 

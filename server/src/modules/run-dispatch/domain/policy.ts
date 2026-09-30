@@ -15,24 +15,6 @@ export type RetryReasonKind =
   | "ai_connection_wait"
   | "other";
 
-/**
- * SON-4370: retry reasons that recover an in-flight run's own lifecycle
- * (bounded transient infrastructure recovery, e.g. workspace Git scan
- * timeouts rescheduled by scheduleBoundedRetryForRun) rather than
- * re-dispatching the agent for issue work. These stay eligible when an
- * issue is parked `blocked`: they finish what a started run owed, they are
- * attempt-bounded, and they never wake the agent while the workspace still
- * cannot be prepared — so they cannot become SON-4179-style churn.
- */
-const RUN_LIFECYCLE_RETRY_REASONS: ReadonlySet<string> = new Set([
-  "transient_failure",
-]);
-
-/** SON-4370: true when a retry reason recovers the run's own lifecycle instead of re-dispatching issue work. */
-export function isRunLifecycleRetryReason(retryReason: string | null): boolean {
-  return retryReason !== null && RUN_LIFECYCLE_RETRY_REASONS.has(retryReason);
-}
-
 export type BudgetBlockFacts = {
   reason: string;
   scopeType: string;
@@ -132,13 +114,6 @@ export type ScheduledRetryFacts = {
    * means no such event: parked blocked cards are inert to auto re-dispatch.
    */
   unblockingEventPresent?: boolean;
-  /**
-   * SON-4370: true when this retry recovers the run's own lifecycle (bounded
-   * transient infrastructure recovery such as a workspace Git scan retry).
-   * Lifecycle recovery finishes an in-flight run without re-dispatching
- * issue work, so it stays eligible even while the issue is parked `blocked`.
-   */
-  retryRecoversRunLifecycle?: boolean;
 };
 
 export type QueuedRunStalenessErrorCode =
@@ -196,15 +171,6 @@ export type QueuedRunFacts = {
    * still be dispatched.
    */
   unblockingEventPresent?: boolean;
-  /**
-   * SON-4370: true when this queued run recovers the run's own lifecycle
-   * (bounded transient infrastructure recovery such as a workspace Git scan
-   * retry). Lifecycle recovery finishes an in-flight run without
- * re-dispatching issue work, so it stays eligible even while the issue is
-   * parked `blocked`.
-   */
-  retryRecoversRunLifecycle?: boolean;
-
   /** True when the run's wake or retry reason asks for a continuation the parked-summary check must inspect. */
   continuationParkApplies: boolean;
   /** The pre-classified verdict on whatever continuation summary body applies; only meaningful when continuationParkApplies is true. */
@@ -531,13 +497,13 @@ export function decideScheduledRetryGate(
   // unblocking event (new comment/interaction, status or assignee change,
   // explicit manual dispatch, or a wake naming the issue) may re-dispatch.
   // Dependency readiness is checked first so a real dependency blocker keeps
-  // its specific suppression reason. Bounded transient lifecycle recovery is
-  // not re-dispatch: a started run may finish its own infrastructure retry.
+  // its specific suppression reason. Even bounded infrastructure retries may
+  // re-enter the normal executor, so a parked issue requires an explicit
+  // unblock before any automatic retry can proceed.
   if (
     facts.issueStatus === "blocked" &&
     facts.retryReasonKind !== "max_turn_continuation" &&
-    facts.unblockingEventPresent !== true &&
-    facts.retryRecoversRunLifecycle !== true
+    facts.unblockingEventPresent !== true
   ) {
     return {
       allowed: false,
@@ -646,20 +612,24 @@ export function decideQueuedRunStaleness(
   // a comment wake, an explicit resume, an interaction wake, a resolved
   // interaction continuation, or an event the caller folded into
   // unblockingEventPresent.
+  // A scheduled retry carries a snapshot of the original wake. Its comment,
+  // manual-wake and interaction markers are historical, not a fresh unblock.
+  // The adapter may still provide an independently verified current event via
+  // unblockingEventPresent.
   const unblockingEvent =
     facts.unblockingEventPresent === true ||
-    Boolean(
-      facts.resumeIntent ||
-        facts.wakeCommentIdPresent ||
-        facts.isInteractionWake ||
-        facts.isResolvedInteractionContinuation ||
-        hasIssueUnblockingEvent({ wakeReason: facts.wakeReason }),
-    );
+    (!facts.retryReason &&
+      Boolean(
+        facts.resumeIntent ||
+          facts.wakeCommentIdPresent ||
+          facts.isInteractionWake ||
+          facts.isResolvedInteractionContinuation ||
+          hasIssueUnblockingEvent({ wakeReason: facts.wakeReason }),
+      ));
   if (
     facts.issueStatus === "blocked" &&
     facts.retryReasonKind !== "max_turn_continuation" &&
-    !unblockingEvent &&
-    facts.retryRecoversRunLifecycle !== true
+    !unblockingEvent
   ) {
     return {
       stale: true,

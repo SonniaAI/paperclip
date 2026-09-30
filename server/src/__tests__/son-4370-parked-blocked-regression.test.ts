@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   decideQueuedRunStaleness,
   decideScheduledRetryGate,
-  isRunLifecycleRetryReason,
   type QueuedRunFacts,
   type ScheduledRetryFacts,
 } from "../modules/run-dispatch/domain/policy.js";
@@ -104,7 +103,7 @@ describe("SON-4370 parked blocked is inert to auto re-dispatch", () => {
 
   it("a new comment on a parked blocked card still dispatches (exactly one wake path)", () => {
     const decision = decideQueuedRunStaleness(
-      queuedFacts({ wakeCommentIdPresent: true }),
+      queuedFacts({ retryReason: null, wakeCommentIdPresent: true }),
       new Date(),
     );
     expect(decision.stale).toBe(false);
@@ -120,7 +119,14 @@ describe("SON-4370 parked blocked is inert to auto re-dispatch", () => {
   });
 
   it("an interaction wake is an unblocking event", () => {
-    expect(decideQueuedRunStaleness(queuedFacts({ isInteractionWake: true }), new Date()).stale).toBe(false);
+    expect(decideQueuedRunStaleness(queuedFacts({ retryReason: null, isInteractionWake: true }), new Date()).stale).toBe(false);
+  });
+
+  it("a resolved interaction is an unblocking event", () => {
+    expect(decideQueuedRunStaleness(queuedFacts({
+      retryReason: null,
+      isResolvedInteractionContinuation: true,
+    }), new Date()).stale).toBe(false);
   });
 
   it("non-blocked statuses keep the previous behavior (in_progress control)", () => {
@@ -135,20 +141,16 @@ describe("SON-4370 parked blocked is inert to auto re-dispatch", () => {
     expect(decision.allowed).toBe(false);
   });
 
-  it("a bounded transient lifecycle retry (workspace git scan recovery) still finishes on a parked blocked card", () => {
-    expect(
-      decideScheduledRetryGate(scheduledFacts({ retryRecoversRunLifecycle: true }), new Date()).allowed,
-    ).toBe(true);
-    expect(
-      decideQueuedRunStaleness(queuedFacts({ retryRecoversRunLifecycle: true }), new Date()).stale,
-    ).toBe(false);
-  });
-
-  it("classifies transient_failure as run-lifecycle recovery and re-dispatch reasons as not", () => {
-    expect(isRunLifecycleRetryReason("transient_failure")).toBe(true);
-    expect(isRunLifecycleRetryReason("assignment_recovery")).toBe(false);
-    expect(isRunLifecycleRetryReason("issue_continuation_needed")).toBe(false);
-    expect(isRunLifecycleRetryReason(null)).toBe(false);
+  it("does not let an automatic retry with inherited wake markers restart a parked card", () => {
+    const decision = decideQueuedRunStaleness(queuedFacts({
+      retryReason: "transient_failure",
+      wakeReason: "issue_commented",
+      wakeCommentIdPresent: true,
+      resumeIntent: true,
+      isInteractionWake: true,
+      unblockingEventPresent: false,
+    }), new Date());
+    expect(decision).toMatchObject({ stale: true, errorCode: "issue_blocked" });
   });
 });
 

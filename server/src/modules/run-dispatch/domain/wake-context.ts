@@ -96,6 +96,10 @@ export function hasIssueUnblockingEvent(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ): boolean {
   const context = contextSnapshot ?? {};
+  // scheduleBoundedRetryForRun preserves the predecessor's wake snapshot and
+  // adds retryReason. Those historical comments/manual markers must not turn
+  // a later park into a fresh authorization to re-dispatch.
+  if (readNonEmptyString(context.retryReason)) return false;
   const wakeReason = readNonEmptyString(context.wakeReason)?.trim() ?? "";
   const wakeSource = readNonEmptyString(context.wakeSource)?.trim();
   const wakeTriggerDetail = readNonEmptyString(context.wakeTriggerDetail)?.trim();

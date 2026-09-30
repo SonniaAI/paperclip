@@ -57,6 +57,26 @@ describe("wake context", () => {
     expect(hasIssueUnblockingEvent({ wakeReason: "issue_monitor_due" })).toBe(false);
   });
 
+  it("recognizes an authenticated manual retry of a failed run as an explicit dispatch", () => {
+    expect(hasIssueUnblockingEvent({
+      wakeReason: "retry_failed_run",
+      wakeSource: "on_demand",
+      wakeTriggerDetail: "manual",
+      forceFreshSession: true,
+      previousRunId: "failed-run",
+    })).toBe(true);
+  });
+
+  it("does not treat copied wake metadata on an automatic retry as a fresh unblock", () => {
+    expect(hasIssueUnblockingEvent({
+      wakeReason: "issue_commented",
+      wakeCommentId: "old-comment",
+      wakeSource: "on_demand",
+      wakeTriggerDetail: "manual",
+      retryReason: WORKSPACE_BUSY_RETRY_REASON,
+    })).toBe(false);
+  });
+
   it("allows interaction wakes only for an allowed reason with a comment id", () => {
     const allowed = new Set(["issue_commented"]);
     expect(allowsIssueInteractionWake({

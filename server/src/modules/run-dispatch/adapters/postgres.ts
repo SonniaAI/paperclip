@@ -38,7 +38,6 @@ import { parseIssueExecutionState } from "../../../services/issue-execution-poli
 import {
   decideQueuedRunStaleness,
   decideScheduledRetryGate,
-  isRunLifecycleRetryReason,
 } from "../domain/policy.js";
 import type {
   QueuedRunFacts,
@@ -294,7 +293,6 @@ export function createPostgresRunDispatchAdapter(
       runAgentId: input.agentId,
       issueId,
       retryReasonKind,
-      retryRecoversRunLifecycle: isRunLifecycleRetryReason(retryReason),
       unblockingEventPresent: hasIssueUnblockingEvent(input.contextSnapshot),
       enforceIssueExecutionLock: retryReasonKind === "max_turn_continuation" || retryReasonKind === "ai_connection_wait",
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, input.contextSnapshot),
@@ -613,7 +611,6 @@ export function createPostgresRunDispatchAdapter(
       runAgentId: input.agentId,
       issueId,
       retryReasonKind,
-      retryRecoversRunLifecycle: isRunLifecycleRetryReason(retryReason),
       dependenciesBlocked: readiness && !readiness.isDependencyReady ? {
         unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
         unresolvedBlockerCount: readiness.unresolvedBlockerCount,
