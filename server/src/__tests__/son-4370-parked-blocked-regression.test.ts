@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   decideQueuedRunStaleness,
   decideScheduledRetryGate,
+  isRunLifecycleRetryReason,
   type QueuedRunFacts,
   type ScheduledRetryFacts,
 } from "../modules/run-dispatch/domain/policy.js";
@@ -132,6 +133,22 @@ describe("SON-4370 parked blocked is inert to auto re-dispatch", () => {
       new Date(),
     );
     expect(decision.allowed).toBe(false);
+  });
+
+  it("a bounded transient lifecycle retry (workspace git scan recovery) still finishes on a parked blocked card", () => {
+    expect(
+      decideScheduledRetryGate(scheduledFacts({ retryRecoversRunLifecycle: true }), new Date()).allowed,
+    ).toBe(true);
+    expect(
+      decideQueuedRunStaleness(queuedFacts({ retryRecoversRunLifecycle: true }), new Date()).stale,
+    ).toBe(false);
+  });
+
+  it("classifies transient_failure as run-lifecycle recovery and re-dispatch reasons as not", () => {
+    expect(isRunLifecycleRetryReason("transient_failure")).toBe(true);
+    expect(isRunLifecycleRetryReason("assignment_recovery")).toBe(false);
+    expect(isRunLifecycleRetryReason("issue_continuation_needed")).toBe(false);
+    expect(isRunLifecycleRetryReason(null)).toBe(false);
   });
 });
 

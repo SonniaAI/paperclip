@@ -13,6 +13,24 @@ export type RetryReasonKind =
   | "ai_connection_wait"
   | "other";
 
+/**
+ * SON-4370: retry reasons that recover an in-flight run's own lifecycle
+ * (bounded transient infrastructure recovery, e.g. workspace Git scan
+ * timeouts rescheduled by scheduleBoundedRetryForRun) rather than
+ * re-dispatching the agent for issue work. These stay eligible when an
+ * issue is parked `blocked`: they finish what a started run owed, they are
+ * attempt-bounded, and they never wake the agent while the workspace still
+ * cannot be prepared — so they cannot become SON-4179-style churn.
+ */
+const RUN_LIFECYCLE_RETRY_REASONS: ReadonlySet<string> = new Set([
+  "transient_failure",
+]);
+
+/** SON-4370: true when a retry reason recovers the run's own lifecycle instead of re-dispatching issue work. */
+export function isRunLifecycleRetryReason(retryReason: string | null): boolean {
+  return retryReason !== null && RUN_LIFECYCLE_RETRY_REASONS.has(retryReason);
+}
+
 export type BudgetBlockFacts = {
   reason: string;
   scopeType: string;
@@ -112,6 +130,13 @@ export type ScheduledRetryFacts = {
    * means no such event: parked blocked cards are inert to auto re-dispatch.
    */
   unblockingEventPresent?: boolean;
+  /**
+   * SON-4370: true when this retry recovers the run's own lifecycle (bounded
+   * transient infrastructure recovery such as a workspace Git scan retry).
+   * Lifecycle recovery finishes an in-flight run without re-dispatching
+ * issue work, so it stays eligible even while the issue is parked `blocked`.
+   */
+  retryRecoversRunLifecycle?: boolean;
 };
 
 export type QueuedRunStalenessErrorCode =
@@ -169,6 +194,14 @@ export type QueuedRunFacts = {
    * still be dispatched.
    */
   unblockingEventPresent?: boolean;
+  /**
+   * SON-4370: true when this queued run recovers the run's own lifecycle
+   * (bounded transient infrastructure recovery such as a workspace Git scan
+   * retry). Lifecycle recovery finishes an in-flight run without
+ * re-dispatching issue work, so it stays eligible even while the issue is
+   * parked `blocked`.
+   */
+  retryRecoversRunLifecycle?: boolean;
 
   /** True when the run's wake or retry reason asks for a continuation the parked-summary check must inspect. */
   continuationParkApplies: boolean;
@@ -386,7 +419,13 @@ export function decideScheduledRetryGate(
   // SON-4370: parked `blocked` cards are inert to auto re-dispatch. Only an
   // unblocking event (new comment/interaction, status or assignee change,
   // explicit manual dispatch, or a wake naming the issue) may re-dispatch.
-  if (facts.issueStatus === "blocked" && facts.unblockingEventPresent !== true) {
+  // Bounded transient lifecycle recovery is not re-dispatch: a run that
+  // already started may finish its own infrastructure retry.
+  if (
+    facts.issueStatus === "blocked" &&
+    facts.unblockingEventPresent !== true &&
+    facts.retryRecoversRunLifecycle !== true
+  ) {
     return {
       allowed: false,
       issueId: facts.issueId,
@@ -604,7 +643,11 @@ export function decideQueuedRunStaleness(
         facts.isInteractionWake ||
         facts.isResolvedInteractionContinuation,
     );
-  if (facts.issueStatus === "blocked" && !unblockingEvent) {
+  if (
+    facts.issueStatus === "blocked" &&
+    !unblockingEvent &&
+    facts.retryRecoversRunLifecycle !== true
+  ) {
     return {
       stale: true,
       errorCode: "issue_blocked",

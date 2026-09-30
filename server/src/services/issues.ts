@@ -11439,7 +11439,10 @@ export function issueService(db: Db) {
           // without a status transition — the card stays parked until an
           // explicit status change happens on the board.
           status: sql`case when ${issues.status} = 'blocked' then ${issues.status} else 'in_progress' end`,
-          startedAt: sql`case when ${issues.status} = 'blocked' then ${issues.startedAt} else ${now} end`,
+          // The fresh `now` must bind as an ISO string with an explicit
+          // cast: a raw Date inside a raw sql chunk skips the column's
+          // timestamp mapper and crashes the driver's Bind serialization.
+          startedAt: sql`case when ${issues.status} = 'blocked' then ${issues.startedAt} else ${now.toISOString()}::timestamptz end`,
           updatedAt: now,
         })
         .where(
