@@ -125,6 +125,7 @@ describe("openclaw_gateway execute dispatch boundary", () => {
       "send:connect",
       "dispatch",
       "send:agent",
+      "send:sessions.usage",
     ]);
   });
 

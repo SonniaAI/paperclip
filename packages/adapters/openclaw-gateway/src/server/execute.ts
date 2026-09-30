@@ -911,7 +911,11 @@ function parseUsage(value: unknown): AdapterExecutionResult["usage"] | undefined
   const inputTokens = asNumber(record.inputTokens ?? record.input, 0);
   const outputTokens = asNumber(record.outputTokens ?? record.output, 0);
   const cachedInputTokens = asNumber(
-    record.cachedInputTokens ?? record.cached_input_tokens ?? record.cacheRead ?? record.cache_read,
+    record.cachedInputTokens ??
+      record.cached_input_tokens ??
+      record.cacheReadTokens ??
+      record.cacheRead ??
+      record.cache_read,
     0,
   );
 
@@ -924,6 +928,100 @@ function parseUsage(value: unknown): AdapterExecutionResult["usage"] | undefined
     outputTokens,
     ...(cachedInputTokens > 0 ? { cachedInputTokens } : {}),
   };
+}
+
+export type SessionUsageSummary = {
+  usage: NonNullable<AdapterExecutionResult["usage"]>;
+  costUsd: number;
+};
+
+/**
+ * Aggregate a gateway `sessions.usage` report (per-session rows, each with a
+ * usage summary) into one token/cost total. Accepts the field-name variants
+ * the gateway has used across versions (input/inputTokens, cacheRead/
+ * cacheReadTokens/cachedInputTokens, totalCost/costUsd). Returns null when the
+ * report carries no token data — usage reporting must never fail the run.
+ */
+export function summarizeSessionUsage(payload: unknown): SessionUsageSummary | null {
+  const record = asRecord(payload);
+  if (!record) return null;
+
+  const rows = Array.isArray(record.sessions) ? record.sessions : [];
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedInputTokens = 0;
+  let costUsd = 0;
+  let sawTokens = false;
+
+  for (const row of rows) {
+    const rowRecord = asRecord(row);
+    if (!rowRecord) continue;
+    const usageRecord = asRecord(rowRecord.usage) ?? rowRecord;
+
+    const entryInput = asNumber(usageRecord.inputTokens ?? usageRecord.input, 0);
+    const entryOutput = asNumber(usageRecord.outputTokens ?? usageRecord.output, 0);
+    const entryCached = asNumber(
+      usageRecord.cachedInputTokens ??
+        usageRecord.cached_input_tokens ??
+        usageRecord.cacheReadTokens ??
+        usageRecord.cacheRead ??
+        usageRecord.cache_read,
+      0,
+    );
+    const entryCost = asNumber(
+      usageRecord.totalCost ?? usageRecord.costUsd ?? usageRecord.cost_usd,
+      0,
+    );
+
+    inputTokens += entryInput;
+    outputTokens += entryOutput;
+    cachedInputTokens += entryCached;
+    costUsd += entryCost;
+    if (entryInput > 0 || entryOutput > 0 || entryCached > 0) {
+      sawTokens = true;
+    }
+  }
+
+  if (!sawTokens) return null;
+
+  return {
+    usage: {
+      inputTokens,
+      outputTokens,
+      ...(cachedInputTokens > 0 ? { cachedInputTokens } : {}),
+    },
+    costUsd,
+  };
+}
+
+export type SessionUsageClient = {
+  request<T>(
+    method: string,
+    params: unknown,
+    opts: GatewayClientRequestOptions,
+  ): Promise<T>;
+};
+
+/**
+ * Fetch the cumulative usage report for the run's session from the gateway.
+ * Fail-safe by contract: any error or empty report resolves to null and the
+ * run completion proceeds without a usage payload.
+ */
+export async function fetchSessionUsageSummary(
+  client: SessionUsageClient,
+  sessionKey: string,
+  timeoutMs: number,
+): Promise<SessionUsageSummary | null> {
+  try {
+    const payload = await client.request<Record<string, unknown>>(
+      "sessions.usage",
+      { key: sessionKey, limit: 5 },
+      { timeoutMs },
+    );
+    return summarizeSessionUsage(payload);
+  } catch {
+    return null;
+  }
 }
 
 function extractRuntimeServicesFromMeta(meta: Record<string, unknown> | null): AdapterRuntimeServiceReport[] {
@@ -1398,11 +1496,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         asRecord(mergedMeta.agentMeta) ??
         asRecord(acceptedMeta?.agentMeta) ??
         asRecord(latestMeta?.agentMeta);
-      const usage = parseUsage(agentMeta?.usage ?? mergedMeta.usage);
+      const metaUsage = parseUsage(agentMeta?.usage ?? mergedMeta.usage);
       const runtimeServices = extractRuntimeServicesFromMeta(agentMeta ?? mergedMeta);
       const provider = nonEmpty(agentMeta?.provider) ?? nonEmpty(mergedMeta.provider) ?? "openclaw";
       const model = nonEmpty(agentMeta?.model) ?? nonEmpty(mergedMeta.model) ?? null;
-      const costUsd = asNumber(agentMeta?.costUsd ?? mergedMeta.costUsd, 0);
+      let usage = metaUsage;
+      // Meta-carried usage is reported by the gateway for this execution only;
+      // anything fetched from the session report is a cumulative session total.
+      let usageBasis: AdapterExecutionResult["usageBasis"] = metaUsage ? "per_run" : null;
+      let costUsd = asNumber(agentMeta?.costUsd ?? mergedMeta.costUsd, 0);
+      if (!usage) {
+        const sessionUsage = await fetchSessionUsageSummary(client, sessionKey, connectTimeoutMs);
+        if (sessionUsage) {
+          usage = sessionUsage.usage;
+          usageBasis = "session_cumulative";
+          if (sessionUsage.costUsd > 0) {
+            costUsd = sessionUsage.costUsd;
+          }
+          await ctx.onLog(
+            "stdout",
+            `[openclaw-gateway] attached session usage basis=session_cumulative inputTokens=${sessionUsage.usage.inputTokens} outputTokens=${sessionUsage.usage.outputTokens} costUsd=${sessionUsage.costUsd}\n`,
+          );
+        }
+      }
 
       await ctx.onLog(
         "stdout",
@@ -1416,6 +1532,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         provider,
         ...(model ? { model } : {}),
         ...(usage ? { usage } : {}),
+        ...(usageBasis ? { usageBasis } : {}),
         ...(costUsd > 0 ? { costUsd } : {}),
         resultJson: asRecord(latestResultPayload),
         ...(runtimeServices.length > 0 ? { runtimeServices } : {}),
