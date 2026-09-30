@@ -28189,6 +28189,9 @@ export function heartbeatService(
                         throttleDecision.lastRunFinishedAt.toISOString(),
                       nextAllowedAt:
                         throttleDecision.nextAllowedAt.toISOString(),
+                      ...(throttleDecision.raiseAttentionFlag
+                        ? { churnGuardAttentionFlag: true }
+                        : {}),
                     },
                   },
                   status: "skipped",

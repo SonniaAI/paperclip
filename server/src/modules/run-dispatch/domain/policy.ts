@@ -105,6 +105,13 @@ export type ScheduledRetryFacts = {
   dispositionRepair: DispositionRepairFacts | null;
   /** A conversation retry must wait for unresolved questions and approvals. */
   pendingResponse?: "interaction" | "approval" | null;
+  /**
+   * SON-4370: true when an unblocking event (new comment or interaction,
+   * status or assignee change, explicit manual dispatch, or a wake naming
+   * the issue) authorizes re-dispatch of a parked `blocked` issue. Absent
+   * means no such event: parked blocked cards are inert to auto re-dispatch.
+   */
+  unblockingEventPresent?: boolean;
 };
 
 export type QueuedRunStalenessErrorCode =
@@ -153,6 +160,15 @@ export type QueuedRunFacts = {
   wakeCommentIdPresent: boolean;
   /** Verified from current company-scoped parent/child state immediately before dispatch. */
   isCompletedOnboardingHandoffWake?: boolean;
+
+  /**
+   * SON-4370: caller-computed unblocking event signal (new comment or
+   * interaction, status or assignee change, explicit manual dispatch, or a
+   * wake naming the issue). When absent, the wake's own comment/resume/
+   * interaction signals below decide whether a parked `blocked` issue may
+   * still be dispatched.
+   */
+  unblockingEventPresent?: boolean;
 
   /** True when the run's wake or retry reason asks for a continuation the parked-summary check must inspect. */
   continuationParkApplies: boolean;
@@ -367,6 +383,20 @@ export function decideScheduledRetryGate(
       details: { issueId: facts.issueId } };
   }
 
+  // SON-4370: parked `blocked` cards are inert to auto re-dispatch. Only an
+  // unblocking event (new comment/interaction, status or assignee change,
+  // explicit manual dispatch, or a wake naming the issue) may re-dispatch.
+  if (facts.issueStatus === "blocked" && facts.unblockingEventPresent !== true) {
+    return {
+      allowed: false,
+      issueId: facts.issueId,
+      errorCode: "issue_blocked",
+      reason:
+        "Scheduled retry suppressed because the issue is parked blocked and no unblocking event has occurred (new comment/interaction, status or assignee change, explicit dispatch, or a wake naming the issue)",
+      details: { issueId: facts.issueId, currentStatus: facts.issueStatus },
+    };
+  }
+
   if (facts.retryReasonKind === "native_safe_replacement" &&
       [facts.issueExecutionRunId, facts.issueCheckoutRunId].some(id => id != null && id !== facts.runId)) {
     return { allowed: false, issueId: facts.issueId, errorCode: "issue_execution_lock_changed",
@@ -558,6 +588,29 @@ export function decideQueuedRunStaleness(
         retryReason: facts.retryReason,
         nextAction: facts.continuationSummaryBody,
       },
+    };
+  }
+
+  // SON-4370: a parked `blocked` issue is inert to auto re-dispatch. A queued
+  // run may still proceed when the wake itself carries the unblocking event:
+  // a comment wake, an explicit resume, an interaction wake, a resolved
+  // interaction continuation, or an event the caller folded into
+  // unblockingEventPresent.
+  const unblockingEvent =
+    facts.unblockingEventPresent ??
+    Boolean(
+      facts.resumeIntent ||
+        facts.wakeCommentIdPresent ||
+        facts.isInteractionWake ||
+        facts.isResolvedInteractionContinuation,
+    );
+  if (facts.issueStatus === "blocked" && !unblockingEvent) {
+    return {
+      stale: true,
+      errorCode: "issue_blocked",
+      reason:
+        "Cancelled because the issue is parked blocked with no unblocking event (new comment/interaction, status or assignee change, explicit dispatch, or a wake naming the issue) before the queued run could start",
+      details: { issueId: facts.issueId, currentStatus: facts.issueStatus },
     };
   }
 
