@@ -678,4 +678,168 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body?.error).toBe("Issue checkout conflict");
   });
+
+  it("refuses checkout when the actor run row is terminal so it cannot anchor a lock its own PATCH could never dispose (SON-3926)", async () => {
+    // Reproduces the SON-3780 residual gap: the primary UPDATE path used to
+    // let an already-terminal actor row set checkoutRunId/executionRunId (200)
+    // and then self-destruct on every subsequent status PATCH.
+    const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal actor checkout",
+      status: "todo",
+      priority: "high",
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, failedRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body?.error).toBe("Issue checkout refused: actor run is not live");
+    expect(res.body?.details).toMatchObject({
+      issueId,
+      actorRunId: failedRunId,
+      actorRunStatus: "failed",
+      actorRunMissing: false,
+    });
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "todo",
+      assigneeAgentId: null,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+
+    const checkoutActivity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.checked_out"));
+    expect(checkoutActivity).toHaveLength(0);
+  });
+
+  it("refuses checkout when the actor run row is quiet past the TTL (zombie running row)", async () => {
+    const { companyId, agentId } = await seedCompanyAgentAndRuns();
+    const zombieActorRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: zombieActorRunId,
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Zombie actor checkout",
+      status: "todo",
+      priority: "high",
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, zombieActorRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body?.error).toBe("Issue checkout refused: actor run is not live");
+    expect(res.body?.details).toMatchObject({
+      actorRunId: zombieActorRunId,
+      actorRunStatus: "running",
+    });
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "todo",
+      assigneeAgentId: null,
+      checkoutRunId: null,
+    });
+  });
+
+  it("lets a terminal-but-self run PATCH its final disposition instead of 409ing forever (SON-3926)", async () => {
+    // Direct regression for the SON-3780 live repro: a run whose row went
+    // terminal while its session still executes must always be able to record
+    // the final disposition on the card it still owns.
+    const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Terminal-but-self disposition",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, failedRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe("done");
+
+    const row = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ status: "done" });
+  });
+
+  it("lets a terminal-but-self run PATCH through a partially cleared self anchor", async () => {
+    // Partial-anchor shape: checkoutRunId already nulled by an earlier
+    // clear-at-entry, executionRunId still names the terminal actor itself.
+    const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Partial self anchor disposition",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, failedRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Disposed through partial anchor" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.title).toBe("Disposed through partial anchor");
+  });
 });
