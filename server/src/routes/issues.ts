@@ -68,7 +68,6 @@ import {
   updateDocumentAnnotationThreadSchema,
   upsertIssueDocumentSchema,
   updateIssueSchema,
-  blockedJustificationRefinement,
   isClosedIsolatedExecutionWorkspace,
   isMarkdownArtifactWorkProduct,
   isMarkdownAttachmentContent,
@@ -281,8 +280,7 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema
   .extend({
     interrupt: z.boolean().optional(),
-  })
-  .superRefine(blockedJustificationRefinement);
+  });
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
@@ -10275,6 +10273,43 @@ export function issueRoutes(
           eq(companyMemberships.status, "active"),
         )).limit(1).then((rows) => rows[0] ?? null);
         if (!member) throw unprocessable("Unblock owner user must be an active company member");
+      }
+    }
+    // Blocked status needs an attributable reason the system can persist
+    // (SON-3754 / upstream #10404). Creates enforce this in the shared schema;
+    // updates enforce it here, after ownership, run-lock, and task-watchdog
+    // scope checks, so those 403/409 answers win over the 400 and a watchdog
+    // run parking a watched subtree gets a machine reason stamped instead of
+    // a rejection — parking stale subtrees is the watchdog's primary job.
+    if (updateFields.status === "blocked") {
+      const blockerEdges = Array.isArray(req.body.blockedByIssueIds)
+        ? (req.body.blockedByIssueIds as unknown[]).length
+        : 0;
+      const hasBlockerEdges = blockerEdges > 0;
+      const hasExternalBlocker = req.body.externalBlocker != null;
+      const hasUnblockDescriptor = updateFields.unblockDescriptor != null;
+      const clearingExternal = req.body.externalBlocker === null;
+      const clearingEdges = blockerEdges === 0 && Array.isArray(req.body.blockedByIssueIds);
+      const keepsExternal = !clearingExternal && hasExternalBlocker;
+      const keepsEdges = !clearingEdges && hasBlockerEdges;
+      if (!hasBlockerEdges && !hasExternalBlocker && !hasUnblockDescriptor) {
+        const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
+        if (watchdogScope.kind !== "none" && watchdogScope.kind !== "invalid") {
+          updateFields.externalBlocker = {
+            owner: "task-watchdog",
+            note:
+              "Task-watchdog parked this issue without named blocker edges or an external " +
+              "blocker. (SON-3754 machine reason)",
+            since: new Date().toISOString(),
+          };
+        } else {
+          throw badRequest(
+            "blocked status requires either blockedByIssueIds or an externalBlocker " +
+            "(set externalBlocker: {owner, note} when waiting on a human or outside dependency)",
+          );
+        }
+      } else if (!keepsExternal && !keepsEdges && !hasUnblockDescriptor) {
+        throw badRequest("cannot clear the last blocker reason while status is blocked");
       }
     }
     const enteringBlocked = existing.status !== "blocked" && updateFields.status === "blocked";
