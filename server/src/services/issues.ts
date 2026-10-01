@@ -8070,6 +8070,35 @@ export function issueService(db: Db) {
         });
       }
 
+      // SON-3926(a): a checkout anchor may only be installed by a run that is
+      // live in heartbeat_runs. A terminal (or missing) actor row used to slip
+      // through the primary UPDATE path below because it only matched
+      // assignee/lock conditions; the actor then 200'd checkout but could never
+      // dispose the anchor it just set: assertCheckoutOwner clears terminal
+      // anchors at entry and adoption refuses a terminal actor, so every status
+      // PATCH 409'd forever. Refuse the anchor up front instead.
+      if (checkoutRunId) {
+        const actorRun = await db
+          .select({
+            status: heartbeatRuns.status,
+            finishedAt: heartbeatRuns.finishedAt,
+            startedAt: heartbeatRuns.startedAt,
+            lastOutputAt: heartbeatRuns.lastOutputAt,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, checkoutRunId))
+          .then((rows) => rows[0] ?? null);
+        if (!actorRun || heartbeatRunRowIsStale(actorRun)) {
+          throw conflict("Issue checkout refused: actor run is not live", {
+            issueId: id,
+            actorRunId: checkoutRunId,
+            actorRunStatus: actorRun?.status ?? null,
+            actorRunMissing: !actorRun,
+            securityPrinciples: ["Complete Mediation", "Fail Securely"],
+          });
+        }
+      }
+
       await clearExecutionRunIfTerminal(id);
       await clearCheckoutRunIfTerminal(id);
 
@@ -8254,8 +8283,6 @@ export function issueService(db: Db) {
     },
 
     assertCheckoutOwner: async (id: string, actorAgentId: string, actorRunId: string | null) => {
-      await clearExecutionRunIfTerminal(id);
-      await clearCheckoutRunIfTerminal(id);
       const loadCurrent = () =>
         db
           .select({
@@ -8268,6 +8295,47 @@ export function issueService(db: Db) {
           .from(issues)
           .where(eq(issues.id, id))
           .then((rows) => rows[0] ?? null);
+
+      // SON-3926(b): terminal-but-self ownership. A run that anchored a card
+      // while live and later went terminal (watchdog reap while the session
+      // still executes, or a crash terminal write) must still be able to
+      // record its final disposition. The clear-at-entry below used to null
+      // exactly those self-anchors first, and every adoption path refuses a
+      // terminal actor, so the owning session 409'd forever on the card it
+      // still owned. Resolve same-run ownership BEFORE the clears: for a live
+      // actor this is equivalent (the clears never touch a live run's own
+      // anchors); for a terminal-but-self actor it is the only path that can
+      // dispose the card it owns.
+      const resolveSelfAnchoredOwnership = (
+        candidate: {
+          id: string;
+          status: string;
+          assigneeAgentId: string | null;
+          checkoutRunId: string | null;
+          executionRunId: string | null;
+        },
+      ) => {
+        if (!actorRunId) return null;
+        if (candidate.status !== "in_progress") return null;
+        if (candidate.assigneeAgentId !== actorAgentId) return null;
+        if (sameRunLock(candidate.checkoutRunId, actorRunId)) {
+          return { ...candidate, adoptedFromRunId: null as string | null };
+        }
+        // Partial-anchor shape: checkoutRunId already cleared but the
+        // executionRunId still names this actor.
+        if (candidate.checkoutRunId == null && candidate.executionRunId === actorRunId) {
+          return { ...candidate, adoptedFromRunId: null as string | null };
+        }
+        return null;
+      };
+
+      const preClear = await loadCurrent();
+      if (!preClear) throw notFound("Issue not found");
+      const selfAnchored = resolveSelfAnchoredOwnership(preClear);
+      if (selfAnchored) return selfAnchored;
+
+      await clearExecutionRunIfTerminal(id);
+      await clearCheckoutRunIfTerminal(id);
       const current = await loadCurrent();
 
       if (!current) throw notFound("Issue not found");
