@@ -8463,8 +8463,15 @@ export function issueService(db: Db) {
           assigneeUserId: null,
           checkoutRunId,
           executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
+          // SON-4505: checkout must not discard the blocked state. A blocked
+          // card carries a live external blocker justification; flipping it to
+          // in_progress on a zero-content wake left the card wrongly open with
+          // the blocker still attached. Anchor the run, but keep "blocked"
+          // (and its original startedAt) so only an explicit assignee PATCH
+          // records the real disposition. Unstarted work still moves to
+          // in_progress as before.
+          status: sql`case when ${issues.status} = 'blocked' then 'blocked' else 'in_progress' end`,
+          startedAt: sql`case when ${issues.status} = 'blocked' then ${issues.startedAt} else ${now.toISOString()}::timestamptz end`,
           updatedAt: now,
         })
         .where(

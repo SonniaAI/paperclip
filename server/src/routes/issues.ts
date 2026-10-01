@@ -2190,6 +2190,16 @@ async function queueResolvedInteractionContinuationWakeup(input: {
   // and future providers receive the same behavior.
   if (!continuationPolicyAllowsWake && !rejectedPlanNeedsRevision && !reviewPathLost) return;
   if (input.interaction.status === "expired" && !reviewPathLost) return;
+  // SON-4505: a cancelled interaction (board-cancelled questions, a withdrawn
+  // ask_user_questions set, a withdrawn confirmation) resolves with no new
+  // content for the assignee — no answers, no verdicts, no comments — and the
+  // resolved-interaction continuation statuses already exclude "cancelled".
+  // Emitting an issue_commented wake here burned full assignee heartbeats on
+  // zero-comment wakes that also flipped blocked cards open at checkout. The
+  // side effects that do matter (native question run cancellation, direct
+  // run steering) are handled independently of this continuation wake, and a
+  // genuinely stalled review path still wakes with its recovery instruction.
+  if (input.interaction.status === "cancelled" && !reviewPathLost) return;
   // A normal interaction continuation is itself the durable recovery path.
   // Do not contaminate that wake with the fallback "review path lost"
   // instruction merely because the just-consumed interaction now appears

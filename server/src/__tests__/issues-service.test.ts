@@ -3901,6 +3901,9 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
+    // SON-4505 regression coverage seeds live checkout actor runs; clear
+    // them before agents or the heartbeat_runs agent FK fires.
+    await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(instanceSettings);
     await db.delete(companies);
@@ -4693,6 +4696,120 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         }],
       },
     });
+  });
+
+  it("checkout preserves blocked status and its justification instead of flipping to in_progress (SON-4505)", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const blockedId = randomUUID();
+    const todoId = randomUUID();
+    const blockedCheckoutRunId = randomUUID();
+    const todoCheckoutRunId = randomUUID();
+    const blockedStartedAt = new Date("2026-09-30T22:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "QAVerification",
+      role: "engineer",
+      status: "active",
+      adapterType: "openclaw_gateway",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // Checkout actors must be live in heartbeat_runs (fresh output) so the
+    // SON-3926 stale-actor gate does not refuse the anchor.
+    await db.insert(heartbeatRuns).values([
+      {
+        id: blockedCheckoutRunId,
+        companyId,
+        agentId: assigneeAgentId,
+        status: "running",
+        invocationSource: "wake",
+        startedAt: new Date(),
+        lastOutputAt: new Date(),
+      },
+      {
+        id: todoCheckoutRunId,
+        companyId,
+        agentId: assigneeAgentId,
+        status: "running",
+        invocationSource: "wake",
+        startedAt: new Date(),
+        lastOutputAt: new Date(),
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: blockedId,
+        companyId,
+        title: "Externally blocked card",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+        startedAt: blockedStartedAt,
+        externalBlocker: {
+          owner: assigneeAgentId,
+          note: "Deploy roll pending upstream build",
+          since: "2026-09-30T22:00:00.000Z",
+        },
+      },
+      {
+        id: todoId,
+        companyId,
+        title: "Unstarted card",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId,
+      },
+    ]);
+
+    const blockedResult = await svc.checkout(
+      blockedId,
+      assigneeAgentId,
+      ["todo", "backlog", "blocked", "in_review"],
+      blockedCheckoutRunId,
+    );
+    expect(blockedResult.status).toBe("blocked");
+    expect(blockedResult.checkoutRunId).toBe(blockedCheckoutRunId);
+    expect(blockedResult.executionRunId).toBe(blockedCheckoutRunId);
+
+    const blockedRow = await db
+      .select({
+        status: issues.status,
+        startedAt: issues.startedAt,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        externalBlocker: issues.externalBlocker,
+      })
+      .from(issues)
+      .where(eq(issues.id, blockedId))
+      .then((rows) => rows[0]);
+    expect(blockedRow.status).toBe("blocked");
+    expect(blockedRow.startedAt).toEqual(blockedStartedAt);
+    expect(blockedRow.checkoutRunId).toBe(blockedCheckoutRunId);
+    expect(blockedRow.executionRunId).toBe(blockedCheckoutRunId);
+    expect(blockedRow.externalBlocker).toMatchObject({
+      owner: assigneeAgentId,
+      note: "Deploy roll pending upstream build",
+    });
+
+    // Control: unstarted work still moves to in_progress at checkout.
+    const todoResult = await svc.checkout(
+      todoId,
+      assigneeAgentId,
+      ["todo", "backlog", "blocked", "in_review"],
+      todoCheckoutRunId,
+    );
+    expect(todoResult.status).toBe("in_progress");
+    expect(todoResult.startedAt).toBeTruthy();
   });
 
   it("wakes parents only when all direct children are terminal", async () => {

@@ -898,7 +898,7 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
-  it("allows a board user to withdraw and wakes the assignee", async () => {
+  it("allows a board user to withdraw a cancelled interaction without waking the assignee", async () => {
     const app = await createApp();
     const res = await request(app)
       .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-withdraw/withdraw")
@@ -912,12 +912,51 @@ describe.sequential("issue thread interaction routes", () => {
       expect.objectContaining({ userId: "local-board" }),
       expect.objectContaining({ afterResolveInTransaction: expect.any(Function) }),
     );
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(ASSIGNEE_AGENT_ID, expect.objectContaining({
-      payload: expect.objectContaining({ interactionStatus: "cancelled" }),
-    }));
+    // SON-4505: a cancelled resolution carries no new content, so it must not
+    // burn an assignee heartbeat on a zero-comment issue_commented wake.
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "issue.thread_interaction_withdrawn",
     }));
+  });
+
+  it("still wakes the assignee when a cancelled interaction coincides with a stalled review path", async () => {
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({ status: "in_review" }));
+    mockIssueService.listReviewAttention.mockResolvedValueOnce(new Map([
+      [ISSUE_ID, { state: "stalled" }],
+    ]));
+    // Policy "none" isolates the review-path escape hatch: without it the
+    // generic continuation policy alone would allow the wake.
+    mockInteractionService.withdrawInteraction.mockImplementationOnce((...args) => resolveMockInteraction(args, {
+      id: "interaction-withdraw",
+      companyId: "company-1",
+      issueId: ISSUE_ID,
+      kind: "ask_user_questions",
+      createdByAgentId: CREATED_AGENT_ID,
+      status: "cancelled",
+      continuationPolicy: "none",
+      payload: { version: 1, questions: [] },
+      result: { version: 1, answers: [], cancelled: true },
+    }));
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-withdraw/withdraw`)
+      .send({ reason: "Replanning" });
+
+    expect(res.status).toBe(200);
+    // The review-path recovery instruction is real content: the wake must
+    // survive the SON-4505 cancelled guard.
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        payload: expect.objectContaining({
+          interactionId: "interaction-withdraw",
+          interactionStatus: "cancelled",
+          reviewPathLost: true,
+        }),
+      }),
+    );
   });
 
   it("cancels the bound native run when its question is withdrawn", async () => {
@@ -985,7 +1024,7 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
-  it("allows the creator agent to withdraw and wakes a different assignee", async () => {
+  it("allows the creator agent to withdraw without waking a different assignee (SON-4505)", async () => {
     mockIssueService.getById.mockResolvedValueOnce(createIssue({ status: "in_review", reviewPolicy: null }));
     mockInteractionService.getForIssue.mockResolvedValueOnce({
       id: "interaction-withdraw",
@@ -1002,7 +1041,9 @@ describe.sequential("issue thread interaction routes", () => {
       .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-withdraw/withdraw")
       .send({});
     expect(res.status).toBe(200);
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(ASSIGNEE_AGENT_ID, expect.anything());
+    // A withdrawn confirmation resolves cancelled with no verdict and no
+    // comment; the assignee has nothing to act on, so no continuation wake.
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("allows the assignee agent to withdraw without waking itself", async () => {
@@ -1058,7 +1099,7 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
   });
 
-  it("cancels question interactions and emits a continuation wake", async () => {
+  it("cancels question interactions without emitting a zero-content continuation wake", async () => {
     const app = await createApp();
 
     const res = await request(app)
@@ -1074,19 +1115,10 @@ describe.sequential("issue thread interaction routes", () => {
       expect.objectContaining({ userId: "local-board" }),
       expect.objectContaining({ afterResolveInTransaction: expect.any(Function) }),
     );
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      ASSIGNEE_AGENT_ID,
-      expect.objectContaining({
-        reason: "issue_commented",
-        payload: expect.objectContaining({
-          interactionId: "interaction-2",
-          interactionKind: "ask_user_questions",
-          interactionStatus: "cancelled",
-          sourceCommentId: "comment-2",
-          sourceRunId: RUN_2,
-        }),
-      }),
-    );
+    // SON-4505: cancelling an ask_user_questions interaction produces no
+    // answers and no comments; the board cancellation must not burn an
+    // assignee heartbeat on an empty issue_commented wake.
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
