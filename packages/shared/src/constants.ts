@@ -919,6 +919,11 @@ export const HEARTBEAT_RUN_STATUSES = [
   "scheduled_retry",
   "running",
   "succeeded",
+  // Terminal outcome for continuation-only sweeps that produced no material
+  // action (e.g. a comment-only continuation run that ended liveness-blocked).
+  // Distinct from `succeeded` so these runs neither inflate success counts nor
+  // justify another continuation retry tick. See SON-1612.
+  "no_op",
   "interrupted",
   "failed",
   "cancelled",
