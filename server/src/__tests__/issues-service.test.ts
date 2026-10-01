@@ -5634,7 +5634,11 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
         agentId,
         status: "running",
         invocationSource: "manual",
-        startedAt: new Date("2026-06-10T10:07:00.000Z"),
+        // The checkout actor must be live (fresh startedAt/lastOutputAt) so
+        // the stale-actor gate does not refuse it. The stale anchor being
+        // cleared (failedRunId) keeps its old terminal timestamps.
+        startedAt: new Date(),
+        lastOutputAt: new Date(),
       },
     ]);
     await db.insert(issues).values({
@@ -5811,7 +5815,11 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
         agentId,
         status: "running",
         invocationSource: "manual",
-        startedAt: new Date("2026-06-10T10:07:00.000Z"),
+        // The checkout actor must be live (fresh startedAt/lastOutputAt) so
+        // the stale-actor gate does not refuse it. The anchors being adopted
+        // from (failed checkout run, queued execution run) stay unchanged.
+        startedAt: new Date(),
+        lastOutputAt: new Date(),
       },
     ]);
     await db.insert(issues).values({
