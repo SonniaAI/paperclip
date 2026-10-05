@@ -11052,7 +11052,7 @@ export function issueRoutes(
     if (commentBody) {
       const commentReferenceSummaryBefore = updateReferenceSummaryAfter
         ?? await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      comment = await svc.addComment(id, commentBody, {
+      comment = await svc.addComment(issue.id, commentBody, {
         agentId: actor.agentId ?? undefined,
         userId: actor.actorType === "user" ? actor.actorId : undefined,
         runId: actor.runId,
@@ -11853,7 +11853,7 @@ export function issueRoutes(
       limitRaw && Number.isFinite(limitRaw) && limitRaw > 0
         ? Math.min(Math.floor(limitRaw), MAX_ISSUE_COMMENT_LIMIT)
         : null;
-    const comments = await svc.listComments(id, {
+    const comments = await svc.listComments(issue.id, {
       afterCommentId,
       order,
       limit,
@@ -13473,40 +13473,60 @@ export function issueRoutes(
             actor,
           })
         : null;
-      const reopenedIssue = await svc.update(id, { status: "todo" });
-      if (!reopenedIssue) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
+      let reopenedIssue: Awaited<ReturnType<typeof svc.update>> | null = null;
+      let reopenSkippedForActiveIncident = false;
+      try {
+        reopenedIssue = await svc.update(issue.id, { status: "todo" });
+      } catch (error) {
+        if (
+          issue.originKind === "orchestration_incident" &&
+          isUniqueViolation(error, "issues_active_orchestration_incident_uq")
+        ) {
+          if (explicitMoveToTodoRequested) {
+            throw conflict("An active orchestration incident already exists for this source");
+          }
+          // The active incident owns this origin key. Keep this historical issue
+          // terminal, but do not discard a plain comment because it cannot reopen.
+          reopenSkippedForActiveIncident = true;
+        } else {
+          throw error;
+        }
       }
-      reopened = isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers);
-      reopenFromStatus = reopened ? issue.status : null;
-      currentIssue = reopenedIssue;
+      if (!reopenSkippedForActiveIncident) {
+        if (!reopenedIssue) {
+          res.status(404).json({ error: "Issue not found" });
+          return;
+        }
+        reopened = isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers);
+        reopenFromStatus = reopened ? issue.status : null;
+        currentIssue = reopenedIssue;
 
-      await logActivity(db, {
-        companyId: currentIssue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-        action: "issue.updated",
-        entityType: "issue",
-        entityId: currentIssue.id,
-        details: {
-          status: "todo",
-          ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus } : {}),
-          ...(scheduledRetrySupersededByComment
-            ? {
-                scheduledRetrySupersededByComment: true,
-                scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
-                ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
-              }
-            : {}),
-          source: "comment",
-          ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-          identifier: currentIssue.identifier,
-        },
-      });
+        await logActivity(db, {
+          companyId: currentIssue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: currentIssue.id,
+          details: {
+            status: "todo",
+            ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus } : {}),
+            ...(scheduledRetrySupersededByComment
+              ? {
+                  scheduledRetrySupersededByComment: true,
+                  scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
+                  ...(cancelledScheduledRetryRunId ? { cancelledScheduledRetryRunId } : {}),
+                }
+              : {}),
+            source: "comment",
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            identifier: currentIssue.identifier,
+          },
+        });
+      }
     }
 
     if (interruptRequested) {
@@ -13604,7 +13624,7 @@ export function issueRoutes(
       try {
         txResult = await db.transaction(async (tx) => {
           const insertedComment = await svc.addComment(
-            id,
+            issue.id,
             req.body.body,
             {
               agentId: actor.agentId ?? undefined,
@@ -13616,8 +13636,8 @@ export function issueRoutes(
             tx,
           );
           const updated = actor.actorType === "user" && currentIssue.status !== "done"
-            ? await svc.update(id, updatePatch, tx, postCommitActivityPublications, postCommitIssueActions)
-            : await svc.update(id, updatePatch, tx, undefined, postCommitIssueActions);
+            ? await svc.update(issue.id, updatePatch, tx, postCommitActivityPublications, postCommitIssueActions)
+            : await svc.update(issue.id, updatePatch, tx, undefined, postCommitIssueActions);
           // Throw (not return null) so drizzle rolls back the inserted comment when the issue
           // has been concurrently deleted between the initial fetch and the in-transaction update.
           if (!updated) throw new AutoApprovalIssueMissingError();
@@ -13680,7 +13700,7 @@ export function issueRoutes(
         requestedByActorId: actor.actorId,
       });
     } else {
-      comment = await svc.addComment(id, req.body.body, {
+      comment = await svc.addComment(issue.id, req.body.body, {
         agentId: actor.agentId ?? undefined,
         userId: actor.actorType === "user" ? actor.actorId : undefined,
         runId: actor.runId,
