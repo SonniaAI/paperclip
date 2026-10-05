@@ -170,6 +170,12 @@ import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
+import {
+  classifyMachineStatePatchNoop,
+  isRunAnchoredToIssue,
+  type IssueMonitorRunAnchor,
+  type IssueMonitorRunRecord,
+} from "./issue-machine-state.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
   formatAttachmentSize,
@@ -1833,12 +1839,13 @@ function applyActorMonitorScheduledBy(
   return setIssueExecutionPolicyMonitorScheduledBy(policy, actorType === "user" ? "board" : "assignee");
 }
 
-async function assertCanManageIssueMonitor(
+export async function assertCanManageIssueMonitor(
   accessSvc: ReturnType<typeof accessService>,
   req: Request,
   companyId: string,
   assigneeAgentId: string | null,
   monitorChanged: boolean,
+  runAnchor?: IssueMonitorRunAnchor | null,
 ) {
   if (!monitorChanged) return;
   if (req.actor.type === "board") return;
@@ -1851,6 +1858,62 @@ async function assertCanManageIssueMonitor(
     throw forbidden(runtimeDecision.explanation, authorizationDeniedDetails(runtimeDecision));
   }
   if (req.actor.type === "agent" && req.actor.agentId && req.actor.agentId === assigneeAgentId) return;
+  // SON-1524 B1 (run-scoped service identity): a LIVE run anchored to THIS
+  // issue is the service identity executing on it and may hold its machine
+  // state even when the recorded assignee differs. Run identity is trusted
+  // ONLY when the auth middleware resolved it from a signed agent JWT
+  // (source "agent_jwt"): agent_key actors carry the raw X-Paperclip-Run-Id
+  // header, a caller-controlled value that can never anchor a grant here
+  // (fail closed). Defense-in-depth: the fetched run must also belong to the
+  // authenticated company + agent. Missing / stale / cross-issue /
+  // post-takeover / foreign-owner run ids keep the fail-closed 403 below.
+  // Every denial emits exactly one minimal warn (no run or issue ids) so
+  // spoof attempts and store-probe failures stay observable.
+  if (runAnchor && req.actor.type === "agent") {
+    const actorRunId = req.actor.runId ?? "";
+    let denyReason: string | null = null;
+    if (req.actor.source !== "agent_jwt") {
+      denyReason = "untrusted_run_identity_source";
+    } else if (
+      !isRunAnchoredToIssue({
+        actorRunId,
+        checkoutRunId: runAnchor.checkoutRunId,
+        executionRunId: runAnchor.executionRunId,
+      })
+    ) {
+      denyReason = "run_not_anchored_to_issue";
+    } else {
+      let anchoredRun: IssueMonitorRunRecord | null | undefined = null;
+      try {
+        anchoredRun = await runAnchor.getRun(actorRunId);
+      } catch {
+        anchoredRun = null;
+        denyReason = "run_probe_failed";
+      }
+      if (!denyReason) {
+        if (!anchoredRun || anchoredRun.status !== "running") {
+          denyReason = "run_not_live";
+        } else if (
+          anchoredRun.companyId !== req.actor.companyId
+          || anchoredRun.agentId !== req.actor.agentId
+        ) {
+          denyReason = "run_owner_mismatch";
+        }
+      }
+    }
+    if (denyReason) {
+      logger.warn(
+        {
+          reason: denyReason,
+          actorSource: req.actor.source ?? null,
+          runIdPresent: actorRunId.length > 0,
+        },
+        "monitor_run_anchor_denied",
+      );
+    } else {
+      return;
+    }
+  }
   throw forbidden("Only the assignee agent or a board user can manage issue monitors");
 }
 
@@ -9752,7 +9815,11 @@ export function issueRoutes(
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
-    await assertCanManageIssueMonitor(access, req, issue.companyId, issue.assigneeAgentId, true);
+    await assertCanManageIssueMonitor(access, req, issue.companyId, issue.assigneeAgentId, true, {
+      checkoutRunId: issue.checkoutRunId,
+      executionRunId: issue.executionRunId,
+      getRun: (runId) => heartbeat.getRun(runId),
+    });
 
     const actor = getActorInfo(req);
     await heartbeat.triggerIssueMonitor(issue.id, {
@@ -10211,6 +10278,11 @@ export function issueRoutes(
       existing.companyId,
       existing.assigneeAgentId,
       req.body.executionPolicy !== undefined && monitorChanged,
+      {
+        checkoutRunId: existing.checkoutRunId,
+        executionRunId: existing.executionRunId,
+        getRun: (runId) => heartbeat.getRun(runId),
+      },
     );
 
     const transition = applyIssueExecutionPolicyTransition({
@@ -11492,6 +11564,11 @@ export function issueRoutes(
 
     await queueTaskWatchdogEvaluation(issue, actor.runId);
     const changes = issueResponse.changes ?? {};
+    // SON-1524 B2: explicit machine-state noop observability (loosens nothing).
+    const machineStateNoop = classifyMachineStatePatchNoop({
+      requested: req.body as Record<string, unknown>,
+      effectiveChanges: issueChanges,
+    });
     if (prefersMinimalIssueUpdateResponse(req)) {
       res.setHeader("Preference-Applied", "return=minimal");
       res.json({
@@ -11499,11 +11576,17 @@ export function issueRoutes(
         identifier: issueResponse.identifier,
         updatedAt: issueResponse.updatedAt,
         changes,
+        ...(machineStateNoop.noop ? { noop: true, noopReason: machineStateNoop.noopReason } : {}),
         comment,
       });
       return;
     }
-    res.json({ ...issueResponse, changes, comment });
+    res.json({
+      ...issueResponse,
+      changes,
+      ...(machineStateNoop.noop ? { noop: true, noopReason: machineStateNoop.noopReason } : {}),
+      comment,
+    });
   });
 
   router.delete("/issues/:id", async (req, res) => {
