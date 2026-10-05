@@ -17494,7 +17494,7 @@ export function issueRoutes(
             issue.originKind === "orchestration_incident" &&
             isUniqueViolation(error, "issues_active_orchestration_incident_uq")
           ) {
-            if (explicitMoveToTodoRequested) {
+            if (reopenRequested || resumeRequested) {
               throw conflict(
                 "An active orchestration incident already exists for this source",
               );
@@ -17684,22 +17684,49 @@ export function issueRoutes(
               },
               tx,
             );
-            const updated =
-              actor.actorType === "user" && currentIssue.status !== "done"
-                ? await svc.update(
-                    issue.id,
-                    updatePatch,
-                    tx,
-                    postCommitActivityPublications,
-                    postCommitIssueActions,
-                  )
-                : await svc.update(
-                    issue.id,
-                    updatePatch,
-                    tx,
-                    undefined,
-                    postCommitIssueActions,
+            let updated: Awaited<ReturnType<typeof svc.update>> | null =
+              null;
+            try {
+              updated =
+                actor.actorType === "user" && currentIssue.status !== "done"
+                  ? await svc.update(
+                      issue.id,
+                      updatePatch,
+                      tx,
+                      postCommitActivityPublications,
+                      postCommitIssueActions,
+                    )
+                  : await svc.update(
+                      issue.id,
+                      updatePatch,
+                      tx,
+                      undefined,
+                      postCommitIssueActions,
+                    );
+            } catch (error) {
+              if (
+                issue.originKind === "orchestration_incident" &&
+                isUniqueViolation(
+                  error,
+                  "issues_active_orchestration_incident_uq",
+                )
+              ) {
+                if (reopenRequested || resumeRequested) {
+                  // The active successor incident owns this origin key. An
+                  // explicit reopen cannot succeed; roll back the comment.
+                  throw conflict(
+                    "An active orchestration incident already exists for this source",
                   );
+                }
+                // A plain comment must not reopen the historical incident.
+                // Keep it terminal and let the inserted comment commit.
+                updated = currentIssue as Awaited<
+                  ReturnType<typeof svc.update>
+                >;
+              } else {
+                throw error;
+              }
+            }
             // Throw (not return null) so drizzle rolls back the inserted comment when the issue
             // has been concurrently deleted between the initial fetch and the in-transaction update.
             if (!updated) throw new AutoApprovalIssueMissingError();
