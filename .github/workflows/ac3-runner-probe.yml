@@ -1,0 +1,17 @@
+name: AC3 runner probe (SON-4889)
+on:
+  workflow_dispatch:
+    inputs:
+      hold:
+        description: seconds to keep the runner pod alive
+        default: '120'
+        required: false
+jobs:
+  probe:
+    runs-on: spark-paperclip
+    timeout-minutes: 15
+    steps:
+      - name: marker
+        run: echo "SON-4889 AC3 CI-runner probe on $(uname -a) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      - name: hold
+        run: sleep "${{ inputs.hold || '120' }}"
