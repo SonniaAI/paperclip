@@ -536,6 +536,12 @@ export interface IssueUnblockDescriptor {
   action: string;
 }
 
+/** Freeform wait-on-external-party record for blocked issues (e.g. a founder or an off-board system). */
+export interface IssueExternalBlocker {
+  owner: string;
+  note: string;
+}
+
 export type IssueProductivityReviewTrigger =
   | "no_comment_streak"
   | "long_active_duration"
