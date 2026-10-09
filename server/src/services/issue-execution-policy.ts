@@ -968,10 +968,21 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           };
         }
 
-        const participant = selectStageParticipant(nextStage, {
-          preferred: explicitAssignee,
-          exclude: existingState?.returnAssignee ?? null,
-        });
+        // SON-4905: a stage whose participants are exactly the return assignee
+        // (e.g. a final QA stage held by the return reviewer) used to 422 the
+        // whole approval close here, because the exclude filter empties the
+        // candidate list. The return assignee was configured deliberately, so
+        // fall back to the unfiltered selection instead of failing the stage
+        // advance. The pre-filter preference still wins when it yields a
+        // candidate, and a stage with no participants at all still fails below.
+        const participant =
+          selectStageParticipant(nextStage, {
+            preferred: explicitAssignee,
+            exclude: existingState?.returnAssignee ?? null,
+          }) ??
+          selectStageParticipant(nextStage, {
+            preferred: explicitAssignee ?? existingState?.returnAssignee ?? null,
+          });
         if (!participant) {
           throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue`);
         }

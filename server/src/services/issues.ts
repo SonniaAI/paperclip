@@ -8592,6 +8592,61 @@ export function issueService(db: Db) {
         return enriched;
       }
 
+      // SON-4905: a reconciler/finalization release can clear the checkout
+      // hold while the execution anchor still names a run of the same agent.
+      // Every adoption path above requires in_progress status, a set
+      // checkoutRunId, or a terminal anchor run, so that released shape fell
+      // through to a permanent 409: the slot stayed refused even though nobody
+      // held the checkout, and approval-stage closes could never land.
+      // Re-anchor the lock when the requester is the assignee and the anchor
+      // run belongs to the same agent; a live anchor of ANOTHER agent still
+      // conflicts below.
+      if (
+        checkoutRunId &&
+        current.checkoutRunId == null &&
+        current.executionRunId != null &&
+        current.executionRunId !== checkoutRunId &&
+        current.assigneeAgentId === agentId
+      ) {
+        const anchorRun = await db
+          .select({ agentId: heartbeatRuns.agentId })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, current.executionRunId))
+          .then((rows) => rows[0] ?? null);
+        if (anchorRun && anchorRun.agentId === agentId) {
+          const reanchorAt = new Date();
+          const reanchorSet: Record<string, unknown> = {
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            executionAgentNameKey: null,
+            executionLockedAt: reanchorAt,
+            status: "in_progress",
+            updatedAt: reanchorAt,
+          };
+          if (current.status !== "in_progress") {
+            reanchorSet.startedAt = reanchorAt;
+          }
+          const reanchored = await db
+            .update(issues)
+            .set(reanchorSet as never)
+            .where(
+              and(
+                eq(issues.id, id),
+                isNull(issues.checkoutRunId),
+                eq(issues.executionRunId, current.executionRunId),
+                inArray(issues.status, expectedStatuses),
+                eq(issues.assigneeAgentId, agentId),
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (reanchored) {
+            const [enriched] = await withIssueLabels(db, [reanchored]);
+            return enriched;
+          }
+        }
+      }
+
       throw conflict("Issue checkout conflict", {
         issueId: current.id,
         status: current.status,

@@ -1359,6 +1359,52 @@ describe("issue execution policy transitions", () => {
       });
     });
 
+  it("approval advances into a final stage whose only participant is the return assignee (SON-4905)", () => {
+    const policy = makePolicy([
+      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+      { type: "approval", participants: [{ type: "agent", agentId: ctoAgentId }] },
+      { type: "review", participants: [{ type: "agent", agentId: coderAgentId }] },
+    ]);
+    const approvalStageId = policy.stages[1].id;
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: ctoAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: approvalStageId,
+          currentStageIndex: 1,
+          currentStageType: "approval",
+          currentParticipant: { type: "agent", agentId: ctoAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [policy.stages[0].id],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: ctoAgentId },
+      commentBody: "Approved",
+    });
+
+    expect(result.decision).toMatchObject({
+      stageId: approvalStageId,
+      stageType: "approval",
+      outcome: "approved",
+    });
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: policy.stages[2].id,
+      currentParticipant: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
     it("final-stage changes requested still returns to the executor", () => {
       const policy = threeStagePolicy();
       const approvalStageId = policy.stages[2].id;
