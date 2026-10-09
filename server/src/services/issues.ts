@@ -7877,6 +7877,7 @@ export function issueService(db: Db) {
         patch.blockedOwnerNotifiedAt = null;
       } else if (existing.status === "blocked" && issueData.status && issueData.status !== "blocked") {
         patch.unblockDescriptor = null;
+        patch.externalBlocker = null;
         patch.blockedTransitionAt = null;
         patch.blockedOwnerNotifiedAt = null;
       }

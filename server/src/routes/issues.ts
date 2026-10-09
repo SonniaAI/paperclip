@@ -10321,7 +10321,11 @@ export function issueRoutes(
     if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
       throw unprocessable("unblockDescriptor requires blocked status");
     }
+    if (updateFields.externalBlocker && nextStatus !== "blocked") {
+      throw unprocessable("externalBlocker requires blocked status");
+    }
     const descriptor = updateFields.unblockDescriptor ?? null;
+    const externalBlocker = updateFields.externalBlocker ?? null;
     if (descriptor && typeof descriptor === "object") {
       const owner = descriptor.owner;
       if (req.actor.type === "agent" && (owner === "board" || "userId" in owner)) {
@@ -10370,7 +10374,7 @@ export function issueRoutes(
           eq(approvals.status, "pending"),
         )).limit(1).then((rows) => rows[0] ?? null),
       ]);
-      if (!hasUnresolvedBlocker && !pendingInteraction && !pendingApproval && !descriptor) {
+      if (!hasUnresolvedBlocker && !pendingInteraction && !pendingApproval && !descriptor && !externalBlocker) {
         res.status(422).json({ error: "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor" });
         return;
       }
