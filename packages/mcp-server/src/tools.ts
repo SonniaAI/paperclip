@@ -124,6 +124,18 @@ const projectOverviewSchema = z.object({
   issueLimit: z.number().int().min(1).max(25).optional().default(10),
 });
 
+function projectToolContext(client: PaperclipApiClient, projectId: string, requestedCompanyId?: string | null) {
+  const companyId = client.resolveCompanyId(requestedCompanyId);
+  const companyPath = encodeURIComponent(companyId);
+  const projectPath = encodeURIComponent(projectId);
+  return {
+    companyId,
+    projectId,
+    projectUrl: `/projects/${projectPath}?companyId=${companyPath}`,
+    issuesUrl: `/companies/${companyPath}/issues`,
+  };
+}
+
 const listCommentsSchema = z.object({
   issueId: issueIdSchema,
   after: z.string().guid().optional(),
@@ -448,10 +460,9 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       "Read one authorized project's safe summary and a bounded page of its open issues (maximum 25)",
       projectOverviewSchema,
       async ({ companyId: requestedCompanyId, projectId, issueLimit }) => {
-        const companyId = client.resolveCompanyId(requestedCompanyId);
-        const projectPath = `/projects/${encodeURIComponent(projectId)}?companyId=${encodeURIComponent(companyId)}`;
+        const context = projectToolContext(client, projectId, requestedCompanyId);
         const issueParams = new URLSearchParams({
-          projectId,
+          projectId: context.projectId,
           status: "backlog,todo,in_progress,in_review,blocked",
           limit: String(issueLimit),
           sortField: "updated",
@@ -460,10 +471,10 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
           readOnlyProjection: "true",
         });
         const [project, issues] = await Promise.all([
-          client.requestJson<Record<string, unknown>>("GET", projectPath),
+          client.requestJson<Record<string, unknown>>("GET", context.projectUrl),
           client.requestJson<Array<Record<string, unknown>>>(
             "GET",
-            `/companies/${encodeURIComponent(companyId)}/issues?${issueParams.toString()}`,
+            `${context.issuesUrl}?${issueParams.toString()}`,
           ),
         ]);
         const description = typeof project.description === "string" ? project.description : null;

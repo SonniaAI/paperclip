@@ -108,7 +108,7 @@ describe("paperclip MCP tools", () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(mockJsonResponse({
         id: "44444444-4444-4444-8444-444444444444",
-        companyId: "11111111-1111-1111-1111-111111111111",
+        companyId: "77777777-7777-4777-8777-777777777777",
         name: "Current Project",
         description: "D".repeat(1_200),
         status: "in_progress",
@@ -128,6 +128,7 @@ describe("paperclip MCP tools", () => {
 
     const tool = getTool("paperclipGetProjectOverview");
     const response = await tool.execute({
+      companyId: "77777777-7777-4777-8777-777777777777",
       projectId: "44444444-4444-4444-8444-444444444444",
       issueLimit: 25,
     });
@@ -136,10 +137,10 @@ describe("paperclip MCP tools", () => {
     const projectRequest = fetchMock.mock.calls[0] as [string, RequestInit];
     const issueRequest = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(String(projectRequest[0])).toBe(
-      "http://localhost:3100/api/projects/44444444-4444-4444-8444-444444444444?companyId=11111111-1111-1111-1111-111111111111",
+      "http://localhost:3100/api/projects/44444444-4444-4444-8444-444444444444?companyId=77777777-7777-4777-8777-777777777777",
     );
     const issueUrl = new URL(String(issueRequest[0]));
-    expect(issueUrl.pathname).toBe("/api/companies/11111111-1111-1111-1111-111111111111/issues");
+    expect(issueUrl.pathname).toBe("/api/companies/77777777-7777-4777-8777-777777777777/issues");
     expect(issueUrl.searchParams.get("projectId")).toBe("44444444-4444-4444-8444-444444444444");
     expect(issueUrl.searchParams.get("limit")).toBe("25");
     expect(issueUrl.searchParams.get("view")).toBe("compact");
@@ -159,6 +160,20 @@ describe("paperclip MCP tools", () => {
     });
     expect(response.content[0]?.text).not.toContain("do-not-return");
     expect(response.content[0]?.text).not.toContain("private/workspace");
+  });
+
+  it("rejects project overview issue limits above the result cap", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipGetProjectOverview");
+    const response = await tool.execute({
+      projectId: "44444444-4444-4444-8444-444444444444",
+      issueLimit: 26,
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(response.content[0]?.text).toContain("error");
   });
 
   it("uses default agent id for checkout requests", async () => {
@@ -202,6 +217,7 @@ describe("paperclip MCP tools", () => {
       priority: "medium",
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
       requestDepth: 0,
+      allowDuplicate: false,
     });
   });
 

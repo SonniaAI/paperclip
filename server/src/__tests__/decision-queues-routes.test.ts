@@ -7,9 +7,12 @@ import {
   activityLog,
   agents,
   approvals,
+  authUsers,
+  companyMemberships,
   companies,
   createDb,
   decisionRetention,
+  decisionTrainingExamples,
   decisionQueueItems,
   decisionQueues,
   decisionTriage,
@@ -18,6 +21,7 @@ import {
   issueThreadInteractions,
   issueWorkProducts,
   issues,
+  principalPermissionGrants,
 } from "@paperclipai/db";
 import type { AttentionItem } from "@paperclipai/shared";
 import {
@@ -49,6 +53,10 @@ describeEmbeddedPostgres("decision queue routes", () => {
   afterEach(async () => {
     await db.delete(issueRecoveryActions);
     await db.delete(decisionRetention);
+    await db.delete(decisionTrainingExamples);
+    await db.delete(principalPermissionGrants);
+    await db.delete(companyMemberships);
+    await db.delete(authUsers);
     await db.delete(decisionTriageEvents);
     await db.delete(decisionQueueItems);
     await db.delete(decisionTriage);
@@ -295,6 +303,97 @@ describeEmbeddedPostgres("decision queue routes", () => {
     expect(response.body.countsBySourceKind.recovery_action).toBe(1);
     expect(await db.select().from(decisionQueues).where(eq(decisionQueues.companyId, companyId))).toEqual([]);
     expect(await db.select().from(decisionRetention).where(eq(decisionRetention.companyId, companyId))).toEqual([]);
+    expect(await db.select().from(decisionQueueItems).where(eq(decisionQueueItems.companyId, companyId))).toEqual([]);
+    expect(await db.select().from(decisionTriage).where(eq(decisionTriage.companyId, companyId))).toEqual([]);
+    expect(await db.select().from(decisionTriageEvents).where(eq(decisionTriageEvents.companyId, companyId))).toEqual([]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).toEqual([]);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, companyId)))
+      .toEqual([expect.objectContaining({ id: recoveryId, status: "active" })]);
+  });
+
+  it("rejects a Decisions overview request outside the agent company", async () => {
+    const { companyId, agentId } = await seed();
+    await request(app(agentActor(companyId, agentId)))
+      .get(`/api/companies/${randomUUID()}/decision-queue-overview`)
+      .expect(403);
+  });
+
+  it("uses the responsible user when attaching personalized Decisions context", async () => {
+    const { companyId, agentId, issueId, interactionId } = await seed();
+    const responsibleUserId = "decision-reviewer";
+    const otherUserId = "another-reviewer";
+    const now = new Date();
+    for (const userId of [responsibleUserId, otherUserId]) {
+      await db.insert(authUsers).values({
+        id: userId,
+        name: userId,
+        email: `${userId}@example.test`,
+        emailVerified: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "user",
+        principalId: userId,
+        membershipRole: "operator",
+        status: "active",
+      });
+      await db.insert(principalPermissionGrants).values({
+        companyId,
+        principalType: "user",
+        principalId: userId,
+        permissionKey: "decision_queue:read",
+      });
+    }
+    const trainingExampleId = randomUUID();
+    await db.insert(decisionTrainingExamples).values({
+      id: trainingExampleId,
+      companyId,
+      sourceKind: "interaction",
+      sourceId: interactionId,
+      issueId,
+      cutoffAt: new Date(),
+      notes: "",
+      snapshot: {} as never,
+      createdByUserId: responsibleUserId,
+    });
+
+    const matchingResponse = await request(app({
+      ...agentActor(companyId, agentId),
+      onBehalfOfUserId: responsibleUserId,
+      onBehalfOfMemberships: [{ companyId, membershipRole: "member", status: "active" }],
+    }))
+      .get(`/api/companies/${companyId}/decision-queue-overview`)
+      .expect(200);
+    const matchingItem = matchingResponse.body.items.find((item: { sourceKind: string; subject: { id: string } }) =>
+      item.sourceKind === "issue_thread_interaction" && item.subject.id === interactionId,
+    );
+    expect(matchingItem.trainingExampleId).toBe(trainingExampleId);
+
+    const otherResponse = await request(app({
+      ...agentActor(companyId, agentId),
+      onBehalfOfUserId: otherUserId,
+      onBehalfOfMemberships: [{ companyId, membershipRole: "member", status: "active" }],
+    }))
+      .get(`/api/companies/${companyId}/decision-queue-overview`)
+      .expect(200);
+    const otherItem = otherResponse.body.items.find((item: { sourceKind: string; subject: { id: string } }) =>
+      item.sourceKind === "issue_thread_interaction" && item.subject.id === interactionId,
+    );
+    expect(otherItem.trainingExampleId).toBeNull();
+  });
+
+  it("rejects agents without decision queue read access", async () => {
+    const { companyId, agentId } = await seed();
+    const restrictedAgent = {
+      ...agentActor(companyId, agentId),
+      source: "agent_jwt",
+      keyScope: { kind: "skill_test", issueId: randomUUID() },
+    };
+    await request(app(restrictedAgent))
+      .get(`/api/companies/${companyId}/decision-queue-overview`)
+      .expect(403);
   });
 
   it("rejects invalid decision overview page limits", async () => {
