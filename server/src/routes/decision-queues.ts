@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import {
   addDecisionQueueItemSchema,
@@ -17,12 +18,20 @@ import {
   type AuthorizationAction,
 } from "../services/authorization.js";
 import {
+  canReadDecisionSource,
   DECISION_QUEUE_SEEDS,
   decisionQueueService,
   type DecisionMutationActor,
 } from "../services/decision-queues.js";
 import { assertBoardOrAgent, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { decisionRetentionService } from "../services/decision-retention.js";
+import { attentionService } from "../services/attention.js";
+
+const decisionQueueOverviewQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  cursor: z.string().trim().min(1).max(2_000).optional(),
+  sort: z.enum(["activity", "decide"]).optional(),
+}).strict();
 
 function mutationActor(req: Parameters<typeof getActorInfo>[0]): DecisionMutationActor {
   const actor = getActorInfo(req);
@@ -72,6 +81,28 @@ export function decisionQueueRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     await assertDecisionAccess(db, req, companyId, "decision_queue:read");
     res.json(DECISION_QUEUE_SEEDS);
+  });
+
+  router.get("/companies/:companyId/decision-queue-overview", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    await assertDecisionAccess(db, req, companyId, "decision_queue:read");
+    const query = decisionQueueOverviewQuerySchema.safeParse(req.query);
+    if (!query.success) {
+      res.status(400).json({ error: "Invalid decision queue overview filters", details: query.error.flatten() });
+      return;
+    }
+    const actor = req.actor;
+    const userId = actor.type === "board" ? actor.userId : actor.onBehalfOfUserId ?? null;
+    const feed = await attentionService(db, { readOnly: true }).list(companyId, {
+      userId,
+      limit: query.data.limit,
+      cursor: query.data.cursor,
+      sort: query.data.sort,
+      ...(actor.type === "agent" ? {
+        canReadItem: (sourceKind, sourceId) => canReadDecisionSource(db, actor, companyId, sourceKind, sourceId),
+      } : {}),
+    });
+    res.json(feed);
   });
 
   router.get("/companies/:companyId/decision-queues", async (req, res) => {

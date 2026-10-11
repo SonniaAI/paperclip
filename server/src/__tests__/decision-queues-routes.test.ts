@@ -9,10 +9,12 @@ import {
   approvals,
   companies,
   createDb,
+  decisionRetention,
   decisionQueueItems,
   decisionQueues,
   decisionTriage,
   decisionTriageEvents,
+  issueRecoveryActions,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
@@ -45,6 +47,8 @@ describeEmbeddedPostgres("decision queue routes", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(issueRecoveryActions);
+    await db.delete(decisionRetention);
     await db.delete(decisionTriageEvents);
     await db.delete(decisionQueueItems);
     await db.delete(decisionTriage);
@@ -261,6 +265,43 @@ describeEmbeddedPostgres("decision queue routes", () => {
       eq(decisionQueueItems.companyId, companyId),
       eq(decisionQueueItems.sourceKind, "approval"),
     ))).toHaveLength(0);
+  });
+
+  it("serves a paginated Recovery-inclusive decision overview to agents without mutating projections", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    const recoveryId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: recoveryId,
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "board",
+      ownerUserId: "board-user",
+      cause: "executor_unavailable",
+      fingerprint: "decision-queue-overview-test",
+      nextAction: "Assign a new owner",
+    });
+
+    const response = await request(app(agentActor(companyId, agentId)))
+      .get(`/api/companies/${companyId}/decision-queue-overview?limit=10&sort=activity`)
+      .expect(200);
+
+    expect(response.body.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceKind: "recovery_action", subject: expect.objectContaining({ id: recoveryId }) }),
+      expect.objectContaining({ sourceKind: "issue_thread_interaction" }),
+    ]));
+    expect(response.body.totalCount).toBe(response.body.items.length);
+    expect(response.body.countsBySourceKind.recovery_action).toBe(1);
+    expect(await db.select().from(decisionQueues).where(eq(decisionQueues.companyId, companyId))).toEqual([]);
+    expect(await db.select().from(decisionRetention).where(eq(decisionRetention.companyId, companyId))).toEqual([]);
+  });
+
+  it("rejects invalid decision overview page limits", async () => {
+    const { companyId, agentId } = await seed();
+    await request(app(agentActor(companyId, agentId)))
+      .get(`/api/companies/${companyId}/decision-queue-overview?limit=101`)
+      .expect(400);
   });
 
   it("materializes data-backed starter queues from plan, question, and pull-request signals", async () => {

@@ -86,6 +86,81 @@ describe("paperclip MCP tools", () => {
     expect(response.content[0]?.text).toContain("issue-1");
   });
 
+  it("reads the Recovery-inclusive Decisions overview with a bounded cursor page", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ items: [{ sourceKind: "recovery_action" }], nextCursor: "next-page" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipGetDecisionQueueOverview");
+    const response = await tool.execute({ limit: 25, cursor: "prior-page", sort: "decide" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/decision-queue-overview?limit=25&cursor=prior-page&sort=decide",
+    );
+    expect(init.method).toBe("GET");
+    expect(response.content[0]?.text).toContain("recovery_action");
+  });
+
+  it("returns one project's safe summary and at most 25 open issues", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(mockJsonResponse({
+        id: "44444444-4444-4444-8444-444444444444",
+        companyId: "11111111-1111-1111-1111-111111111111",
+        name: "Current Project",
+        description: "D".repeat(1_200),
+        status: "in_progress",
+        env: { SECRET: "do-not-return" },
+        workspaces: [{ cwd: "/private/workspace" }],
+      }))
+      .mockResolvedValueOnce(mockJsonResponse([{
+        id: "55555555-5555-4555-8555-555555555555",
+        identifier: "PAP-42",
+        title: "Open item",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: "22222222-2222-2222-2222-222222222222",
+        updatedAt: "2026-10-11T10:00:00.000Z",
+      }]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipGetProjectOverview");
+    const response = await tool.execute({
+      projectId: "44444444-4444-4444-8444-444444444444",
+      issueLimit: 25,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const projectRequest = fetchMock.mock.calls[0] as [string, RequestInit];
+    const issueRequest = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(String(projectRequest[0])).toBe(
+      "http://localhost:3100/api/projects/44444444-4444-4444-8444-444444444444?companyId=11111111-1111-1111-1111-111111111111",
+    );
+    const issueUrl = new URL(String(issueRequest[0]));
+    expect(issueUrl.pathname).toBe("/api/companies/11111111-1111-1111-1111-111111111111/issues");
+    expect(issueUrl.searchParams.get("projectId")).toBe("44444444-4444-4444-8444-444444444444");
+    expect(issueUrl.searchParams.get("limit")).toBe("25");
+    expect(issueUrl.searchParams.get("view")).toBe("compact");
+    expect(issueUrl.searchParams.get("readOnlyProjection")).toBe("true");
+
+    const output = JSON.parse(response.content[0]!.text) as Record<string, unknown>;
+    expect(output).toMatchObject({
+      project: {
+        name: "Current Project",
+        status: "in_progress",
+        description: "D".repeat(1_000),
+        descriptionTruncated: true,
+      },
+      openIssues: [{ identifier: "PAP-42", title: "Open item" }],
+      issueLimit: 25,
+      mayHaveMoreOpenIssues: false,
+    });
+    expect(response.content[0]?.text).not.toContain("do-not-return");
+    expect(response.content[0]?.text).not.toContain("private/workspace");
+  });
+
   it("uses default agent id for checkout requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ id: "PAP-1135", status: "in_progress" }),

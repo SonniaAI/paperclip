@@ -135,6 +135,16 @@ export function decisionRetentionService(
   db: Db,
   options: { notifyOriginAgent?: (batch: ArchiveNotificationBatch) => Promise<unknown> } = {},
 ) {
+  async function getItems(companyId: string, items: readonly AttentionItem[]) {
+    if (items.length === 0) return new Map<string, DecisionRetentionState>();
+    const sourceIds = [...new Set(items.map((item) => item.subject.id))];
+    const rows = await db.select().from(decisionRetention).where(and(
+      eq(decisionRetention.companyId, companyId),
+      inArray(decisionRetention.sourceId, sourceIds),
+    ));
+    return new Map(rows.map((row) => [sourceKey(row.sourceKind, row.sourceId), row]));
+  }
+
   async function syncItems(companyId: string, items: readonly AttentionItem[]) {
     if (items.length === 0) return new Map<string, DecisionRetentionState>();
     const unique = [...new Map(items.map((item) => [itemSourceKey(item), item])).values()];
@@ -470,6 +480,7 @@ export function decisionRetentionService(
   }
 
   return {
+    getItems,
     syncItems,
     getState,
     setKeep,

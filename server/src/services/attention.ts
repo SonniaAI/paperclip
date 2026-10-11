@@ -161,11 +161,15 @@ type AttentionListOptions = AttentionFeedQuery & {
   userId?: string | null;
   /** Internal-only escape hatch for callers that need one stable, unpaginated feed snapshot. */
   allowUnscopedAll?: boolean;
+  /** Internal authorization filter applied before enrichment, counts, and pagination. */
+  canReadItem?: (sourceKind: AttentionSourceKind, sourceId: string) => Promise<boolean>;
 };
 
 type AttentionServiceOptions = {
   openDecisionLimit?: number;
   now?: () => number;
+  /** Disable projection synchronization for callers that require a strictly read-only feed. */
+  readOnly?: boolean;
 };
 
 function emptyCounts(): Record<AttentionSourceKind, number> {
@@ -552,7 +556,13 @@ function parseActivityBoundary(value: string | undefined, field: "activitySince"
   return parsed;
 }
 
-async function enrichAttentionItems(db: Db, companyId: string, items: AttentionItem[], now: number) {
+async function enrichAttentionItems(
+  db: Db,
+  companyId: string,
+  items: AttentionItem[],
+  now: number,
+  readOnly = false,
+) {
   if (items.length === 0) return items;
   const sourceIds = [...new Set(items.map((item) => item.subject.id))];
   const queueRows = await db
@@ -631,7 +641,10 @@ async function enrichAttentionItems(db: Db, companyId: string, items: AttentionI
       snoozedUntil: triage?.snoozedUntil ? toIso(triage.snoozedUntil) : null,
     };
   });
-  const retentionBySource = await decisionRetentionService(db).syncItems(companyId, enriched);
+  const retentionService = decisionRetentionService(db);
+  const retentionBySource = readOnly
+    ? await retentionService.getItems(companyId, enriched)
+    : await retentionService.syncItems(companyId, enriched);
   return enriched.map((item) => {
     const key = itemSourceKey(item);
     const retention = retentionBySource.get(key);
@@ -1964,8 +1977,21 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       }
 
       const collectedItems = [...deduped.values()].sort(compareAttentionItems);
-      await decisionQueueService(db).materializeSeededQueues(companyId, collectedItems);
-      const enrichedItems = await enrichAttentionItems(db, companyId, collectedItems, now);
+      const authorizedItems = options.canReadItem
+        ? (await Promise.all(collectedItems.map(async (item) =>
+          await options.canReadItem!(item.sourceKind, item.subject.id) ? item : null,
+        ))).filter((item): item is AttentionItem => item !== null)
+        : collectedItems;
+      if (!serviceOptions.readOnly) {
+        await decisionQueueService(db).materializeSeededQueues(companyId, authorizedItems);
+      }
+      const enrichedItems = await enrichAttentionItems(
+        db,
+        companyId,
+        authorizedItems,
+        now,
+        serviceOptions.readOnly === true,
+      );
 
       const activitySince = parseActivityBoundary(options.activitySince, "activitySince");
       const activityUntil = parseActivityBoundary(options.activityUntil, "activityUntil");

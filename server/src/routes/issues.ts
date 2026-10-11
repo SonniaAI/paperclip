@@ -6556,6 +6556,7 @@ export function issueRoutes(
     const compactView = view === "compact";
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
     const includeLiveDescendantSummary = parseOptionalBooleanQuery(req.query.includeLiveDescendantSummary);
+    const readOnlyProjection = parseOptionalBooleanQuery(req.query.readOnlyProjection);
     const assigneeAgentFilterRaw = req.query.assigneeAgentId;
     let assigneeAgentId: string | null | undefined;
     const rawUpdatedSince = req.query.updatedSince as string | undefined;
@@ -6606,6 +6607,10 @@ export function issueRoutes(
     }
     if (includeLiveDescendantSummary === null) {
       res.status(400).json({ error: "includeLiveDescendantSummary must be true or false when provided" });
+      return;
+    }
+    if (readOnlyProjection === null) {
+      res.status(400).json({ error: "readOnlyProjection must be true or false when provided" });
       return;
     }
     if (assigneeAgentFilterRaw !== undefined) {
@@ -6673,6 +6678,7 @@ export function issueRoutes(
       normalizedQuery: {
         ...listFilters,
         view: compactView ? "compact" : undefined,
+        readOnlyProjection: readOnlyProjection === true ? true : undefined,
       },
     });
     const coordinated = await coordinateIssueListGet({
@@ -6696,14 +6702,16 @@ export function issueRoutes(
           await Promise.all(result.map(async (issue) => {
             const activeRecoveryAction = recoveryActionByIssue.get(issue.id) ?? null;
             if (!activeRecoveryAction) return;
-            const revalidated = await revalidateActiveSourceRecoveryForRead({
-              issue,
-              trigger: "read_projection",
-              actor,
-              activeRecoveryAction,
-            });
-            if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
-            else recoveryActionByIssue.delete(issue.id);
+            if (readOnlyProjection !== true) {
+              const revalidated = await revalidateActiveSourceRecoveryForRead({
+                issue,
+                trigger: "read_projection",
+                actor,
+                activeRecoveryAction,
+              });
+              if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
+              else recoveryActionByIssue.delete(issue.id);
+            }
           }));
           const compactResult = result.map((issue) =>
             toCompactIssue({
@@ -6726,14 +6734,16 @@ export function issueRoutes(
         await Promise.all(result.map(async (issue) => {
           const activeRecoveryAction = recoveryActionByIssue.get(issue.id) ?? null;
           if (!activeRecoveryAction) return;
-          const revalidated = await revalidateActiveSourceRecoveryForRead({
-            issue,
-            trigger: "read_projection",
-            actor,
-            activeRecoveryAction,
-          });
-          if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
-          else recoveryActionByIssue.delete(issue.id);
+          if (readOnlyProjection !== true) {
+            const revalidated = await revalidateActiveSourceRecoveryForRead({
+              issue,
+              trigger: "read_projection",
+              actor,
+              activeRecoveryAction,
+            });
+            if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
+            else recoveryActionByIssue.delete(issue.id);
+          }
         }));
         return {
           kind: "full",
