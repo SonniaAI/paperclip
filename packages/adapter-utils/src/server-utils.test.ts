@@ -2676,6 +2676,34 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
     expect(prompt).not.toContain("planning directive:");
   });
 
+  it("renders an external-service monitor wake as a bounded check without unblocking dependent work", () => {
+    const payload = {
+      reason: "issue_monitor_due",
+      issue: {
+        id: "issue-1",
+        identifier: "ENG-43",
+        title: "Collect the existing queue request",
+        description: null,
+        descriptionTruncated: false,
+        status: "blocked",
+      },
+      externalServiceMonitorWake: true,
+      unresolvedBlockerSummaries: [
+        { id: "blocker-1", identifier: "ENG-42", title: "Platform monitor repair", status: "in_progress" },
+      ],
+    };
+
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain("- external-service monitor wake: yes");
+    expect(prompt).toContain("inspect only the scheduled external service");
+    expect(prompt).toContain("keep blocker-dependent deliverable work blocked");
+    expect(prompt).toContain("ENG-42 Platform monitor repair (in_progress)");
+    expect(JSON.parse(stringifyPaperclipWakePayload(payload) ?? "{}")).toMatchObject({
+      externalServiceMonitorWake: true,
+      unresolvedBlockerSummaries: [expect.objectContaining({ identifier: "ENG-42" })],
+    });
+  });
+
   it("survives a JSON round-trip through stringifyPaperclipWakePayload", () => {
     const payload = {
       ...baseWatchdogPayload,
