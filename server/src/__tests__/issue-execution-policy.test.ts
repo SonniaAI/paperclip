@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyIssueExecutionPolicyTransition,
+  buildIssueMonitorRetryPatch,
   hydrateStoredIssueExecutionPolicy,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -70,6 +71,28 @@ describe("normalizeIssueExecutionPolicy", () => {
       ],
     });
     expect(result!.stages[0].participants).toHaveLength(1);
+  });
+
+  it("normalizes external-service monitor metadata while redacting the reference", () => {
+    expect(normalizeIssueExecutionPolicy({
+      stages: [],
+      monitor: {
+        nextCheckAt: "2099-04-11T12:30:00.000Z",
+        kind: "external_service",
+        serviceName: "cluster-job-queue",
+        externalRef: "request-123",
+        timeoutAt: "2099-04-12T12:30:00.000Z",
+        maxAttempts: 4,
+        recoveryPolicy: "wake_owner",
+      },
+    })?.monitor).toMatchObject({
+      kind: "external_service",
+      serviceName: "cluster-job-queue",
+      externalRef: "[redacted]",
+      timeoutAt: "2099-04-12T12:30:00.000Z",
+      maxAttempts: 4,
+      recoveryPolicy: "wake_owner",
+    });
   });
 
   it("assigns UUIDs to stages and participants", () => {
@@ -1763,7 +1786,113 @@ describe("issue execution policy transitions", () => {
           actor: { agentId: coderAgentId },
           monitorExplicitlyUpdated: true,
         }),
-      ).toThrow("Monitor can only be scheduled");
+      ).toThrow("Monitor requires an agent assignee");
+    });
+
+    it("preserves a finite external-service monitor on a blocked issue", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2099-04-11T12:30:00.000Z",
+          kind: "external_service",
+          serviceName: "cluster-job-queue",
+          externalRef: "request-123",
+          timeoutAt: "2099-04-12T12:30:00.000Z",
+          maxAttempts: 4,
+          recoveryPolicy: "wake_owner",
+        },
+      })!;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "blocked",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: null,
+          executionState: null,
+        },
+        policy,
+        previousPolicy: null,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: true,
+      });
+
+      expect(result.patch.monitorNextCheckAt).toEqual(new Date("2099-04-11T12:30:00.000Z"));
+      expect(policy.monitor).toMatchObject({
+        kind: "external_service",
+        maxAttempts: 4,
+        recoveryPolicy: "wake_owner",
+      });
+      expect(result.patch.executionState).toMatchObject({
+        monitor: { status: "scheduled", nextCheckAt: "2099-04-11T12:30:00.000Z", attemptCount: 0 },
+      });
+    });
+
+    it("still rejects a generic monitor on a blocked issue", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: { nextCheckAt: "2099-04-11T12:30:00.000Z" },
+      })!;
+
+      expect(() => applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "blocked",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: null,
+          executionState: null,
+        },
+        policy,
+        previousPolicy: null,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: true,
+      })).toThrow("blocked issues may only retain a bounded external_service monitor");
+    });
+
+    it("reschedules an external monitor after an undelivered wake without consuming an attempt", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-04-11T12:30:00.000Z",
+          kind: "external_service",
+          serviceName: "cluster-job-queue",
+          externalRef: "request-123",
+          timeoutAt: "2026-04-11T13:30:00.000Z",
+          maxAttempts: 4,
+          recoveryPolicy: "wake_owner",
+        },
+      })!;
+      const issue = {
+        status: "blocked",
+        executionPolicy: policy,
+        executionState: {
+          status: "idle",
+          monitor: {
+            status: "scheduled",
+            nextCheckAt: "2026-04-11T12:30:00.000Z",
+            attemptCount: 2,
+          },
+        },
+        monitorNextCheckAt: new Date("2026-04-11T12:30:00.000Z"),
+        monitorAttemptCount: 2,
+        monitorWakeRequestedAt: new Date("2026-04-11T12:31:00.000Z"),
+      };
+
+      const retryAt = new Date("2026-04-11T12:32:00.000Z");
+      const patch = buildIssueMonitorRetryPatch({ issue, policy, nextCheckAt: retryAt });
+
+      expect(patch).toMatchObject({
+        monitorNextCheckAt: retryAt,
+        monitorWakeRequestedAt: null,
+        executionPolicy: {
+          monitor: { nextCheckAt: retryAt.toISOString(), maxAttempts: 4, recoveryPolicy: "wake_owner" },
+        },
+        executionState: {
+          monitor: { status: "scheduled", nextCheckAt: retryAt.toISOString(), attemptCount: 2 },
+        },
+      });
     });
 
     it("rejects explicitly re-arming a monitor after max attempts are exhausted", () => {

@@ -258,8 +258,10 @@ import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
+  buildIssueMonitorRetryPatch,
   buildIssueMonitorTriggeredPatch,
   hydrateStoredIssueExecutionPolicy,
+  isBoundedExternalServiceMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
@@ -7121,6 +7123,8 @@ export async function buildPaperclipWakePayload(input: {
     simplifiedEnglishInteractions: input.simplifiedEnglishInteractions === true,
     dependencyBlockedInteraction:
       input.contextSnapshot.dependencyBlockedInteraction === true,
+    externalServiceMonitorWake:
+      input.contextSnapshot.externalServiceMonitorWake === true,
     treeHoldInteraction: input.contextSnapshot.treeHoldInteraction === true,
     activeTreeHold: parseObject(input.contextSnapshot.activeTreeHold),
     unresolvedBlockerIssueIds: Array.isArray(
@@ -9199,6 +9203,104 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
+  const ISSUE_MONITOR_WAKE_RETRY_DELAY_MS = 60_000;
+
+  function issueMonitorStatusAllowsDispatch(
+    status: string,
+    executionPolicy: Record<string, unknown> | null,
+  ) {
+    if (status === "in_progress" || status === "in_review") return true;
+    if (status !== "blocked") return false;
+    const policy = hydrateStoredIssueExecutionPolicy(executionPolicy);
+    return isBoundedExternalServiceMonitor(policy?.monitor);
+  }
+
+  function issueMonitorStatusCondition() {
+    return or(
+      inArray(issues.status, ["in_progress", "in_review"]),
+      and(
+        eq(issues.status, "blocked"),
+        sql`${issues.executionPolicy} -> 'monitor' ->> 'kind' = 'external_service'`,
+        sql`nullif(${issues.executionPolicy} -> 'monitor' ->> 'serviceName', '') is not null`,
+        sql`nullif(${issues.executionPolicy} -> 'monitor' ->> 'externalRef', '') is not null`,
+        sql`nullif(btrim(${issues.executionPolicy} -> 'monitor' ->> 'timeoutAt'), '') is not null`,
+        sql`nullif(btrim(${issues.executionPolicy} -> 'monitor' ->> 'maxAttempts'), '') ~ '^[1-9][0-9]*$'`,
+        sql`(${issues.executionPolicy} -> 'monitor' ->> 'timeoutAt') > (${issues.executionPolicy} -> 'monitor' ->> 'nextCheckAt')`,
+      ),
+    );
+  }
+
+  async function issueMonitorWakeRequestStatus(agentId: string, idempotencyKey: string) {
+    return db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+      ))
+      .orderBy(desc(agentWakeupRequests.requestedAt))
+      .limit(1)
+      .then((rows) => rows[0]?.status ?? null);
+  }
+
+  function issueMonitorWakeRequestAccepted(status: string | null) {
+    return Boolean(status && !["skipped", "failed", "cancelled"].includes(status));
+  }
+
+  function issueMonitorRetryAt(input: { now: Date; monitor: IssueExecutionMonitorPolicy | null }) {
+    const retryAt = new Date(input.now.getTime() + ISSUE_MONITOR_WAKE_RETRY_DELAY_MS);
+    const timeoutAt = parseMonitorDate(input.monitor?.timeoutAt ?? null);
+    if (!timeoutAt) return retryAt;
+
+    // Keep the persisted schedule before the timeout so blocked external-service
+    // monitors remain queryable. If less than one millisecond remains, schedule
+    // an immediate recheck; the next scheduler tick will clear the expired bound.
+    const beforeTimeout = new Date(timeoutAt.getTime() - 1);
+    if (timeoutAt.getTime() > input.now.getTime() && beforeTimeout.getTime() > input.now.getTime()) {
+      return beforeTimeout.getTime() < retryAt.getTime() ? beforeTimeout : retryAt;
+    }
+    return input.now;
+  }
+
+  async function rescheduleIssueMonitorAfterUndeliveredWake(input: {
+    claimed: IssueMonitorDispatchRow;
+    policy: ReturnType<typeof normalizeIssueExecutionPolicy>;
+    now: Date;
+    requestStatus: string | null;
+    reason: string;
+    actorType: "user" | "agent" | "system";
+    actorId: string;
+    agentId: string | null;
+    runId: string | null;
+    activitySource: "manual" | "scheduled";
+  }) {
+    const nextCheckAt = issueMonitorRetryAt({ now: input.now, monitor: input.policy?.monitor ?? null });
+    await db
+      .update(issues)
+      .set({
+        ...buildIssueMonitorRetryPatch({ issue: input.claimed, policy: input.policy, nextCheckAt }),
+        updatedAt: input.now,
+      })
+      .where(eq(issues.id, input.claimed.id));
+    await logActivity(db, {
+      companyId: input.claimed.companyId,
+      actorType: input.actorType,
+      actorId: input.actorId,
+      agentId: input.agentId,
+      runId: input.runId,
+      action: "issue.monitor_dispatch_deferred",
+      entityType: "issue",
+      entityId: input.claimed.id,
+      details: {
+        identifier: input.claimed.identifier,
+        nextCheckAt: nextCheckAt.toISOString(),
+        requestStatus: input.requestStatus,
+        reason: input.reason,
+        source: input.activitySource,
+      },
+    });
+  }
+
   const issueMonitorDispatchColumns = {
     id: issues.id,
     companyId: issues.companyId,
@@ -9479,11 +9581,15 @@ export function heartbeatService(
       return;
     }
 
-    await enqueueWakeup(input.claimed.assigneeAgentId!, {
+    const recoveryIdempotencyKey = `issue-monitor-recovery:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`;
+    let recoveryRun: Awaited<ReturnType<typeof enqueueWakeup>> = null;
+    let recoveryWakeError: unknown = null;
+    try {
+      recoveryRun = await enqueueWakeup(input.claimed.assigneeAgentId!, {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_monitor_recovery",
-      idempotencyKey: `issue-monitor-recovery:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+      idempotencyKey: recoveryIdempotencyKey,
       payload: withRecoveryContext(
         {
           issueId: input.claimed.id,
@@ -9514,19 +9620,54 @@ export function heartbeatService(
         },
         "status_only",
       ),
-    });
+      });
+    } catch (err) {
+      recoveryWakeError = err;
+    }
+    const recoveryRequestStatus = recoveryRun
+      ? null
+      : await issueMonitorWakeRequestStatus(input.claimed.assigneeAgentId!, recoveryIdempotencyKey);
 
-    await logActivity(db, {
-      companyId: input.claimed.companyId,
-      actorType: input.actorType,
-      actorId: input.actorId,
-      agentId: input.agentId,
-      runId: input.runId,
-      action: "issue.monitor_recovery_wake_queued",
-      entityType: "issue",
-      entityId: input.claimed.id,
-      details,
-    });
+    if (recoveryRun || issueMonitorWakeRequestAccepted(recoveryRequestStatus)) {
+      await logActivity(db, {
+        companyId: input.claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_recovery_wake_queued",
+        entityType: "issue",
+        entityId: input.claimed.id,
+        details: { ...details, wakeRequestStatus: recoveryRequestStatus ?? "queued" },
+      });
+    } else {
+      const statusText = recoveryRequestStatus ?? "not_persisted";
+      const failureReason = recoveryWakeError instanceof HttpError
+        ? `http_${recoveryWakeError.status}`
+        : recoveryWakeError
+          ? "enqueue_error"
+          : "request_not_accepted";
+      await db.insert(issueComments).values({
+        companyId: input.claimed.companyId,
+        issueId: input.claimed.id,
+        body: [
+          `Paperclip cleared the external-service monitor for ${input.claimed.identifier ?? input.claimed.title}, but could not queue the requested owner wake (wake request state: ${statusText}).`,
+          "",
+          "Next action: restore the assignee's ability to run and retry the owner recovery. The external check is no longer being polled because its configured bound was reached.",
+        ].join("\n"),
+      });
+      await logActivity(db, {
+        companyId: input.claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_recovery_wake_skipped",
+        entityType: "issue",
+        entityId: input.claimed.id,
+        details: { ...details, wakeRequestStatus: statusText, failureReason },
+      });
+    }
   }
 
   async function clearIssueMonitorAndRecover(input: {
@@ -9681,37 +9822,71 @@ export function heartbeatService(
       });
     }
 
+    const idempotencyKey = `issue-monitor:${claimed.id}:${scheduledAtIso}`;
     try {
-      await enqueueWakeup(targetAgentId, {
-        source: input.source,
-        triggerDetail: input.triggerDetail,
-        reason: wakeReason,
-        idempotencyKey: `issue-monitor:${claimed.id}:${scheduledAtIso}`,
-        payload: {
-          issueId: claimed.id,
-          nextCheckAt: scheduledAtIso,
-          monitorAttemptCount: nextAttemptCount,
-          monitorNotes: claimed.monitorNotes ?? null,
-          ...monitorMetadata,
-          ...reviewRecoveryContext,
-          source: input.activitySource,
-        },
-        requestedByActorType: input.actorType,
-        requestedByActorId: input.actorId,
-        contextSnapshot: {
-          issueId: claimed.id,
-          source: isProviderQuotaReviewMonitor
-            ? "issue.execution_review_recovery"
-            : "issue.monitor",
-          wakeReason,
-          nextCheckAt: scheduledAtIso,
-          monitorAttemptCount: nextAttemptCount,
-          monitorNotes: claimed.monitorNotes ?? null,
-          ...monitorMetadata,
-          ...reviewRecoveryContext,
-          manualTrigger: input.activitySource === "manual",
-        },
-      });
+      // A worker can fail after the durable wake request is inserted but before
+      // enqueueWakeup returns. Reuse that request on a monitor retry rather than
+      // creating another heartbeat run for the same scheduled check.
+      let wakeRequestStatus = await issueMonitorWakeRequestStatus(targetAgentId, idempotencyKey);
+      let wakeRun: Awaited<ReturnType<typeof enqueueWakeup>> = null;
+      let enqueueError: unknown = null;
+      if (!issueMonitorWakeRequestAccepted(wakeRequestStatus)) {
+        try {
+          wakeRun = await enqueueWakeup(targetAgentId, {
+            source: input.source,
+            triggerDetail: input.triggerDetail,
+            reason: wakeReason,
+            idempotencyKey,
+            payload: {
+              issueId: claimed.id,
+              nextCheckAt: scheduledAtIso,
+              monitorAttemptCount: nextAttemptCount,
+              monitorNotes: claimed.monitorNotes ?? null,
+              ...monitorMetadata,
+              ...reviewRecoveryContext,
+              source: input.activitySource,
+            },
+            requestedByActorType: input.actorType,
+            requestedByActorId: input.actorId,
+            contextSnapshot: {
+              issueId: claimed.id,
+              source: isProviderQuotaReviewMonitor
+                ? "issue.execution_review_recovery"
+                : "issue.monitor",
+              wakeReason,
+              nextCheckAt: scheduledAtIso,
+              monitorAttemptCount: nextAttemptCount,
+              monitorNotes: claimed.monitorNotes ?? null,
+              ...monitorMetadata,
+              ...reviewRecoveryContext,
+              externalServiceMonitorWake: claimed.status === "blocked" && monitor?.kind === "external_service",
+              manualTrigger: input.activitySource === "manual",
+            },
+          });
+        } catch (err) {
+          enqueueError = err;
+        }
+        if (!wakeRun) {
+          wakeRequestStatus = await issueMonitorWakeRequestStatus(targetAgentId, idempotencyKey);
+        }
+      }
+
+      if (!wakeRun && !issueMonitorWakeRequestAccepted(wakeRequestStatus)) {
+        if (enqueueError) throw enqueueError;
+        await rescheduleIssueMonitorAfterUndeliveredWake({
+          claimed,
+          policy,
+          now: input.now,
+          requestStatus: wakeRequestStatus,
+          reason: "owner_wake_not_queued",
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          activitySource: input.activitySource,
+        });
+        return { outcome: "skipped" as const, reason: "owner_wake_not_queued" };
+      }
 
       await db
         .update(issues)
@@ -9747,6 +9922,32 @@ export function heartbeatService(
 
       return { outcome: "triggered" as const };
     } catch (err) {
+      if (monitor?.kind === "external_service") {
+        const persistedWakeStatus = await issueMonitorWakeRequestStatus(targetAgentId, idempotencyKey);
+        if (issueMonitorWakeRequestAccepted(persistedWakeStatus)) {
+          // The durable wake exists. Leave the monitor claim for the bounded
+          // stale-claim retry; the idempotency lookup above will collect the
+          // accepted request instead of dispatching a duplicate.
+          if (input.clearOnClientError) return { outcome: "skipped" as const, reason: "owner_wake_already_queued" };
+          throw err;
+        }
+        await rescheduleIssueMonitorAfterUndeliveredWake({
+          claimed,
+          policy,
+          now: input.now,
+          requestStatus: null,
+          reason: err instanceof HttpError ? `http_${err.status}` : "enqueue_error",
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          activitySource: input.activitySource,
+        });
+        if (input.clearOnClientError) {
+          return { outcome: "skipped" as const, reason: "owner_wake_not_queued" };
+        }
+        throw err;
+      }
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
         if (input.clearOnClientError) {
           await db
@@ -9839,9 +10040,9 @@ export function heartbeatService(
     if (!issue.assigneeAgentId || issue.assigneeUserId) {
       throw conflict("Issue monitor requires an agent assignee");
     }
-    if (!["in_progress", "in_review"].includes(issue.status)) {
+    if (!issueMonitorStatusAllowsDispatch(issue.status, issue.executionPolicy)) {
       throw conflict(
-        "Issue monitor can only run while the issue is in progress or in review",
+        "Issue monitor can only run on an in-progress or in-review issue, or a blocked issue with an external-service monitor",
       );
     }
 
@@ -9859,7 +10060,7 @@ export function heartbeatService(
             sql`${issues.monitorNextCheckAt} is not null`,
             isNull(issues.assigneeUserId),
             sql`${issues.assigneeAgentId} is not null`,
-            inArray(issues.status, ["in_progress", "in_review"]),
+            issueMonitorStatusCondition(),
             or(
               isNull(issues.monitorWakeRequestedAt),
               lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -9901,7 +10102,7 @@ export function heartbeatService(
           lte(issues.monitorNextCheckAt, now),
           isNull(issues.assigneeUserId),
           sql`${issues.assigneeAgentId} is not null`,
-          inArray(issues.status, ["in_progress", "in_review"]),
+          issueMonitorStatusCondition(),
           or(
             isNull(issues.monitorWakeRequestedAt),
             lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -9929,7 +10130,7 @@ export function heartbeatService(
               lte(issues.monitorNextCheckAt, now),
               isNull(issues.assigneeUserId),
               sql`${issues.assigneeAgentId} is not null`,
-              inArray(issues.status, ["in_progress", "in_review"]),
+              issueMonitorStatusCondition(),
               or(
                 isNull(issues.monitorWakeRequestedAt),
                 lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
@@ -23461,6 +23662,8 @@ export function heartbeatService(
             companyId: issues.companyId,
             identifier: issues.identifier,
             status: issues.status,
+            executionPolicy: issues.executionPolicy,
+            executionState: issues.executionState,
             projectId: issues.projectId,
             projectWorkspaceId: issues.projectWorkspaceId,
             executionWorkspaceId: issues.executionWorkspaceId,
@@ -23804,23 +24007,43 @@ export function heartbeatService(
         // Blocked descendants should stay idle until the final blocker resolves.
         // Human comment/mention wakes are the exception: they may run in a
         // bounded interaction mode so the assignee can answer or triage.
+        const storedMonitor = hydrateStoredIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor ?? null;
+        const monitorState = parseIssueExecutionState(issue.executionState)?.monitor ?? null;
+        const blockedExternalServiceMonitorWake =
+          issue.status === "blocked" &&
+          ((reason === "issue_monitor_due" &&
+            enrichedContextSnapshot.source === "issue.monitor" &&
+            isBoundedExternalServiceMonitor(storedMonitor)) ||
+            (reason === "issue_monitor_recovery" &&
+              enrichedContextSnapshot.source === "issue.monitor.recovery" &&
+              monitorState?.kind === "external_service" &&
+              Boolean(monitorState.serviceName && monitorState.externalRef && monitorState.timeoutAt && monitorState.maxAttempts) &&
+              (monitorState.recoveryPolicy === "wake_owner" || monitorState.recoveryPolicy === null)));
+        if (blockedExternalServiceMonitorWake) {
+          enrichedContextSnapshot.externalServiceMonitorWake = true;
+        }
+
         const blockedInteractionWake =
           dependencyReadiness &&
           !dependencyReadiness.isDependencyReady &&
           allowsIssueInteractionWake(enrichedContextSnapshot);
+        const blockedExternalMonitorWake =
+          dependencyReadiness &&
+          !dependencyReadiness.isDependencyReady &&
+          blockedExternalServiceMonitorWake;
 
-        if (blockedInteractionWake) {
-          enrichedContextSnapshot.dependencyBlockedInteraction = true;
+        if (blockedInteractionWake || blockedExternalMonitorWake) {
+          if (blockedInteractionWake) enrichedContextSnapshot.dependencyBlockedInteraction = true;
           enrichedContextSnapshot.unresolvedBlockerIssueIds =
-            dependencyReadiness.unresolvedBlockerIssueIds;
+            dependencyReadiness!.unresolvedBlockerIssueIds;
           enrichedContextSnapshot.unresolvedBlockerCount =
-            dependencyReadiness.unresolvedBlockerCount;
+            dependencyReadiness!.unresolvedBlockerCount;
           enrichedContextSnapshot.unresolvedBlockerSummaries =
             await listUnresolvedBlockerSummaries(
               tx,
               issue.companyId,
               issue.id,
-              dependencyReadiness.unresolvedBlockerIssueIds,
+              dependencyReadiness!.unresolvedBlockerIssueIds,
             );
         }
 
@@ -23828,7 +24051,8 @@ export function heartbeatService(
           !activeExecutionRun &&
           dependencyReadiness &&
           !dependencyReadiness.isDependencyReady &&
-          !blockedInteractionWake
+          !blockedInteractionWake &&
+          !blockedExternalMonitorWake
         ) {
           await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,

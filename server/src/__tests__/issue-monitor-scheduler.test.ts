@@ -25,7 +25,13 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
-import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { issueService } from "../services/issues.ts";
+import {
+  applyIssueExecutionPolicyTransition,
+  hydrateStoredIssueExecutionPolicy,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "../services/issue-execution-policy.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -138,7 +144,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused";
-    issueStatus?: "in_progress" | "in_review";
+    issueStatus?: "in_progress" | "in_review" | "blocked";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
   }) {
@@ -269,6 +275,193 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_triggered");
+  });
+
+  it("persists a blocked external-service monitor through the issue update/read path before dispatch", async () => {
+    const { issueId, agentId } = await seedFixture({
+      issueStatus: "blocked",
+      monitor: {
+        kind: "external_service",
+        serviceName: "cluster-job-queue",
+        externalRef: "request-123",
+        timeoutAt: "2026-04-11T13:30:00.000Z",
+        maxAttempts: 4,
+        recoveryPolicy: "wake_owner",
+      },
+    });
+    const current = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    const previousPolicy = hydrateStoredIssueExecutionPolicy(current.executionPolicy ?? null);
+    const nextCheckAt = "2099-04-11T12:40:00.000Z";
+    const policy = normalizeIssueExecutionPolicy({
+      ...previousPolicy,
+      monitor: {
+        ...previousPolicy?.monitor,
+        nextCheckAt,
+        timeoutAt: "2099-04-12T12:40:00.000Z",
+      },
+    })!;
+    const transition = applyIssueExecutionPolicyTransition({
+      issue: current,
+      policy,
+      previousPolicy,
+      requestedAssigneePatch: {},
+      actor: { agentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    await issueService(db).update(
+      issueId,
+      { executionPolicy: policy, ...transition.patch } as Record<string, unknown> as any,
+    );
+
+    const readBack = await issueService(db).getById(issueId);
+    expect(readBack?.executionPolicy).toMatchObject({
+      monitor: { nextCheckAt, serviceName: "cluster-job-queue", maxAttempts: 4, recoveryPolicy: "wake_owner" },
+    });
+    expect(readBack?.monitorNextCheckAt?.toISOString()).toBe(nextCheckAt);
+    expect(parseIssueExecutionState(readBack?.executionState)?.monitor).toMatchObject({
+      status: "scheduled",
+      nextCheckAt,
+      attemptCount: 0,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.tickTimers(new Date("2099-04-11T12:41:00.000Z"));
+    expect(result.enqueued).toBe(1);
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.reason).toBe("issue_monitor_due");
+  });
+
+  it("dispatches bounded external-service monitors on blocked issues with scoped instructions", async () => {
+    const { companyId, issueId, agentId } = await seedFixture({
+      issueStatus: "blocked",
+      monitor: {
+        kind: "external_service",
+        serviceName: "cluster-job-queue",
+        externalRef: "request-123",
+        timeoutAt: "2026-04-11T13:30:00.000Z",
+        maxAttempts: 4,
+        recoveryPolicy: "wake_owner",
+      },
+    });
+    const blockerId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId,
+      title: "Unresolved delivery dependency",
+      status: "in_progress",
+      priority: "high",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await issueService(db).update(issueId, { blockedByIssueIds: [blockerId] });
+    const heartbeat = heartbeatService(db);
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.tickTimers(tickAt);
+
+    expect(result.enqueued).toBe(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.status).toBe("blocked");
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor ?? null).toBeNull();
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup).toMatchObject({ reason: "issue_monitor_due", status: expect.any(String) });
+    expect(JSON.stringify(wakeup?.payload)).not.toContain("request-123");
+
+    await waitForHeartbeatIdle();
+    const run = wakeup?.runId
+      ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wakeup.runId)).then((rows) => rows[0] ?? null)
+      : null;
+    expect(run?.contextSnapshot).toMatchObject({
+      externalServiceMonitorWake: true,
+      source: "issue.monitor",
+      unresolvedBlockerIssueIds: [blockerId],
+      unresolvedBlockerCount: 1,
+    });
+    expect(JSON.stringify(run?.contextSnapshot)).not.toContain("request-123");
+  });
+
+  it("re-arms an external-service monitor when the owner wake is skipped", async () => {
+    const { issueId, nextCheckAt } = await seedFixture({
+      agentStatus: "paused",
+      issueStatus: "blocked",
+      monitor: {
+        kind: "external_service",
+        serviceName: "cluster-job-queue",
+        externalRef: "request-123",
+        timeoutAt: "2026-04-11T13:30:00.000Z",
+        maxAttempts: 4,
+        recoveryPolicy: "wake_owner",
+      },
+    });
+    const heartbeat = heartbeatService(db);
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.tickTimers(tickAt);
+
+    expect(result.skipped).toBe(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    const scheduledAt = new Date(tickAt.getTime() + 60_000);
+    expect(issue.status).toBe("blocked");
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe(scheduledAt.toISOString());
+    expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor).toMatchObject({
+      nextCheckAt: scheduledAt.toISOString(),
+      serviceName: "cluster-job-queue",
+      maxAttempts: 4,
+      recoveryPolicy: "wake_owner",
+    });
+    expect(issue.monitorNextCheckAt?.getTime()).toBeGreaterThan(nextCheckAt.getTime());
+
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(activity.map((row) => row.action)).toContain("issue.monitor_dispatch_deferred");
+  });
+
+  it("keeps a deferred external monitor scheduled before a near timeout", async () => {
+    const { issueId } = await seedFixture({
+      agentStatus: "paused",
+      issueStatus: "blocked",
+      monitor: {
+        kind: "external_service",
+        serviceName: "cluster-job-queue",
+        externalRef: "request-123",
+        timeoutAt: "2026-04-11T12:31:00.500Z",
+        maxAttempts: 4,
+        recoveryPolicy: "wake_owner",
+      },
+    });
+    const heartbeat = heartbeatService(db);
+    const firstTick = new Date("2026-04-11T12:31:00.000Z");
+
+    const deferred = await heartbeat.tickTimers(firstTick);
+
+    expect(deferred.skipped).toBe(1);
+    const retried = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    const beforeTimeout = new Date("2026-04-11T12:31:00.499Z").toISOString();
+    expect(retried.monitorNextCheckAt?.toISOString()).toBe(beforeTimeout);
+    expect(normalizeIssueExecutionPolicy(retried.executionPolicy ?? null)?.monitor?.nextCheckAt).toBe(
+      beforeTimeout,
+    );
+
+    const expired = await heartbeat.tickTimers(new Date("2026-04-11T12:31:01.000Z"));
+
+    expect(expired.skipped).toBe(1);
+    const cleared = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(cleared.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(cleared.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "timeout_exceeded",
+    });
   });
 
   it("wakes a cross-agent review participant for provider quota monitors", async () => {
@@ -451,6 +644,45 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(activity).toContain("issue.monitor_exhausted");
     expect(activity).toContain("issue.monitor_recovery_wake_queued");
     expect(activity).not.toContain("issue.monitor_triggered");
+  });
+
+  it("records a failed wake_owner recovery instead of leaving it unobserved", async () => {
+    const { issueId, agentId } = await seedFixture({
+      agentStatus: "paused",
+      monitorAttemptCount: 1,
+      monitor: {
+        kind: "external_service",
+        serviceName: "cluster-job-queue",
+        externalRef: "request-123",
+        timeoutAt: "2026-04-11T13:30:00.000Z",
+        maxAttempts: 1,
+        recoveryPolicy: "wake_owner",
+      },
+    });
+    const heartbeat = heartbeatService(db);
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.tickTimers(tickAt);
+
+    expect(result.skipped).toBe(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "max_attempts_exhausted",
+    });
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup).toMatchObject({ reason: "agent.not_invokable", status: "skipped" });
+
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(activity.map((row) => row.action)).toContain("issue.monitor_recovery_wake_skipped");
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.map((row) => row.body).join("\n")).toContain("could not queue the requested owner wake");
   });
 
   it("clears timed-out monitors and creates a visible recovery issue when requested", async () => {

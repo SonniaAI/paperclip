@@ -721,6 +721,7 @@ type PaperclipWakePayload = {
   // Technical English with brief decision context.
   simplifiedEnglishInteractions: boolean;
   dependencyBlockedInteraction: boolean;
+  externalServiceMonitorWake: boolean;
   treeHoldInteraction: boolean;
   activeTreeHold: PaperclipWakeTreeHoldSummary | null;
   unresolvedBlockerIssueIds: string[];
@@ -1424,6 +1425,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
     checkedOutByHarness: asBoolean(payload.checkedOutByHarness, false),
     simplifiedEnglishInteractions: asBoolean(payload.simplifiedEnglishInteractions, false),
     dependencyBlockedInteraction: asBoolean(payload.dependencyBlockedInteraction, false),
+    externalServiceMonitorWake: asBoolean(payload.externalServiceMonitorWake, false),
     treeHoldInteraction: asBoolean(payload.treeHoldInteraction, false),
     activeTreeHold,
     unresolvedBlockerIssueIds,
@@ -1748,6 +1750,18 @@ export function renderPaperclipWakePrompt(
   if (normalized.dependencyBlockedInteraction) {
     lines.push("- dependency-blocked interaction: yes");
     lines.push("- execution scope: respond or triage the human comment; do not treat blocker-dependent deliverable work as unblocked");
+    if (normalized.unresolvedBlockerSummaries.length > 0) {
+      const blockers = normalized.unresolvedBlockerSummaries
+        .map((blocker) => `${blocker.identifier ?? blocker.id ?? "unknown"}${blocker.title ? ` ${blocker.title}` : ""}${blocker.status ? ` (${blocker.status})` : ""}`)
+        .join("; ");
+      lines.push(`- unresolved blockers: ${blockers}`);
+    } else if (normalized.unresolvedBlockerIssueIds.length > 0) {
+      lines.push(`- unresolved blocker issue ids: ${normalized.unresolvedBlockerIssueIds.join(", ")}`);
+    }
+  }
+  if (normalized.externalServiceMonitorWake) {
+    lines.push("- external-service monitor wake: yes");
+    lines.push("- execution scope: inspect only the scheduled external service, record its current state, and keep blocker-dependent deliverable work blocked");
     if (normalized.unresolvedBlockerSummaries.length > 0) {
       const blockers = normalized.unresolvedBlockerSummaries
         .map((blocker) => `${blocker.identifier ?? blocker.id ?? "unknown"}${blocker.title ? ` ${blocker.title}` : ""}${blocker.status ? ` (${blocker.status})` : ""}`)

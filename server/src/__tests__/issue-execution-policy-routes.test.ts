@@ -698,6 +698,72 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it("persists a bounded external-service monitor update on a blocked issue", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "blocked",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1006A",
+      title: "Blocked queue collection",
+      executionPolicy: null,
+      executionState: null,
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-12-01T12:00:00.000Z",
+            kind: "external_service",
+            serviceName: "cluster-job-queue",
+            externalRef: "request-123",
+            timeoutAt: "2026-12-02T12:00:00.000Z",
+            maxAttempts: 4,
+            recoveryPolicy: "wake_owner",
+          },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+        executionPolicy: expect.objectContaining({
+          monitor: expect.objectContaining({
+            kind: "external_service",
+            serviceName: "cluster-job-queue",
+            maxAttempts: 4,
+            recoveryPolicy: "wake_owner",
+          }),
+        }),
+        executionState: expect.objectContaining({
+          monitor: expect.objectContaining({ status: "scheduled", nextCheckAt: "2026-12-01T12:00:00.000Z" }),
+        }),
+      }),
+    );
+  });
+
   it("allows board-authored in_review repair updates without a review path", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

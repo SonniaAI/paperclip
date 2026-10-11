@@ -71,7 +71,7 @@ export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
 const PENDING_STATUS: IssueExecutionState["status"] = "pending";
 const CHANGES_REQUESTED_STATUS: IssueExecutionState["status"] = "changes_requested";
-const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review";
+const MONITOR_INVALID_MESSAGE = "Monitor requires an agent assignee on an in_progress or in_review issue; blocked issues may only retain a bounded external_service monitor";
 const MONITOR_BOUNDS_EXHAUSTED_MESSAGE = "Monitor bounds are already exhausted";
 const STAGE_DECISION_COMMENT_HINT = "Include the decision comment in the same PATCH request; prior comments are not considered.";
 export const REDACTED_ISSUE_MONITOR_EXTERNAL_REF = "[redacted]";
@@ -262,18 +262,39 @@ function buildClearedMonitorState(input: {
   };
 }
 
-function issueAllowsMonitor(status: string, assigneeAgentId: string | null, assigneeUserId: string | null) {
-  return Boolean(assigneeAgentId) && !assigneeUserId && (status === "in_progress" || status === "in_review");
+export function isBoundedExternalServiceMonitor(monitor: IssueExecutionMonitorPolicy | null | undefined) {
+  if (
+    monitor?.kind !== "external_service" ||
+    !monitor.serviceName?.trim() ||
+    !monitor.externalRef?.trim() ||
+    !Number.isInteger(monitor.maxAttempts) ||
+    (monitor.maxAttempts ?? 0) <= 0
+  ) return false;
+  const nextCheckAt = Date.parse(monitor.nextCheckAt);
+  const timeoutAt = Date.parse(monitor.timeoutAt ?? "");
+  return Number.isFinite(nextCheckAt) && Number.isFinite(timeoutAt) && timeoutAt > nextCheckAt;
+}
+
+function issueAllowsMonitor(
+  status: string,
+  assigneeAgentId: string | null,
+  assigneeUserId: string | null,
+  monitor?: IssueExecutionMonitorPolicy | null,
+) {
+  const activeIssue = status === "in_progress" || status === "in_review";
+  const blockedExternalWait = status === "blocked" && isBoundedExternalServiceMonitor(monitor);
+  return Boolean(assigneeAgentId) && !assigneeUserId && (activeIssue || blockedExternalWait);
 }
 
 function monitorClearReasonForIssue(
   status: string,
   assigneeAgentId: string | null,
   assigneeUserId: string | null,
+  monitor?: IssueExecutionMonitorPolicy | null,
 ): IssueExecutionMonitorClearReason | null {
   if (status === "done") return "done";
   if (status === "cancelled") return "cancelled";
-  if (!issueAllowsMonitor(status, assigneeAgentId, assigneeUserId)) {
+  if (!issueAllowsMonitor(status, assigneeAgentId, assigneeUserId, monitor)) {
     if (assigneeUserId || !assigneeAgentId) return "invalid_assignee";
     return "invalid_status";
   }
@@ -1226,7 +1247,7 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
       ? parseIssueExecutionState(stagePatch.executionState)
       : existingState;
   const invalidReason = input.policy?.monitor
-    ? monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId)
+    ? monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId, input.policy?.monitor)
     : null;
 
   let targetMonitorState = currentMonitorState;
@@ -1297,7 +1318,12 @@ export function buildInitialIssueMonitorFields(input: {
   assigneeUserId?: string | null;
 }) {
   if (!input.policy?.monitor) return {};
-  if (!issueAllowsMonitor(input.status, input.assigneeAgentId ?? null, input.assigneeUserId ?? null)) {
+  if (!issueAllowsMonitor(
+    input.status,
+    input.assigneeAgentId ?? null,
+    input.assigneeUserId ?? null,
+    input.policy.monitor,
+  )) {
     throw unprocessable(MONITOR_INVALID_MESSAGE);
   }
   const exhaustedReason = exhaustedMonitorClearReason({
@@ -1316,6 +1342,37 @@ export function buildInitialIssueMonitorFields(input: {
     monitorNotes: input.policy.monitor.notes ?? null,
     monitorScheduledBy: input.policy.monitor.scheduledBy,
     executionState: executionStateWithMonitor(null, monitorState) as Record<string, unknown> | null,
+  };
+}
+
+
+export function buildIssueMonitorRetryPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy | null;
+  nextCheckAt: Date;
+}) {
+  const monitor = input.policy?.monitor;
+  if (!monitor) return {};
+
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({
+    issue: input.issue,
+    state: existingState,
+    policy: input.policy,
+  });
+  const rescheduledMonitor = {
+    ...monitor,
+    nextCheckAt: input.nextCheckAt.toISOString(),
+  };
+  const nextMonitorState = buildScheduledMonitorState(currentMonitorState, rescheduledMonitor);
+
+  return {
+    executionPolicy: { ...input.policy, monitor: rescheduledMonitor } as Record<string, unknown>,
+    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+    monitorNextCheckAt: input.nextCheckAt,
+    monitorWakeRequestedAt: null,
+    monitorNotes: rescheduledMonitor.notes ?? null,
+    monitorScheduledBy: rescheduledMonitor.scheduledBy,
   };
 }
 
