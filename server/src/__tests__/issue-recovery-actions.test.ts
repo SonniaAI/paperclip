@@ -1920,6 +1920,45 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("does not resolve stale Recovery during a read-only company issue projection", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:readonly-list-projection",
+      evidence: { latestIssueStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
+
+    const response = await request(createApp())
+      .get(`/api/companies/${companyId}/issues?status=done&limit=10&view=compact&readOnlyProjection=true`)
+      .expect(200);
+
+    expect(response.body).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: sourceIssueId,
+        activeRecoveryAction: expect.objectContaining({ id: action.id, status: "active" }),
+      }),
+    ]));
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({ status: "active", outcome: null });
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    expect(activityRows.some((row) => row.action === "issue.recovery_action_resolved")).toBe(false);
+  });
+
   it("keeps active recovery visible when a plain comment does not create a live path", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     await db

@@ -44,6 +44,7 @@ Read tools:
 - `paperclipListAgents`
 - `paperclipGetAgent`
 - `paperclipListIssues`
+- `paperclipGetDecisionQueueOverview`
 - `paperclipGetIssue`
 - `paperclipGetHeartbeatContext`
 - `paperclipListComments`
@@ -54,6 +55,7 @@ Read tools:
 - `paperclipListDocumentRevisions`
 - `paperclipListProjects`
 - `paperclipGetProject`
+- `paperclipGetProjectOverview`
 - `paperclipGetIssueWorkspaceRuntime`
 - `paperclipWaitForIssueWorkspaceService`
 - `paperclipListGoals`
@@ -88,3 +90,42 @@ Escape hatch:
 
 `paperclipApiRequest` is limited to paths under `/api` and JSON bodies. It is
 meant for endpoints that do not yet have a dedicated MCP tool.
+
+### Read-only overviews
+
+The MCP server registers these tools through `createPaperclipMcpServer()` and
+`createToolDefinitions()` in `src/index.ts` and `src/tools.ts`. The server exposes
+them over its standard input/output MCP transport.
+
+`paperclipGetDecisionQueueOverview` reads:
+
+- `GET /api/companies/{companyId}/decision-queue-overview`
+- Optional query fields: `limit` (default 50, maximum 100), `cursor` (maximum
+  2,000 characters), and `sort` (`activity` or `decide`)
+
+The feed includes open `recovery_action` items. The route requires company access
+and `decision_queue:read`. Agent results include only sources the agent can read.
+The route does not materialize queues or sync retention state.
+
+Use `paperclipListProjects` to find a project, then call
+`paperclipGetProjectOverview` with its project UUID. The tool reads:
+
+- `GET /api/projects/{projectId}?companyId={companyId}`
+- `GET /api/companies/{companyId}/issues` with `projectId`, open `status` values
+  (`backlog,todo,in_progress,in_review,blocked`), `limit`, `sortField=updated`,
+  `sortDir=desc`, `view=compact`, and `readOnlyProjection=true`
+
+The existing project and issue routes enforce company scope and their normal
+`project:read` and `issue:read` checks. The tool returns a safe project summary
+and at most 25 open issues (default 10). It caps project descriptions at 1,000
+characters. It omits environment bindings and workspace configuration. The
+read-only issue projection can include a stale Recovery snapshot; it does not
+resolve or mutate that action.
+
+### Cancelling a superseded issue
+
+Use `paperclipUpdateIssue` with `{ "issueId": "…", "status": "cancelled" }`,
+then read the issue with `paperclipGetIssue` and verify its terminal status and
+`cancelledAt`. If the update fails, read the current issue and execution state
+before retrying; an HTTP 500 can reflect a concurrent routine-execution lock
+claim rather than a cancellation-guard rejection.

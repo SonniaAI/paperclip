@@ -111,6 +111,31 @@ const listIssuesSchema = z.object({
   q: z.string().optional(),
 });
 
+const decisionQueueOverviewSchema = z.object({
+  companyId: companyIdOptional,
+  limit: z.number().int().min(1).max(100).optional(),
+  cursor: z.string().trim().min(1).max(2_000).optional(),
+  sort: z.enum(["activity", "decide"]).optional(),
+});
+
+const projectOverviewSchema = z.object({
+  companyId: companyIdOptional,
+  projectId: z.string().guid(),
+  issueLimit: z.number().int().min(1).max(25).optional().default(10),
+});
+
+function projectToolContext(client: PaperclipApiClient, projectId: string, requestedCompanyId?: string | null) {
+  const companyId = client.resolveCompanyId(requestedCompanyId);
+  const companyPath = encodeURIComponent(companyId);
+  const projectPath = encodeURIComponent(projectId);
+  return {
+    companyId,
+    projectId,
+    projectUrl: `/projects/${projectPath}?companyId=${companyPath}`,
+    issuesUrl: `/companies/${companyPath}/issues`,
+  };
+}
+
 const listCommentsSchema = z.object({
   issueId: issueIdSchema,
   after: z.string().guid().optional(),
@@ -336,6 +361,22 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       },
     ),
     makeTool(
+      "paperclipGetDecisionQueueOverview",
+      "Read a paginated company Decisions overview, including human-owned Recovery actions, subject to the actor's read permissions",
+      decisionQueueOverviewSchema,
+      async ({ companyId, limit, cursor, sort }) => {
+        const params = new URLSearchParams();
+        if (limit !== undefined) params.set("limit", String(limit));
+        if (cursor !== undefined) params.set("cursor", cursor);
+        if (sort !== undefined) params.set("sort", sort);
+        const qs = params.toString();
+        return client.requestJson(
+          "GET",
+          `/companies/${client.resolveCompanyId(companyId)}/decision-queue-overview${qs ? `?${qs}` : ""}`,
+        );
+      },
+    ),
+    makeTool(
       "paperclipGetIssue",
       "Get a single issue by UUID or identifier",
       z.object({ issueId: issueIdSchema }),
@@ -412,6 +453,57 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       async ({ projectId, companyId }) => {
         const qs = companyId ? `?companyId=${encodeURIComponent(companyId)}` : "";
         return client.requestJson("GET", `/projects/${encodeURIComponent(projectId)}${qs}`);
+      },
+    ),
+    makeTool(
+      "paperclipGetProjectOverview",
+      "Read one authorized project's safe summary and a bounded page of its open issues (maximum 25)",
+      projectOverviewSchema,
+      async ({ companyId: requestedCompanyId, projectId, issueLimit }) => {
+        const context = projectToolContext(client, projectId, requestedCompanyId);
+        const issueParams = new URLSearchParams({
+          projectId: context.projectId,
+          status: "backlog,todo,in_progress,in_review,blocked",
+          limit: String(issueLimit),
+          sortField: "updated",
+          sortDir: "desc",
+          view: "compact",
+          readOnlyProjection: "true",
+        });
+        const [project, issues] = await Promise.all([
+          client.requestJson<Record<string, unknown>>("GET", context.projectUrl),
+          client.requestJson<Array<Record<string, unknown>>>(
+            "GET",
+            `${context.issuesUrl}?${issueParams.toString()}`,
+          ),
+        ]);
+        const description = typeof project.description === "string" ? project.description : null;
+        return {
+          project: {
+            id: project.id,
+            companyId: project.companyId,
+            urlKey: project.urlKey,
+            name: project.name,
+            description: description?.slice(0, 1_000) ?? null,
+            descriptionTruncated: description !== null && description.length > 1_000,
+            status: project.status,
+            leadAgentId: project.leadAgentId,
+            targetDate: project.targetDate,
+            taskCount: project.taskCount,
+          },
+          openIssues: issues.map((issue) => ({
+            id: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            status: issue.status,
+            priority: issue.priority,
+            assigneeAgentId: issue.assigneeAgentId,
+            assigneeUserId: issue.assigneeUserId,
+            updatedAt: issue.updatedAt,
+          })),
+          issueLimit,
+          mayHaveMoreOpenIssues: issues.length === issueLimit,
+        };
       },
     ),
     makeTool(
