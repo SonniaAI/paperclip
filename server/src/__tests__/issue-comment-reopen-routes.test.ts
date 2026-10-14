@@ -5,6 +5,7 @@ import { HttpError } from "../errors.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  getByIdentifier: vi.fn(),
   getByIdForUpdate: vi.fn(),
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
@@ -266,6 +267,7 @@ describe.sequential("issue comment reopen routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockReset();
+    mockIssueService.getByIdentifier.mockReset();
     mockIssueService.getByIdForUpdate.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
     mockIssueService.update.mockReset();
@@ -318,6 +320,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDb.transaction.mockImplementation(async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx));
+    mockIssueService.getByIdentifier.mockResolvedValue(null);
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
     mockHeartbeatService.wakeup.mockResolvedValue(undefined);
     mockHeartbeatService.reportRunActivity.mockResolvedValue(undefined);
@@ -584,6 +587,84 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
     ));
+  });
+
+  it("uses the resolved issue UUID when posting a comment by identifier", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getByIdentifier.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+      makeIssueUpdateReceipt(issue, patch));
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/PAP-580/comments")
+      .send({ body: "hello" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(issue.id, { status: "todo" });
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issue.id,
+      "hello",
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("keeps an orchestration incident terminal but accepts a plain comment when a successor is active", async () => {
+    const issue = {
+      ...makeIssue("done"),
+      originKind: "orchestration_incident",
+      originId: "source-incident-1",
+    };
+    mockIssueService.getByIdentifier.mockResolvedValue(issue);
+    const uniqueViolation = Object.assign(new Error("duplicate active incident"), {
+      cause: { code: "23505", constraint_name: "issues_active_orchestration_incident_uq" },
+    });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockRejectedValue(uniqueViolation);
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/PAP-580/comments")
+      .send({ body: "historical note" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(issue.id, { status: "todo" });
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issue.id,
+      "historical note",
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.updated" }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.comment_added" }),
+    );
+  });
+
+  it("rejects explicit reopen when an orchestration-incident successor is already active", async () => {
+    const issue = {
+      ...makeIssue("done"),
+      originKind: "orchestration_incident",
+      originId: "source-incident-1",
+    };
+    mockIssueService.getByIdentifier.mockResolvedValue(issue);
+    const uniqueViolation = Object.assign(new Error("duplicate active incident"), {
+      cause: { code: "23505", constraint_name: "issues_active_orchestration_incident_uq" },
+    });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockRejectedValue(uniqueViolation);
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/PAP-580/comments")
+      .send({ body: "please reopen", reopen: true });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("active orchestration incident");
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
   it("allows default-open non-assignee POST comments on closed issues without reopening", async () => {
