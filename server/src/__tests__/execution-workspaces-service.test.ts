@@ -835,6 +835,81 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(finalState?.status).toBe("archived");
   }, 30_000);
 
+  it("inspects a shared worktree once per sweep inspection window (SON-5177)", async () => {
+    // Shared project worktrees can back thousands of execution-workspace rows.
+    // Before the hysteresis, every row ran its own uncached git status scan per
+    // sweep page, which pinned one shared worktree at roughly one scan per
+    // second and degraded the whole server. Rows that share a physical worktree
+    // (and branch/base identity) must share one inspection per TTL window, and
+    // the window expiry must re-inspect so eventual cleanup still happens.
+    let clockMs = Date.UTC(2026, 9, 14, 11, 0, 0);
+    const inspectionKeys: string[] = [];
+    const seeded = [
+      await seedTerminalWorkspace(),
+      await seedTerminalWorkspace(),
+      await seedTerminalWorkspace(),
+    ];
+    const sharedPath = seeded[0]!.worktreePath;
+    // All three rows point at the same physical worktree, like shared
+    // `_default` project workspaces backing many issue sessions.
+    for (const row of seeded) {
+      await db
+        .update(executionWorkspaces)
+        .set({
+          cwd: sharedPath,
+          providerRef: sharedPath,
+          providerType: "git_worktree",
+          branchName: null,
+          baseRef: null,
+          repoUrl: null,
+        })
+        .where(eq(executionWorkspaces.id, row.executionWorkspaceId));
+    }
+    const service = executionWorkspaceService(db, {
+      resolvePullRequestDetails: async () => ({ state: "unknown", headRef: null, headSha: null }),
+      now: () => new Date(clockMs),
+      workspaceReaperCooldownDays: 0,
+      sweepInspectionTtlMs: 5 * 60_000,
+      inspectGitCloseReadiness: async (workspace) => {
+        inspectionKeys.push(workspace.providerRef ?? workspace.cwd ?? "?");
+        return {
+          git: {
+            repoRoot: sharedPath,
+            workspacePath: sharedPath,
+            branchName: null,
+            baseRef: null,
+            hasDirtyTrackedFiles: false,
+            hasUntrackedFiles: true,
+            dirtyEntryCount: 0,
+            untrackedEntryCount: 1,
+            aheadCount: null,
+            behindCount: null,
+            isMergedIntoBase: null,
+            createdByRuntime: false,
+          },
+          warnings: [],
+        };
+      },
+    });
+
+    const first = await service.sweepTerminalWorkspaces();
+    expect(first.checked).toBeGreaterThanOrEqual(3);
+    const sharedKeys = () => inspectionKeys.filter((key) => key === sharedPath);
+    // Three rows share one physical worktree: one inspection, not three.
+    expect(sharedKeys()).toHaveLength(1);
+
+    // A sweep inside the TTL window reuses the inspection for every row.
+    clockMs += 60_000;
+    await service.sweepTerminalWorkspaces();
+    expect(sharedKeys()).toHaveLength(1);
+
+    // After the window expires the sweep inspects the worktree again, so a
+    // tree that later becomes clean still reaches its archive decision.
+    clockMs += 5 * 60_000;
+    await service.sweepTerminalWorkspaces();
+    expect(sharedKeys()).toHaveLength(2);
+  }, 30_000);
+
   describe("reaper cooldown", () => {
     const DAY_MS = 24 * 60 * 60 * 1000;
     const nowMs = Date.UTC(2026, 5, 1);

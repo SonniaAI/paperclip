@@ -1156,6 +1156,7 @@ export async function startServer(): Promise<StartedServer> {
     });
     const terminalWorkspaces = executionWorkspaceService(db as any, {
       workspaceReaperCooldownDays: config.workspaceReaperCooldownDays,
+      sweepInspectionTtlMs: config.workspaceSweepInspectionTtlMs,
     });
     const scheduleMergedPullRequestConfirmationSweep = () => {
       if (heartbeatSchedulerStopped) return;
