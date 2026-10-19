@@ -484,6 +484,10 @@ const createIssueBaseSchema = z.object({
     ]),
     action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
   }).strict().optional().nullable(),
+  externalBlocker: z.object({
+    owner: z.string().trim().min(1).max(200),
+    note: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
+  }).strict().optional().nullable(),
   inheritExecutionWorkspaceFromIssueId: z.string().guid().optional().nullable(),
   title: z.string().min(1),
   description: multilineTextSchema.optional().nullable(),
@@ -527,6 +531,19 @@ function requireBlockedStatusForUnblockDescriptor(
   }
 }
 
+function requireBlockedStatusForExternalBlocker(
+  value: { status?: string; externalBlocker?: unknown },
+  ctx: z.RefinementCtx,
+) {
+  if (value.externalBlocker != null && value.status !== undefined && value.status !== "blocked") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "externalBlocker requires blocked status",
+      path: ["externalBlocker"],
+    });
+  }
+}
+
 const createIssueDuplicateGuardSchema = {
   idempotencyKey: z.string().trim().min(1).max(255).optional().nullable(),
   allowDuplicate: z.boolean()
@@ -553,7 +570,8 @@ export const createIssueSchema = withCreateIssueStatusDefault(
     ...createIssueDuplicateGuardSchema,
     ...onboardingFirstTaskMarkerSchema,
   }),
-).superRefine(requireBlockedStatusForUnblockDescriptor);
+).superRefine(requireBlockedStatusForUnblockDescriptor)
+  .superRefine(requireBlockedStatusForExternalBlocker);
 
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 
@@ -573,7 +591,8 @@ export const createChildIssueSchema = withCreateIssueStatusDefault(createIssueBa
   .extend({
     acceptanceCriteria: z.array(z.string().trim().min(1).max(500)).max(20).optional(),
     blockParentUntilDone: z.boolean().optional().default(false),
-  })).superRefine(requireBlockedStatusForUnblockDescriptor);
+  })).superRefine(requireBlockedStatusForUnblockDescriptor)
+  .superRefine(requireBlockedStatusForExternalBlocker);
 
 export type CreateChildIssue = z.infer<typeof createChildIssueSchema>;
 

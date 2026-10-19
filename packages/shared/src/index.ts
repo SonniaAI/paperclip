@@ -1088,6 +1088,7 @@ export type {
   IssueInboxAttentionKind,
   IssueBlockedInboxAction,
   IssueBlockedInboxAttention,
+  IssueExternalBlocker,
   IssueUnblockDescriptor,
   IssueUnblockOwner,
   IssueBlockedInboxIssueRef,
