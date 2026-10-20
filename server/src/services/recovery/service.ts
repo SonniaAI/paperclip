@@ -67,6 +67,7 @@ import {
 } from "./stranded-notice.js";
 import {
   RECOVERY_ORIGIN_KINDS,
+  RECOVERY_REASON_KINDS,
   isStrandedIssueRecoveryOriginKind,
 } from "./origins.js";
 import { withRecoveryContext } from "./status-only-context.js";
@@ -541,6 +542,79 @@ export function classifyContinuationFailure(latestRun: LatestIssueRun): Continua
   };
 }
 
+/**
+ * SON-1612: consecutive liveness-blocked / no_op continuation runs after which
+ * the continuation requeue gate engages (back off to the hourly wake class).
+ */
+export const CONTINUATION_NO_MATERIAL_BACKOFF_THRESHOLD = 2;
+
+/**
+ * SON-1612: backoff window for continuation requeues once the no-material
+ * streak reaches the threshold — the hourly wake class, not the scheduler's
+ * ~30s/5-min tick cadence.
+ */
+export const CONTINUATION_NO_MATERIAL_BACKOFF_MS = 60 * 60 * 1000;
+
+export type ContinuationRequeueGateDecision =
+  | { kind: "allow"; consecutive: number }
+  | { kind: "backoff"; consecutive: number; nextAllowedAt: Date }
+  | { kind: "stop"; consecutive: number };
+
+/**
+ * Decides whether a stranded-issue continuation requeue may proceed.
+ *
+ * - Below the no-material streak threshold: allow (normal retry cadence).
+ * - At/above the threshold with no live execution path AND every child routed:
+ *   stop — continuation cannot make progress; the caller converts the issue to
+ *   `blocked` so the missing path is visible instead of retrying forever.
+ * - Otherwise: back off to the hourly class anchored at the last continuation
+ *   finish time.
+ */
+export function evaluateContinuationRequeueGate(input: {
+  consecutiveNoMaterialContinuations: number;
+  latestContinuationFinishedAt: Date | null;
+  hasLiveExecutionPath: boolean;
+  allChildrenRouted: boolean;
+  now: Date;
+}): ContinuationRequeueGateDecision {
+  const { consecutiveNoMaterialContinuations, latestContinuationFinishedAt, now } = input;
+  if (consecutiveNoMaterialContinuations < CONTINUATION_NO_MATERIAL_BACKOFF_THRESHOLD) {
+    return { kind: "allow", consecutive: consecutiveNoMaterialContinuations };
+  }
+  if (!input.hasLiveExecutionPath && input.allChildrenRouted) {
+    return { kind: "stop", consecutive: consecutiveNoMaterialContinuations };
+  }
+  const anchoredAt = latestContinuationFinishedAt ?? now;
+  const nextAllowedAt = new Date(anchoredAt.getTime() + CONTINUATION_NO_MATERIAL_BACKOFF_MS);
+  if (now.getTime() < nextAllowedAt.getTime()) {
+    return { kind: "backoff", consecutive: consecutiveNoMaterialContinuations, nextAllowedAt };
+  }
+  return { kind: "allow", consecutive: consecutiveNoMaterialContinuations };
+}
+
+/**
+ * Terminal continuation runs (newest first) feed the no-material streak when
+ * they are continuation-scoped (retryReason/wakeReason) and either recorded as
+ * `no_op` (SON-1612 terminal outcome) or classified liveness-blocked.
+ */
+export function isNoMaterialContinuationRun(run: {
+  status: string;
+  contextSnapshot: unknown;
+  livenessState: string | null;
+}): boolean {
+  const ctx = parseObject(run.contextSnapshot);
+  const wakeReason = readNonEmptyString(ctx.wakeReason);
+  const retryReason = readNonEmptyString(ctx.retryReason);
+  const continuationScoped =
+    retryReason === "issue_continuation_needed" ||
+    wakeReason === "issue_continuation_needed" ||
+    wakeReason === "issue_monitor_due" ||
+    wakeReason === RECOVERY_REASON_KINDS.runLivenessContinuation;
+  if (!continuationScoped) return false;
+  if (run.status === "no_op") return true;
+  return run.status === "succeeded" && run.livenessState === "blocked";
+}
+
 function successfulRunHandoffRecoveryEvidence(latestRun: LatestIssueRun): SuccessfulRunHandoffRecoveryEvidence | null {
   if (!latestRun) return null;
 
@@ -788,6 +862,132 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (latestFinishedAt === null) latestFinishedAt = row.finishedAt ?? null;
     }
     return { consecutive, latestFinishedAt };
+  }
+
+  /**
+   * SON-1612: newest-first streak of consecutive no-material continuation runs
+   * for an issue (liveness-blocked comment-only sweeps, or runs recorded as the
+   * `no_op` terminal outcome). Mirrors summarizeRecentContinuationRetries but
+   * keys on run status/liveness instead of errorCode.
+   */
+  async function summarizeRecentNoMaterialContinuations(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+  ) {
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        livenessState: heartbeatRuns.livenessState,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          inArray(heartbeatRuns.status, [
+            "succeeded",
+            "no_op",
+            "interrupted",
+            "failed",
+            "cancelled",
+            "timed_out",
+          ]),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(15);
+
+    let consecutive = 0;
+    let latestFinishedAt: Date | null = null;
+    for (const row of rows) {
+      if (!isNoMaterialContinuationRun(row)) break;
+      consecutive += 1;
+      if (latestFinishedAt === null) latestFinishedAt = row.finishedAt ?? null;
+    }
+    return { consecutive, latestFinishedAt };
+  }
+
+  /**
+   * SON-1612: a child issue counts as routed when it has an assignee or has
+   * reached a terminal status; open unassigned children mean the parent still
+   * owes routing work, so continuation must not stop.
+   */
+  async function issueChildrenAllRouted(issueId: string) {
+    const children = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+      })
+      .from(issues)
+      .where(eq(issues.parentId, issueId));
+    return children.every((child) =>
+      child.assigneeAgentId !== null ||
+      (child.assigneeUserId !== null && child.assigneeUserId !== "") ||
+      child.status === "done" ||
+      child.status === "cancelled"
+    );
+  }
+
+  /**
+   * SON-1612: requeue gate for no-material continuation runs. Returns "stop"
+   * (issue converted to `blocked`), "backoff" (skip this tick; the hourly-class
+   * window must elapse first), or "allow" (proceed with the normal requeue).
+   */
+  async function gateNoMaterialContinuationRequeue(
+    issue: typeof issues.$inferSelect,
+    agentId: string,
+    latestRun: LatestIssueRun,
+  ): Promise<"stop" | "backoff" | "allow"> {
+    if (!latestRun || !isNoMaterialContinuationRun({
+      status: latestRun.status,
+      contextSnapshot: latestRun.contextSnapshot,
+      livenessState: latestRun.livenessState,
+    })) {
+      return "allow";
+    }
+    const [streak, activePath, pendingInteraction, durableWait, childrenRouted] = await Promise.all([
+      summarizeRecentNoMaterialContinuations(issue.companyId, issue.id, agentId),
+      hasActiveExecutionPath(issue.companyId, issue.id, agentId),
+      hasPendingWakeInteraction(issue.companyId, issue.id),
+      hasPersistedDurableWaitPath(issue),
+      issueChildrenAllRouted(issue.id),
+    ]);
+    const decision = evaluateContinuationRequeueGate({
+      consecutiveNoMaterialContinuations: streak.consecutive,
+      latestContinuationFinishedAt: streak.latestFinishedAt,
+      hasLiveExecutionPath: Boolean(activePath) || pendingInteraction || durableWait,
+      allChildrenRouted: childrenRouted,
+      now: new Date(),
+    });
+    if (decision.kind === "stop") {
+      const updated = await escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: issue.status as StrandedPreviousStatus,
+        latestRun,
+        notice: {
+          body:
+            "Paperclip stopped continuation for this assigned `" + issue.status + "` issue after " +
+            decision.consecutive + " consecutive continuation runs without a material action, with no " +
+            "live execution path and every child issue routed. Moving it to `blocked` so the missing " +
+            "path is visible for intervention.",
+          title: "Continuation stopped",
+          tone: "danger",
+        },
+      });
+      if (updated) {
+        return "stop";
+      }
+      // Could not convert (e.g. a concurrent board edit) — still back off
+      // rather than hammering the issue with another immediate wake.
+      return "backoff";
+    }
+    return decision.kind;
   }
 
   async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
@@ -3459,6 +3659,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       assignmentDispatched: 0,
       dispatchRequeued: 0,
       continuationRequeued: 0,
+      continuationGateStopped: 0,
+      continuationBackoffSkipped: 0,
       dispositionRepairRequeued: 0,
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
@@ -4062,6 +4264,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        // SON-1612: a liveness-`blocked` "productive" continuation is exactly
+        // the comment-only sweep class — gate it BEFORE the comment-progress
+        // exemption so per-tick comments cannot hold the retry loop open.
+        if (successfulRun.livenessState === "blocked") {
+          const gate = await gateNoMaterialContinuationRequeue(issue, agentId, successfulRun);
+          if (gate === "stop") {
+            result.continuationGateStopped += 1;
+            result.issueIds.push(issue.id);
+            continue;
+          }
+          if (gate === "backoff") {
+            result.continuationBackoffSkipped += 1;
+            result.skipped += 1;
+            continue;
+          }
+        }
+
         if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
           // GGU-809: skip escalation if the assignee has shown visible progress
           // (comment or attachment) within the exemption window. Falling
@@ -4208,6 +4427,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (await isInvocationBudgetBlocked(issue, agentId)) {
         result.skipped += 1;
         continue;
+      }
+
+      // SON-1612: gate the generic continuation fall-through for no-material
+      // continuation runs (e.g. `no_op` sweeps) — hourly-class backoff or stop
+      // instead of an unconditional retry tick.
+      {
+        const gate = await gateNoMaterialContinuationRequeue(issue, agentId, latestRun);
+        if (gate === "stop") {
+          result.continuationGateStopped += 1;
+          result.issueIds.push(issue.id);
+          continue;
+        }
+        if (gate === "backoff") {
+          result.continuationBackoffSkipped += 1;
+          result.skipped += 1;
+          continue;
+        }
       }
 
       const queued = await enqueueStrandedIssueRecovery({

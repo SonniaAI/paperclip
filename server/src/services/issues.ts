@@ -819,7 +819,7 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
-export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "no_op", "interrupted", "failed", "cancelled", "timed_out"]);
 
 export const STALE_RUN_QUIET_MINUTES_DEFAULT = 120;
 
