@@ -17200,8 +17200,26 @@ export function heartbeatService(
       );
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
+    let promotedRunCount = 0;
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      const claimed = await startNextQueuedRunForAgent(agentId);
+      promotedRunCount += claimed.length;
+    }
+    // This promoter is intentionally quiet when the board is already moving:
+    // no queued runs and no free slots both produce zero claims. Log only
+    // actual claims so dispatch-health investigations can verify from logs
+    // that the promoter ran and started work, instead of inferring its
+    // existence from the absence of stranded runs. Repeat calls are safe:
+    // startNextQueuedRunForAgent serializes on the per-agent start lock and
+    // no-ops when slots are full.
+    if (promotedRunCount > 0) {
+      logger.info(
+        {
+          scannedAgents: agentIds.length,
+          promotedQueuedRuns: promotedRunCount,
+        },
+        "queued-run promoter started queued heartbeat runs",
+      );
     }
   }
 
