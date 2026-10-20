@@ -67,7 +67,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
-import { isForeignKeyViolation } from "../db-errors.js";
+import { isForeignKeyViolation, isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -8758,11 +8758,34 @@ export function issueService(db: Db) {
         if (sameRunOwnership) return { ownership: sameRunOwnership, latest: null };
 
         if (canAdoptUnownedCheckout(candidate)) {
-          const adopted = await adoptUnownedCheckoutRun({
-            issueId: id,
-            actorAgentId,
-            actorRunId: actorRunId!,
-          });
+          let adopted: Awaited<
+            ReturnType<typeof adoptUnownedCheckoutRun>
+          > = null;
+          try {
+            adopted = await adoptUnownedCheckoutRun({
+              issueId: id,
+              actorAgentId,
+              actorRunId: actorRunId!,
+            });
+          } catch (error) {
+            if (!isUniqueViolation(error, "issues_open_routine_execution_uq")) {
+              throw error;
+            }
+            // SON-5458: a sibling open execution of the same routine era
+            // already holds the issues_open_routine_execution_uq tuple, so the
+            // attribution stamp for this row is rejected by the index. The
+            // stamp is not a precondition for acting on the issue: the row is
+            // the actor's own unowned-checked-out task, and the index verdict
+            // means "another open execution exists", not "no mutation".
+            // Proceed without the stamp instead of failing the mutation.
+            return {
+              ownership: {
+                ...candidate,
+                adoptedFromRunId: null as string | null,
+              },
+              latest: null,
+            };
+          }
 
           if (adopted) {
             return {
@@ -8788,6 +8811,13 @@ export function issueService(db: Db) {
             actorAgentId,
             actorRunId,
             expectedCheckoutRunId: previousCheckoutRunId,
+          }).catch((error: unknown) => {
+            if (!isUniqueViolation(error, "issues_open_routine_execution_uq")) {
+              throw error;
+            }
+            // SON-5458: same era-tuple conflict as the unowned adoption above.
+            // The stale-lock stamp is attribution-only; proceed without it.
+            return { adopted: null, latest: null };
           });
 
           if (staleAdoption.adopted) {
@@ -8805,6 +8835,15 @@ export function issueService(db: Db) {
             if (latestOwnership) return { ownership: latestOwnership, latest: staleAdoption.latest };
             return { ownership: null, latest: staleAdoption.latest };
           }
+          // The adoption stamp was declined (era-tuple conflict); the actor
+          // keeps mutation authority over their own stale-locked issue.
+          return {
+            ownership: {
+              ...candidate,
+              adoptedFromRunId: null as string | null,
+            },
+            latest: null,
+          };
         }
 
         return { ownership: null, latest: null };
