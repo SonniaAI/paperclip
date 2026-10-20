@@ -15687,27 +15687,41 @@ export function heartbeatService(
       claimedWakeReason !== "source_scoped_recovery_action"
     ) {
       const claimedAgent = await getAgent(claimed.agentId);
-      await db
-        .update(issues)
-        .set({
-          executionRunId: claimed.id,
-          executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
-          executionLockedAt: claimedAt,
-          updatedAt: claimedAt,
-        })
-        .where(
-          and(
-            eq(issues.id, claimedIssueId),
-            eq(issues.companyId, claimed.companyId),
-            // Mention/context runs can touch an issue, but only the current assignee
-            // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
-            or(
-              isNull(issues.executionRunId),
-              eq(issues.executionRunId, claimed.id),
+      try {
+        await db
+          .update(issues)
+          .set({
+            executionRunId: claimed.id,
+            executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
+            executionLockedAt: claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(
+            and(
+              eq(issues.id, claimedIssueId),
+              eq(issues.companyId, claimed.companyId),
+              // Mention/context runs can touch an issue, but only the current assignee
+              // owns the issue execution lock shown as the active run.
+              eq(issues.assigneeAgentId, claimed.agentId),
+              or(
+                isNull(issues.executionRunId),
+                eq(issues.executionRunId, claimed.id),
+              ),
             ),
-          ),
-        );
+          );
+      } catch (err) {
+        if (isRoutineExecutionLockConflict(err)) {
+          logger.info(
+            { err, runId: claimed.id, issueId: claimedIssueId },
+            "routine execution lock held by another open issue; execution stamp deferred",
+          );
+        } else {
+          logger.error(
+            { err, runId: claimed.id, issueId: claimedIssueId },
+            "issue execution stamp after claim failed",
+          );
+        }
+      }
     }
 
     return claimed;
@@ -17446,6 +17460,40 @@ export function heartbeatService(
     }
   }
 
+  // A routine_execution issue's execution stamp is guarded by the partial
+  // unique index issues_open_routine_execution_uq: one lock-holding open
+  // issue per (company, routine, origin fingerprint). Multiple open issues
+  // can legitimately share that tuple - the routine's carrier card and a
+  // fire's instance both carry the routine-definition fingerprint. When a
+  // claim loses the stamp race it must not fail the claim: the lock is
+  // ownership/display state, not a work guard, and the run has already
+  // started by the time the stamp is written.
+  function isRoutineExecutionLockConflict(err: unknown): boolean {
+    let current: unknown = err;
+    for (let depth = 0; current && depth < 4; depth += 1) {
+      const candidate = current as {
+        code?: unknown;
+        constraint?: unknown;
+        message?: unknown;
+        cause?: unknown;
+      };
+      if (candidate.code === "23505") {
+        if (candidate.constraint === "issues_open_routine_execution_uq") {
+          return true;
+        }
+        if (
+          String(candidate.message ?? "").includes(
+            "issues_open_routine_execution_uq",
+          )
+        ) {
+          return true;
+        }
+      }
+      current = candidate.cause;
+    }
+    return false;
+  }
+
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
@@ -17560,7 +17608,28 @@ export function heartbeatService(
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
+        let claimed: typeof heartbeatRuns.$inferSelect | null = null;
+        try {
+          claimed = await claimQueuedRun(queuedRun, companyAgents);
+        } catch (err) {
+          // One poisoned queued run must not abort the whole claim sweep:
+          // a throw here escapes to resumeQueuedRuns and kills the periodic
+          // recovery chain for every agent on that tick (observed as a
+          // company-wide dispatch outage on 2026-10-20 11:06-12:07Z).
+          // Skip this run and keep claiming the rest of the queue.
+          if (isRoutineExecutionLockConflict(err)) {
+            logger.info(
+              { err, runId: queuedRun.id },
+              "deferrable claim rejection: routine execution lock held; run stays queued",
+            );
+          } else {
+            logger.error(
+              { err, runId: queuedRun.id },
+              "queued run claim failed; continuing with remaining queued runs",
+            );
+          }
+          continue;
+        }
         if (claimed) claimedRuns.push(claimed);
       }
       if (claimedRuns.length === 0) return [];
