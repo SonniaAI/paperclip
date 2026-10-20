@@ -3328,6 +3328,7 @@ const issueListSelect = {
   executionWorkspaceSettings: sql<null>`null`,
   sourceTrust: issues.sourceTrust,
   unblockDescriptor: issues.unblockDescriptor,
+  externalBlocker: issues.externalBlocker,
   blockedTransitionAt: issues.blockedTransitionAt,
   blockedOwnerNotifiedAt: issues.blockedOwnerNotifiedAt,
   startedAt: issues.startedAt,
