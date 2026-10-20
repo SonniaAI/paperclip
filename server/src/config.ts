@@ -70,6 +70,7 @@ export interface Config {
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
   workspaceReaperCooldownDays: number;
+  workspaceSweepInspectionTtlMs: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -285,6 +286,19 @@ export function loadConfig(): Config {
       && workspaceReaperCooldownDaysRaw >= 0
       ? workspaceReaperCooldownDaysRaw
       : 7;
+  // Terminal-sweep inspection hysteresis (SON-5177). Minimum age before the
+  // reaper re-runs a git close-readiness inspection for the same physical
+  // worktree, since shared project worktrees can back thousands of candidate
+  // rows. 0 restores one inspection per row per sweep. Clamped to [0, 3600000].
+  const workspaceSweepInspectionTtlMsEnv =
+    process.env.PAPERCLIP_WORKSPACE_SWEEP_INSPECTION_TTL_MS?.trim();
+  const workspaceSweepInspectionTtlMsRaw = Number(workspaceSweepInspectionTtlMsEnv);
+  const workspaceSweepInspectionTtlMs =
+    workspaceSweepInspectionTtlMsEnv
+      && Number.isFinite(workspaceSweepInspectionTtlMsRaw)
+      && workspaceSweepInspectionTtlMsRaw >= 0
+      ? Math.min(3_600_000, Math.floor(workspaceSweepInspectionTtlMsRaw))
+      : 300_000;
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -328,6 +342,7 @@ export function loadConfig(): Config {
     databaseBackupRetentionDays,
     databaseBackupDir,
     workspaceReaperCooldownDays,
+    workspaceSweepInspectionTtlMs,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

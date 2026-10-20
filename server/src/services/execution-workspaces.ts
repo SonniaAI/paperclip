@@ -109,6 +109,15 @@ export const EXECUTION_WORKSPACE_REOPEN_FAILED_REASON = "reopen_failed";
 // consumer is gone, not a hard deadline on the request.
 export const STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS = 5 * 60 * 1000;
 
+const SWEEP_INSPECTION_MEMO_MAX_ENTRIES = 4096;
+const DEFAULT_SWEEP_INSPECTION_TTL_MS = 300_000;
+const MAX_SWEEP_INSPECTION_TTL_MS = 3_600_000;
+
+function clampSweepInspectionTtlMs(value: number | undefined): number {
+  if (!Number.isFinite(value)) return DEFAULT_SWEEP_INSPECTION_TTL_MS;
+  return Math.min(MAX_SWEEP_INSPECTION_TTL_MS, Math.max(0, Math.floor(value!)));
+}
+
 // The metadata key that holds the workspace lifecycle generation. The generation
 // is a monotonic integer. Every archive and every reopen increases it by one. A
 // destructive cleanup captures the generation it archived at, then re-reads the
@@ -236,6 +245,13 @@ export type ExecutionWorkspaceServiceOptions = {
     git: ExecutionWorkspaceCloseGitReadiness | null;
     warnings: string[];
   }>;
+  // Minimum age before the terminal-workspace reaper re-runs a git
+  // close-readiness inspection for the same physical worktree (SON-5177).
+  // Shared project worktrees can back thousands of candidate rows, and one
+  // inspection per row per sweep page pinned a shared worktree at roughly one
+  // git status scan per second. 0 disables the hysteresis and restores one
+  // inspection per row per sweep. Default 5 minutes.
+  sweepInspectionTtlMs?: number;
 };
 
 function parseGitHubRepository(repoUrl: string | null) {
@@ -788,11 +804,13 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
   }
 }
 
-async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<{
+type GitCloseReadinessInspection = {
   git: ExecutionWorkspaceCloseGitReadiness | null;
   warnings: string[];
   statusInspectionSucceeded: boolean;
-}> {
+};
+
+async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<GitCloseReadinessInspection> {
   const warnings: string[] = [];
   const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
   const createdByRuntime = workspace.providerType === "git_worktree"
@@ -1281,6 +1299,71 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     0,
     (opts.workspaceReaperCooldownDays ?? 7) * 24 * 60 * 60 * 1000,
   );
+  // Terminal-sweep inspection hysteresis (SON-5177). A shared project
+  // worktree can back thousands of execution-workspace rows, and the sweep ran
+  // one uncached `git status --untracked-files=all` inspection per row per
+  // sweep page. With ~2k terminal-but-unarchivable rows on one shared
+  // worktree, that pinned the worktree at roughly one scan per second and
+  // drove the node heap into GC thrash. The sweep may reuse one inspection
+  // result per resolved worktree (plus branch/base identity) within the TTL
+  // window below. Only the sweep's skip decisions read this cache; every
+  // destructive path re-verifies the git state with its own exact scan
+  // immediately before acting, so a stale memo entry cannot destroy work.
+  const sweepInspectionTtlMs = clampSweepInspectionTtlMs(opts.sweepInspectionTtlMs);
+  const sweepInspectionMemo = new Map<
+    string,
+    { expiresAt: number; promise: Promise<GitCloseReadinessInspection> }
+  >();
+  const inspectGitCloseReadinessForSweep = async (
+    workspace: ExecutionWorkspace,
+  ): Promise<GitCloseReadinessInspection> => {
+    const inspect: (w: ExecutionWorkspace) => Promise<GitCloseReadinessInspection> = opts.inspectGitCloseReadiness
+      ? async (w) => {
+        const { git, warnings } = await opts.inspectGitCloseReadiness!(w);
+        return { git, warnings, statusInspectionSucceeded: true };
+      }
+      : inspectGitCloseReadiness;
+    if (sweepInspectionTtlMs <= 0) return inspect(workspace);
+    const rawPath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd) ?? "";
+    let canonicalPath = rawPath;
+    if (rawPath) {
+      try {
+        canonicalPath = await fs.realpath(rawPath);
+      } catch {
+        // A missing or unreadable path stays uncanonicalized; the inspection
+        // itself reports that outcome with its own warnings.
+      }
+    }
+    const key = stableStringify([
+      canonicalPath,
+      readNullableString(workspace.branchName),
+      readNullableString(workspace.baseRef),
+    ]);
+    const nowMs = now().getTime();
+    const hit = sweepInspectionMemo.get(key);
+    if (hit && hit.expiresAt > nowMs) return hit.promise;
+    for (const [candidate, entry] of sweepInspectionMemo) {
+      if (entry.expiresAt <= nowMs) sweepInspectionMemo.delete(candidate);
+    }
+    if (sweepInspectionMemo.size >= SWEEP_INSPECTION_MEMO_MAX_ENTRIES) {
+      sweepInspectionMemo.delete(sweepInspectionMemo.keys().next().value!);
+    }
+    const entry: { expiresAt: number; promise: Promise<GitCloseReadinessInspection> } = {
+      expiresAt: Number.POSITIVE_INFINITY,
+      promise: inspect(workspace).then(
+        (result) => {
+          entry.expiresAt = now().getTime() + sweepInspectionTtlMs;
+          return result;
+        },
+        (error) => {
+          if (sweepInspectionMemo.get(key) === entry) sweepInspectionMemo.delete(key);
+          throw error;
+        },
+      ),
+    };
+    sweepInspectionMemo.set(key, entry);
+    return entry.promise;
+  };
   const pullRequestStateCache = new Map<
     string,
     {
@@ -2607,7 +2690,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
       for (const workspace of candidates) {
         const executionWorkspace = toExecutionWorkspace(workspace);
-        const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
+        const { git, statusInspectionSucceeded } = await inspectGitCloseReadinessForSweep(executionWorkspace);
         if (!statusInspectionSucceeded) {
           result.skippedUndelivered += 1;
           continue;
