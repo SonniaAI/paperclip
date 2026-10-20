@@ -728,7 +728,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // per-rotation upper bound, the cursor never reaches the end, never resets,
     // and never revisits the eligible workspace. The bound makes each rotation
     // cover a finite set, so the cursor resets and the workspace is archived.
-    let clockMs = Date.UTC(2021, 6, 1);
+    let clockMs = Date.now() + 5 * 60_000;
     const service = executionWorkspaceService(db, {
       resolvePullRequestDetails: async () => ({ state: "unknown", headRef: null, headSha: null }),
       now: () => new Date(clockMs),
@@ -842,7 +842,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // second and degraded the whole server. Rows that share a physical worktree
     // (and branch/base identity) must share one inspection per TTL window, and
     // the window expiry must re-inspect so eventual cleanup still happens.
-    let clockMs = Date.UTC(2026, 9, 14, 11, 0, 0);
+    let clockMs = Date.now() + 5 * 60_000;
     const inspectionKeys: string[] = [];
     const seeded = [
       await seedTerminalWorkspace(),
@@ -912,7 +912,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
   describe("reaper cooldown", () => {
     const DAY_MS = 24 * 60 * 60 * 1000;
-    const nowMs = Date.UTC(2026, 5, 1);
+    const nowMs = Date.now() + 5 * 60_000;
 
     function cooldownService(cooldownDays: number) {
       return executionWorkspaceService(db, {
