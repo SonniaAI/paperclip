@@ -8,10 +8,10 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 
 ## Baseline Counts
 
-- Skill/reference headings: 152
+- Skill/reference headings: 164
 - Eval cases: 106 across 16 groups
-- Total normative rows: 258
-- Legacy MCP aliases folded into normative rows: 44
+- Total normative rows: 270
+- Legacy MCP aliases folded into normative rows: 42
 
 | Eval group | Cases |
 | --- | ---: |
@@ -43,32 +43,108 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 | --- | --- | --- |
 | skill:skills/paperclip/SKILL.md:paperclip-skill:10 | optional_agent_tool | skills/paperclip/SKILL.md:10 |
 | skill:skills/paperclip/SKILL.md:terminology:14 | optional_agent_tool | skills/paperclip/SKILL.md:14 |
-| skill:skills/paperclip/SKILL.md:authentication:18 | control_plane_owned | skills/paperclip/SKILL.md:18 |
-| skill:skills/paperclip/SKILL.md:the-heartbeat-procedure:30 | optional_agent_tool | skills/paperclip/SKILL.md:30 |
-| skill:skills/paperclip/SKILL.md:generated-artifacts-and-work-products:101 | always_agent_tool | skills/paperclip/SKILL.md:101 |
-| skill:skills/paperclip/SKILL.md:status-quick-guide:148 | control_plane_owned | skills/paperclip/SKILL.md:148 |
-| skill:skills/paperclip/SKILL.md:monitors-and-watchers-say-only-what-you-actually-scheduled:158 | optional_agent_tool | skills/paperclip/SKILL.md:158 |
-| skill:skills/paperclip/SKILL.md:delegating-review-tasks:171 | always_agent_tool | skills/paperclip/SKILL.md:171 |
-| skill:skills/paperclip/SKILL.md:managing-a-user-s-inbox:182 | control_plane_owned | skills/paperclip/SKILL.md:182 |
-| skill:skills/paperclip/SKILL.md:issue-dependencies-blockers:190 | control_plane_owned | skills/paperclip/SKILL.md:190 |
-| skill:skills/paperclip/SKILL.md:requesting-board-approval:215 | optional_agent_tool | skills/paperclip/SKILL.md:215 |
-| skill:skills/paperclip/SKILL.md:issue-thread-interactions:236 | optional_agent_tool | skills/paperclip/SKILL.md:236 |
-| skill:skills/paperclip/SKILL.md:standalone-decisions:265 | optional_agent_tool | skills/paperclip/SKILL.md:265 |
-| skill:skills/paperclip/SKILL.md:mcp-tool-approval-gates:369 | optional_agent_tool | skills/paperclip/SKILL.md:369 |
-| skill:skills/paperclip/SKILL.md:niche-workflow-pointers:411 | optional_agent_tool | skills/paperclip/SKILL.md:411 |
-| skill:skills/paperclip/SKILL.md:cases:421 | optional_agent_tool | skills/paperclip/SKILL.md:421 |
-| skill:skills/paperclip/SKILL.md:company-skills-workflow:426 | optional_agent_tool | skills/paperclip/SKILL.md:426 |
-| skill:skills/paperclip/SKILL.md:routines:437 | optional_agent_tool | skills/paperclip/SKILL.md:437 |
-| skill:skills/paperclip/SKILL.md:issue-workspace-runtime-controls:448 | optional_agent_tool | skills/paperclip/SKILL.md:448 |
-| skill:skills/paperclip/SKILL.md:proposing-credentials-safely:455 | optional_agent_tool | skills/paperclip/SKILL.md:455 |
-| skill:skills/paperclip/SKILL.md:reading-granted-secrets:462 | optional_agent_tool | skills/paperclip/SKILL.md:462 |
-| skill:skills/paperclip/SKILL.md:critical-rules:488 | optional_agent_tool | skills/paperclip/SKILL.md:488 |
-| skill:skills/paperclip/SKILL.md:comment-style-required:512 | always_agent_tool | skills/paperclip/SKILL.md:512 |
-| skill:skills/paperclip/SKILL.md:update:544 | optional_agent_tool | skills/paperclip/SKILL.md:544 |
-| skill:skills/paperclip/SKILL.md:planning-required-when-planning-requested:554 | optional_agent_tool | skills/paperclip/SKILL.md:554 |
-| skill:skills/paperclip/SKILL.md:key-endpoints-hot-routes:587 | optional_agent_tool | skills/paperclip/SKILL.md:587 |
-| skill:skills/paperclip/SKILL.md:searching-issues:616 | optional_agent_tool | skills/paperclip/SKILL.md:616 |
-| skill:skills/paperclip/SKILL.md:full-reference:626 | optional_agent_tool | skills/paperclip/SKILL.md:626 |
+| skill:skills/paperclip/SKILL.md:authentication:20 | control_plane_owned | skills/paperclip/SKILL.md:20 |
+| skill:skills/paperclip/SKILL.md:conversation-tasks:32 | optional_agent_tool | skills/paperclip/SKILL.md:32 |
+| skill:skills/paperclip/SKILL.md:server-verified-external-chat-turns:49 | control_plane_owned | skills/paperclip/SKILL.md:49 |
+| skill:skills/paperclip/SKILL.md:the-heartbeat-procedure:89 | optional_agent_tool | skills/paperclip/SKILL.md:89 |
+| skill:skills/paperclip/SKILL.md:generated-artifacts-and-work-products:200 | always_agent_tool | skills/paperclip/SKILL.md:200 |
+| skill:skills/paperclip/SKILL.md:status-quick-guide:248 | control_plane_owned | skills/paperclip/SKILL.md:248 |
+| skill:skills/paperclip/SKILL.md:monitors-and-watchers-say-only-what-you-actually-scheduled:258 | optional_agent_tool | skills/paperclip/SKILL.md:258 |
+| skill:skills/paperclip/SKILL.md:delegating-review-tasks:271 | always_agent_tool | skills/paperclip/SKILL.md:271 |
+| skill:skills/paperclip/SKILL.md:managing-a-user-s-inbox:282 | control_plane_owned | skills/paperclip/SKILL.md:282 |
+| skill:skills/paperclip/SKILL.md:issue-dependencies-blockers:290 | control_plane_owned | skills/paperclip/SKILL.md:290 |
+| skill:skills/paperclip/SKILL.md:requesting-board-approval:315 | optional_agent_tool | skills/paperclip/SKILL.md:315 |
+| skill:skills/paperclip/SKILL.md:issue-thread-interactions:336 | optional_agent_tool | skills/paperclip/SKILL.md:336 |
+| skill:skills/paperclip/SKILL.md:standalone-decisions:366 | optional_agent_tool | skills/paperclip/SKILL.md:366 |
+| skill:skills/paperclip/SKILL.md:mcp-tool-approval-gates:470 | optional_agent_tool | skills/paperclip/SKILL.md:470 |
+| skill:skills/paperclip/SKILL.md:niche-workflow-pointers:512 | optional_agent_tool | skills/paperclip/SKILL.md:512 |
+| skill:skills/paperclip/SKILL.md:cases:522 | optional_agent_tool | skills/paperclip/SKILL.md:522 |
+| skill:skills/paperclip/SKILL.md:company-skills-workflow:527 | optional_agent_tool | skills/paperclip/SKILL.md:527 |
+| skill:skills/paperclip/SKILL.md:routines:538 | optional_agent_tool | skills/paperclip/SKILL.md:538 |
+| skill:skills/paperclip/SKILL.md:task-files-and-workspace-choices:549 | optional_agent_tool | skills/paperclip/SKILL.md:549 |
+| skill:skills/paperclip/SKILL.md:issue-workspace-runtime-controls:555 | optional_agent_tool | skills/paperclip/SKILL.md:555 |
+| skill:skills/paperclip/SKILL.md:proposing-credentials-safely:562 | optional_agent_tool | skills/paperclip/SKILL.md:562 |
+| skill:skills/paperclip/SKILL.md:reading-granted-secrets:569 | optional_agent_tool | skills/paperclip/SKILL.md:569 |
+| skill:skills/paperclip/SKILL.md:critical-rules:595 | optional_agent_tool | skills/paperclip/SKILL.md:595 |
+| skill:skills/paperclip/SKILL.md:comment-style-required:616 | always_agent_tool | skills/paperclip/SKILL.md:616 |
+| skill:skills/paperclip/SKILL.md:update:648 | optional_agent_tool | skills/paperclip/SKILL.md:648 |
+| skill:skills/paperclip/SKILL.md:task-documents-and-deliverables:658 | always_agent_tool | skills/paperclip/SKILL.md:658 |
+| skill:skills/paperclip/SKILL.md:planning-required-when-planning-requested:672 | optional_agent_tool | skills/paperclip/SKILL.md:672 |
+| skill:skills/paperclip/SKILL.md:key-endpoints-hot-routes:703 | optional_agent_tool | skills/paperclip/SKILL.md:703 |
+| skill:skills/paperclip/SKILL.md:searching-issues:733 | optional_agent_tool | skills/paperclip/SKILL.md:733 |
+| skill:skills/paperclip/SKILL.md:full-reference:743 | optional_agent_tool | skills/paperclip/SKILL.md:743 |
+| skill:skills/paperclip/SKILL.md:conversational-confirmation-answers:747 | always_agent_tool | skills/paperclip/SKILL.md:747 |
+| skill:skills/paperclip/SKILL.md:incidental-feedback:764 | optional_agent_tool | skills/paperclip/SKILL.md:764 |
+| skill:skills/paperclip/references/api-reference.md:paperclip-api-reference:1 | optional_agent_tool | skills/paperclip/references/api-reference.md:1 |
+| skill:skills/paperclip/references/api-reference.md:response-schemas:9 | optional_agent_tool | skills/paperclip/references/api-reference.md:9 |
+| skill:skills/paperclip/references/api-reference.md:agent-record-get-api-agents-me-or-get-api-agents-agentid:11 | optional_agent_tool | skills/paperclip/references/api-reference.md:11 |
+| skill:skills/paperclip/references/api-reference.md:company-portability:44 | optional_agent_tool | skills/paperclip/references/api-reference.md:44 |
+| skill:skills/paperclip/references/api-reference.md:issue-with-ancestors-get-api-issues-issueid:116 | optional_agent_tool | skills/paperclip/references/api-reference.md:116 |
+| skill:skills/paperclip/references/api-reference.md:issue-update-response-patch-api-issues-issueid:202 | optional_agent_tool | skills/paperclip/references/api-reference.md:202 |
+| skill:skills/paperclip/references/api-reference.md:blocker-diagnostics-get-api-issues-issueid-diagnostics-blockers:244 | control_plane_owned | skills/paperclip/references/api-reference.md:244 |
+| skill:skills/paperclip/references/api-reference.md:wake-diagnostics-get-api-issues-issueid-diagnostics-wakes:283 | control_plane_owned | skills/paperclip/references/api-reference.md:283 |
+| skill:skills/paperclip/references/api-reference.md:subtree-diagnostics-get-api-issues-issueid-diagnostics-subtree:327 | optional_agent_tool | skills/paperclip/references/api-reference.md:327 |
+| skill:skills/paperclip/references/api-reference.md:execution-policy-fields-on-an-issue:375 | optional_agent_tool | skills/paperclip/references/api-reference.md:375 |
+| skill:skills/paperclip/references/api-reference.md:cross-agent-review-gates:427 | always_agent_tool | skills/paperclip/references/api-reference.md:427 |
+| skill:skills/paperclip/references/api-reference.md:worked-example-ic-heartbeat:460 | optional_agent_tool | skills/paperclip/references/api-reference.md:460 |
+| skill:skills/paperclip/references/api-reference.md:1-identity-skip-if-already-in-context:465 | control_plane_owned | skills/paperclip/references/api-reference.md:465 |
+| skill:skills/paperclip/references/api-reference.md:2-check-inbox:469 | control_plane_owned | skills/paperclip/references/api-reference.md:469 |
+| skill:skills/paperclip/references/api-reference.md:3-already-have-issue-101-inprogress-highest-priority-continue-it:476 | optional_agent_tool | skills/paperclip/references/api-reference.md:476 |
+| skill:skills/paperclip/references/api-reference.md:4-do-the-actual-work-write-code-run-tests:483 | optional_agent_tool | skills/paperclip/references/api-reference.md:483 |
+| skill:skills/paperclip/references/api-reference.md:5-work-is-done-update-status-and-comment-in-one-call:485 | always_agent_tool | skills/paperclip/references/api-reference.md:485 |
+| skill:skills/paperclip/references/api-reference.md:6-still-have-time-checkout-the-next-task:489 | control_plane_owned | skills/paperclip/references/api-reference.md:489 |
+| skill:skills/paperclip/references/api-reference.md:7-made-partial-progress-not-done-yet-comment-and-exit:496 | always_agent_tool | skills/paperclip/references/api-reference.md:496 |
+| skill:skills/paperclip/references/api-reference.md:worked-example-report-a-board-user-s-mine-inbox:501 | control_plane_owned | skills/paperclip/references/api-reference.md:501 |
+| skill:skills/paperclip/references/api-reference.md:board-user-created-the-requesting-issue:506 | optional_agent_tool | skills/paperclip/references/api-reference.md:506 |
+| skill:skills/paperclip/references/api-reference.md:fetch-the-board-user-s-mine-inbox-issues:510 | control_plane_owned | skills/paperclip/references/api-reference.md:510 |
+| skill:skills/paperclip/references/api-reference.md:summarize-it-back-to-the-board-in-a-comment-or-document:524 | always_agent_tool | skills/paperclip/references/api-reference.md:524 |
+| skill:skills/paperclip/references/api-reference.md:worked-example-archive-a-resolved-inbox-item:529 | control_plane_owned | skills/paperclip/references/api-reference.md:529 |
+| skill:skills/paperclip/references/api-reference.md:the-responsible-user-s-id-is-resolved-from-the-authenticated-agent-run:534 | optional_agent_tool | skills/paperclip/references/api-reference.md:534 |
+| skill:skills/paperclip/references/api-reference.md:reverse-the-archive-if-it-was-premature-or-no-longer-desired:543 | optional_agent_tool | skills/paperclip/references/api-reference.md:543 |
+| skill:skills/paperclip/references/api-reference.md:worked-example-reviewer-approver-heartbeat:553 | always_agent_tool | skills/paperclip/references/api-reference.md:553 |
+| skill:skills/paperclip/references/api-reference.md:worked-example-manager-heartbeat:592 | optional_agent_tool | skills/paperclip/references/api-reference.md:592 |
+| skill:skills/paperclip/references/api-reference.md:1-identity-skip-if-already-in-context:595 | control_plane_owned | skills/paperclip/references/api-reference.md:595 |
+| skill:skills/paperclip/references/api-reference.md:2-check-team-status:599 | optional_agent_tool | skills/paperclip/references/api-reference.md:599 |
+| skill:skills/paperclip/references/api-reference.md:3-agent-42-is-blocked-read-comments:606 | control_plane_owned | skills/paperclip/references/api-reference.md:606 |
+| skill:skills/paperclip/references/api-reference.md:4-unblock-reassign-and-comment:610 | control_plane_owned | skills/paperclip/references/api-reference.md:610 |
+| skill:skills/paperclip/references/api-reference.md:5-check-own-assignments:614 | optional_agent_tool | skills/paperclip/references/api-reference.md:614 |
+| skill:skills/paperclip/references/api-reference.md:6-create-subtasks-and-delegate:621 | optional_agent_tool | skills/paperclip/references/api-reference.md:621 |
+| skill:skills/paperclip/references/api-reference.md:load-tests-depend-on-caching-layer-being-done-first-paperclip-will-auto-wake-agent-55-when-the-blocker-resolves:627 | control_plane_owned | skills/paperclip/references/api-reference.md:627 |
+| skill:skills/paperclip/references/api-reference.md:7-dashboard-for-health-check:632 | optional_agent_tool | skills/paperclip/references/api-reference.md:632 |
+| skill:skills/paperclip/references/api-reference.md:comments-and-mentions:638 | always_agent_tool | skills/paperclip/references/api-reference.md:638 |
+| skill:skills/paperclip/references/api-reference.md:update:645 | optional_agent_tool | skills/paperclip/references/api-reference.md:645 |
+| skill:skills/paperclip/references/api-reference.md:cross-team-work-and-delegation:667 | optional_agent_tool | skills/paperclip/references/api-reference.md:667 |
+| skill:skills/paperclip/references/api-reference.md:receiving-cross-team-work:671 | optional_agent_tool | skills/paperclip/references/api-reference.md:671 |
+| skill:skills/paperclip/references/api-reference.md:questions-and-dependencies:681 | always_agent_tool | skills/paperclip/references/api-reference.md:681 |
+| skill:skills/paperclip/references/api-reference.md:company-context:693 | optional_agent_tool | skills/paperclip/references/api-reference.md:693 |
+| skill:skills/paperclip/references/api-reference.md:company-branding-ceo-board:705 | optional_agent_tool | skills/paperclip/references/api-reference.md:705 |
+| skill:skills/paperclip/references/api-reference.md:openclaw-invite-prompt-ceo:725 | optional_agent_tool | skills/paperclip/references/api-reference.md:725 |
+| skill:skills/paperclip/references/api-reference.md:setting-agent-instructions-path:744 | optional_agent_tool | skills/paperclip/references/api-reference.md:744 |
+| skill:skills/paperclip/references/api-reference.md:project-setup-create-workspace:777 | optional_agent_tool | skills/paperclip/references/api-reference.md:777 |
+| skill:skills/paperclip/references/api-reference.md:option-a-one-call-create-with-workspace:801 | optional_agent_tool | skills/paperclip/references/api-reference.md:801 |
+| skill:skills/paperclip/references/api-reference.md:option-b-two-calls-project-first-then-workspace:820 | optional_agent_tool | skills/paperclip/references/api-reference.md:820 |
+| skill:skills/paperclip/references/api-reference.md:governance-and-approvals:849 | optional_agent_tool | skills/paperclip/references/api-reference.md:849 |
+| skill:skills/paperclip/references/api-reference.md:requesting-a-hire-management-only:853 | optional_agent_tool | skills/paperclip/references/api-reference.md:853 |
+| skill:skills/paperclip/references/api-reference.md:ceo-strategy-approval:918 | optional_agent_tool | skills/paperclip/references/api-reference.md:918 |
+| skill:skills/paperclip/references/api-reference.md:questions-and-waiting-for-human-input:927 | always_agent_tool | skills/paperclip/references/api-reference.md:927 |
+| skill:skills/paperclip/references/api-reference.md:issue-thread-confirmations:1031 | always_agent_tool | skills/paperclip/references/api-reference.md:1031 |
+| skill:skills/paperclip/references/api-reference.md:conversational-confirmation-answers:1089 | always_agent_tool | skills/paperclip/references/api-reference.md:1089 |
+| skill:skills/paperclip/references/api-reference.md:checkbox-confirmations:1095 | always_agent_tool | skills/paperclip/references/api-reference.md:1095 |
+| skill:skills/paperclip/references/api-reference.md:item-verdict-requests:1210 | optional_agent_tool | skills/paperclip/references/api-reference.md:1210 |
+| skill:skills/paperclip/references/api-reference.md:checking-approval-status:1320 | optional_agent_tool | skills/paperclip/references/api-reference.md:1320 |
+| skill:skills/paperclip/references/api-reference.md:approval-follow-up-requesting-agent:1326 | always_agent_tool | skills/paperclip/references/api-reference.md:1326 |
+| skill:skills/paperclip/references/api-reference.md:issue-lifecycle:1344 | always_agent_tool | skills/paperclip/references/api-reference.md:1344 |
+| skill:skills/paperclip/references/api-reference.md:error-handling:1374 | control_plane_owned | skills/paperclip/references/api-reference.md:1374 |
+| skill:skills/paperclip/references/api-reference.md:full-api-reference:1388 | optional_agent_tool | skills/paperclip/references/api-reference.md:1388 |
+| skill:skills/paperclip/references/api-reference.md:agents:1390 | optional_agent_tool | skills/paperclip/references/api-reference.md:1390 |
+| skill:skills/paperclip/references/api-reference.md:issues-tasks:1411 | optional_agent_tool | skills/paperclip/references/api-reference.md:1411 |
+| skill:skills/paperclip/references/api-reference.md:companies-projects-goals:1452 | optional_agent_tool | skills/paperclip/references/api-reference.md:1452 |
+| skill:skills/paperclip/references/api-reference.md:routines:1476 | optional_agent_tool | skills/paperclip/references/api-reference.md:1476 |
+| skill:skills/paperclip/references/api-reference.md:approvals-costs-activity-dashboard:1492 | optional_agent_tool | skills/paperclip/references/api-reference.md:1492 |
+| skill:skills/paperclip/references/api-reference.md:secrets:1514 | optional_agent_tool | skills/paperclip/references/api-reference.md:1514 |
+| skill:skills/paperclip/references/api-reference.md:agent-secret-proposals:1527 | optional_agent_tool | skills/paperclip/references/api-reference.md:1527 |
+| skill:skills/paperclip/references/api-reference.md:agent-secret-access:1627 | optional_agent_tool | skills/paperclip/references/api-reference.md:1627 |
+| skill:skills/paperclip/references/api-reference.md:common-mistakes:1667 | optional_agent_tool | skills/paperclip/references/api-reference.md:1667 |
 | skill:skills/paperclip/references/artifacts.md:generated-artifacts-and-work-products:1 | always_agent_tool | skills/paperclip/references/artifacts.md:1 |
 | skill:skills/paperclip/references/artifacts.md:workspace-only-file-references:15 | optional_agent_tool | skills/paperclip/references/artifacts.md:15 |
 | skill:skills/paperclip/references/cases.md:cases:1 | optional_agent_tool | skills/paperclip/references/cases.md:1 |
@@ -96,14 +172,18 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 | skill:skills/paperclip/references/company-skills.md:assign-skills-to-an-existing-agent:181 | optional_agent_tool | skills/paperclip/references/company-skills.md:181 |
 | skill:skills/paperclip/references/company-skills.md:include-skills-during-hire-or-create:216 | optional_agent_tool | skills/paperclip/references/company-skills.md:216 |
 | skill:skills/paperclip/references/company-skills.md:notes:256 | optional_agent_tool | skills/paperclip/references/company-skills.md:256 |
+| skill:skills/paperclip/references/issue-documents.md:issue-documents-through-the-api:1 | always_agent_tool | skills/paperclip/references/issue-documents.md:1 |
+| skill:skills/paperclip/references/issue-documents.md:create-a-document:8 | always_agent_tool | skills/paperclip/references/issue-documents.md:8 |
+| skill:skills/paperclip/references/issue-documents.md:update-or-resolve-an-unclear-write:49 | optional_agent_tool | skills/paperclip/references/issue-documents.md:49 |
 | skill:skills/paperclip/references/issue-workspaces.md:issue-workspace-runtime-controls:1 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:1 |
 | skill:skills/paperclip/references/issue-workspaces.md:discover-the-workspace:5 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:5 |
-| skill:skills/paperclip/references/issue-workspaces.md:control-services:23 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:23 |
-| skill:skills/paperclip/references/issue-workspaces.md:start-all-configured-services-waits-for-configured-readiness-checks:28 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:28 |
-| skill:skills/paperclip/references/issue-workspaces.md:restart-all-configured-services:36 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:36 |
-| skill:skills/paperclip/references/issue-workspaces.md:stop-all-running-services:44 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:44 |
-| skill:skills/paperclip/references/issue-workspaces.md:read-the-url:63 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:63 |
-| skill:skills/paperclip/references/issue-workspaces.md:mcp-tools:72 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:72 |
+| skill:skills/paperclip/references/issue-workspaces.md:choose-files-and-repositories:23 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:23 |
+| skill:skills/paperclip/references/issue-workspaces.md:control-services:37 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:37 |
+| skill:skills/paperclip/references/issue-workspaces.md:start-all-configured-services-waits-for-configured-readiness-checks:42 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:42 |
+| skill:skills/paperclip/references/issue-workspaces.md:restart-all-configured-services:50 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:50 |
+| skill:skills/paperclip/references/issue-workspaces.md:stop-all-running-services:58 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:58 |
+| skill:skills/paperclip/references/issue-workspaces.md:read-the-url:77 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:77 |
+| skill:skills/paperclip/references/issue-workspaces.md:mcp-tools:86 | optional_agent_tool | skills/paperclip/references/issue-workspaces.md:86 |
 | skill:skills/paperclip/references/routines.md:paperclip-routines:1 | optional_agent_tool | skills/paperclip/references/routines.md:1 |
 | skill:skills/paperclip/references/routines.md:lifecycle:16 | optional_agent_tool | skills/paperclip/references/routines.md:16 |
 | skill:skills/paperclip/references/routines.md:creating-a-routine:27 | optional_agent_tool | skills/paperclip/references/routines.md:27 |
@@ -125,74 +205,6 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 | skill:skills/paperclip/references/workflows.md:setting-agent-instructions-path:50 | optional_agent_tool | skills/paperclip/references/workflows.md:50 |
 | skill:skills/paperclip/references/workflows.md:company-import-export:79 | optional_agent_tool | skills/paperclip/references/workflows.md:79 |
 | skill:skills/paperclip/references/workflows.md:self-test-playbook-app-level:106 | optional_agent_tool | skills/paperclip/references/workflows.md:106 |
-| skill:skills/paperclip/references/api-reference.md:paperclip-api-reference:1 | optional_agent_tool | skills/paperclip/references/api-reference.md:1 |
-| skill:skills/paperclip/references/api-reference.md:response-schemas:7 | optional_agent_tool | skills/paperclip/references/api-reference.md:7 |
-| skill:skills/paperclip/references/api-reference.md:agent-record-get-api-agents-me-or-get-api-agents-agentid:9 | optional_agent_tool | skills/paperclip/references/api-reference.md:9 |
-| skill:skills/paperclip/references/api-reference.md:company-portability:42 | optional_agent_tool | skills/paperclip/references/api-reference.md:42 |
-| skill:skills/paperclip/references/api-reference.md:issue-with-ancestors-get-api-issues-issueid:108 | optional_agent_tool | skills/paperclip/references/api-reference.md:108 |
-| skill:skills/paperclip/references/api-reference.md:issue-update-response-patch-api-issues-issueid:194 | optional_agent_tool | skills/paperclip/references/api-reference.md:194 |
-| skill:skills/paperclip/references/api-reference.md:blocker-diagnostics-get-api-issues-issueid-diagnostics-blockers:236 | control_plane_owned | skills/paperclip/references/api-reference.md:236 |
-| skill:skills/paperclip/references/api-reference.md:wake-diagnostics-get-api-issues-issueid-diagnostics-wakes:275 | control_plane_owned | skills/paperclip/references/api-reference.md:275 |
-| skill:skills/paperclip/references/api-reference.md:subtree-diagnostics-get-api-issues-issueid-diagnostics-subtree:319 | optional_agent_tool | skills/paperclip/references/api-reference.md:319 |
-| skill:skills/paperclip/references/api-reference.md:execution-policy-fields-on-an-issue:367 | optional_agent_tool | skills/paperclip/references/api-reference.md:367 |
-| skill:skills/paperclip/references/api-reference.md:cross-agent-review-gates:419 | always_agent_tool | skills/paperclip/references/api-reference.md:419 |
-| skill:skills/paperclip/references/api-reference.md:worked-example-ic-heartbeat:452 | optional_agent_tool | skills/paperclip/references/api-reference.md:452 |
-| skill:skills/paperclip/references/api-reference.md:1-identity-skip-if-already-in-context:457 | control_plane_owned | skills/paperclip/references/api-reference.md:457 |
-| skill:skills/paperclip/references/api-reference.md:2-check-inbox:461 | control_plane_owned | skills/paperclip/references/api-reference.md:461 |
-| skill:skills/paperclip/references/api-reference.md:3-already-have-issue-101-inprogress-highest-priority-continue-it:468 | optional_agent_tool | skills/paperclip/references/api-reference.md:468 |
-| skill:skills/paperclip/references/api-reference.md:4-do-the-actual-work-write-code-run-tests:475 | optional_agent_tool | skills/paperclip/references/api-reference.md:475 |
-| skill:skills/paperclip/references/api-reference.md:5-work-is-done-update-status-and-comment-in-one-call:477 | always_agent_tool | skills/paperclip/references/api-reference.md:477 |
-| skill:skills/paperclip/references/api-reference.md:6-still-have-time-checkout-the-next-task:481 | control_plane_owned | skills/paperclip/references/api-reference.md:481 |
-| skill:skills/paperclip/references/api-reference.md:7-made-partial-progress-not-done-yet-comment-and-exit:488 | always_agent_tool | skills/paperclip/references/api-reference.md:488 |
-| skill:skills/paperclip/references/api-reference.md:worked-example-report-a-board-user-s-mine-inbox:493 | control_plane_owned | skills/paperclip/references/api-reference.md:493 |
-| skill:skills/paperclip/references/api-reference.md:board-user-created-the-requesting-issue:498 | optional_agent_tool | skills/paperclip/references/api-reference.md:498 |
-| skill:skills/paperclip/references/api-reference.md:fetch-the-board-user-s-mine-inbox-issues:502 | control_plane_owned | skills/paperclip/references/api-reference.md:502 |
-| skill:skills/paperclip/references/api-reference.md:summarize-it-back-to-the-board-in-a-comment-or-document:516 | always_agent_tool | skills/paperclip/references/api-reference.md:516 |
-| skill:skills/paperclip/references/api-reference.md:worked-example-archive-a-resolved-inbox-item:521 | control_plane_owned | skills/paperclip/references/api-reference.md:521 |
-| skill:skills/paperclip/references/api-reference.md:the-responsible-user-s-id-is-resolved-from-the-authenticated-agent-run:526 | optional_agent_tool | skills/paperclip/references/api-reference.md:526 |
-| skill:skills/paperclip/references/api-reference.md:reverse-the-archive-if-it-was-premature-or-no-longer-desired:535 | optional_agent_tool | skills/paperclip/references/api-reference.md:535 |
-| skill:skills/paperclip/references/api-reference.md:worked-example-reviewer-approver-heartbeat:545 | always_agent_tool | skills/paperclip/references/api-reference.md:545 |
-| skill:skills/paperclip/references/api-reference.md:worked-example-manager-heartbeat:584 | optional_agent_tool | skills/paperclip/references/api-reference.md:584 |
-| skill:skills/paperclip/references/api-reference.md:1-identity-skip-if-already-in-context:587 | control_plane_owned | skills/paperclip/references/api-reference.md:587 |
-| skill:skills/paperclip/references/api-reference.md:2-check-team-status:591 | optional_agent_tool | skills/paperclip/references/api-reference.md:591 |
-| skill:skills/paperclip/references/api-reference.md:3-agent-42-is-blocked-read-comments:598 | control_plane_owned | skills/paperclip/references/api-reference.md:598 |
-| skill:skills/paperclip/references/api-reference.md:4-unblock-reassign-and-comment:602 | control_plane_owned | skills/paperclip/references/api-reference.md:602 |
-| skill:skills/paperclip/references/api-reference.md:5-check-own-assignments:606 | optional_agent_tool | skills/paperclip/references/api-reference.md:606 |
-| skill:skills/paperclip/references/api-reference.md:6-create-subtasks-and-delegate:613 | optional_agent_tool | skills/paperclip/references/api-reference.md:613 |
-| skill:skills/paperclip/references/api-reference.md:load-tests-depend-on-caching-layer-being-done-first-paperclip-will-auto-wake-agent-55-when-the-blocker-resolves:619 | control_plane_owned | skills/paperclip/references/api-reference.md:619 |
-| skill:skills/paperclip/references/api-reference.md:7-dashboard-for-health-check:624 | optional_agent_tool | skills/paperclip/references/api-reference.md:624 |
-| skill:skills/paperclip/references/api-reference.md:comments-and-mentions:630 | always_agent_tool | skills/paperclip/references/api-reference.md:630 |
-| skill:skills/paperclip/references/api-reference.md:update:637 | optional_agent_tool | skills/paperclip/references/api-reference.md:637 |
-| skill:skills/paperclip/references/api-reference.md:cross-team-work-and-delegation:675 | optional_agent_tool | skills/paperclip/references/api-reference.md:675 |
-| skill:skills/paperclip/references/api-reference.md:receiving-cross-team-work:679 | optional_agent_tool | skills/paperclip/references/api-reference.md:679 |
-| skill:skills/paperclip/references/api-reference.md:escalation:689 | optional_agent_tool | skills/paperclip/references/api-reference.md:689 |
-| skill:skills/paperclip/references/api-reference.md:company-context:699 | optional_agent_tool | skills/paperclip/references/api-reference.md:699 |
-| skill:skills/paperclip/references/api-reference.md:company-branding-ceo-board:711 | optional_agent_tool | skills/paperclip/references/api-reference.md:711 |
-| skill:skills/paperclip/references/api-reference.md:openclaw-invite-prompt-ceo:731 | optional_agent_tool | skills/paperclip/references/api-reference.md:731 |
-| skill:skills/paperclip/references/api-reference.md:setting-agent-instructions-path:750 | optional_agent_tool | skills/paperclip/references/api-reference.md:750 |
-| skill:skills/paperclip/references/api-reference.md:project-setup-create-workspace:783 | optional_agent_tool | skills/paperclip/references/api-reference.md:783 |
-| skill:skills/paperclip/references/api-reference.md:option-a-one-call-create-with-workspace:787 | optional_agent_tool | skills/paperclip/references/api-reference.md:787 |
-| skill:skills/paperclip/references/api-reference.md:option-b-two-calls-project-first-then-workspace:806 | optional_agent_tool | skills/paperclip/references/api-reference.md:806 |
-| skill:skills/paperclip/references/api-reference.md:governance-and-approvals:835 | optional_agent_tool | skills/paperclip/references/api-reference.md:835 |
-| skill:skills/paperclip/references/api-reference.md:requesting-a-hire-management-only:839 | optional_agent_tool | skills/paperclip/references/api-reference.md:839 |
-| skill:skills/paperclip/references/api-reference.md:ceo-strategy-approval:859 | optional_agent_tool | skills/paperclip/references/api-reference.md:859 |
-| skill:skills/paperclip/references/api-reference.md:issue-thread-confirmations:868 | always_agent_tool | skills/paperclip/references/api-reference.md:868 |
-| skill:skills/paperclip/references/api-reference.md:checkbox-confirmations:926 | always_agent_tool | skills/paperclip/references/api-reference.md:926 |
-| skill:skills/paperclip/references/api-reference.md:item-verdict-requests:1041 | optional_agent_tool | skills/paperclip/references/api-reference.md:1041 |
-| skill:skills/paperclip/references/api-reference.md:checking-approval-status:1151 | optional_agent_tool | skills/paperclip/references/api-reference.md:1151 |
-| skill:skills/paperclip/references/api-reference.md:approval-follow-up-requesting-agent:1157 | always_agent_tool | skills/paperclip/references/api-reference.md:1157 |
-| skill:skills/paperclip/references/api-reference.md:issue-lifecycle:1175 | always_agent_tool | skills/paperclip/references/api-reference.md:1175 |
-| skill:skills/paperclip/references/api-reference.md:error-handling:1205 | control_plane_owned | skills/paperclip/references/api-reference.md:1205 |
-| skill:skills/paperclip/references/api-reference.md:full-api-reference:1219 | optional_agent_tool | skills/paperclip/references/api-reference.md:1219 |
-| skill:skills/paperclip/references/api-reference.md:agents:1221 | optional_agent_tool | skills/paperclip/references/api-reference.md:1221 |
-| skill:skills/paperclip/references/api-reference.md:issues-tasks:1242 | optional_agent_tool | skills/paperclip/references/api-reference.md:1242 |
-| skill:skills/paperclip/references/api-reference.md:companies-projects-goals:1282 | optional_agent_tool | skills/paperclip/references/api-reference.md:1282 |
-| skill:skills/paperclip/references/api-reference.md:routines:1306 | optional_agent_tool | skills/paperclip/references/api-reference.md:1306 |
-| skill:skills/paperclip/references/api-reference.md:approvals-costs-activity-dashboard:1322 | optional_agent_tool | skills/paperclip/references/api-reference.md:1322 |
-| skill:skills/paperclip/references/api-reference.md:secrets:1344 | optional_agent_tool | skills/paperclip/references/api-reference.md:1344 |
-| skill:skills/paperclip/references/api-reference.md:agent-secret-proposals:1357 | optional_agent_tool | skills/paperclip/references/api-reference.md:1357 |
-| skill:skills/paperclip/references/api-reference.md:agent-secret-access:1457 | optional_agent_tool | skills/paperclip/references/api-reference.md:1457 |
-| skill:skills/paperclip/references/api-reference.md:common-mistakes:1497 | optional_agent_tool | skills/paperclip/references/api-reference.md:1497 |
 
 ## Legacy MCP Alias Index
 
@@ -200,47 +212,45 @@ This is a compatibility/traceability index, not a tool catalog. “Inherited dis
 
 | Legacy MCP name | Folded into normative row | Inherited disposition | Source anchor |
 | --- | --- | --- | --- |
-| paperclipMe | eval:hb-inbox-lite-01 | control_plane_owned | packages/mcp-server/src/tools.ts:315 |
-| paperclipInboxLite | eval:hb-inbox-lite-01 | control_plane_owned | packages/mcp-server/src/tools.ts:321 |
-| paperclipListAgents | eval:rf-api-mgr-heartbeat-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:327 |
-| paperclipListSkills | eval:rf-cskill-audit-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:333 |
-| paperclipGetAgent | eval:rf-api-mgr-heartbeat-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:339 |
-| paperclipListIssues | eval:se-q-filters-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:348 |
-| paperclipGetDecisionQueueOverview | eval:rf-api-mgr-heartbeat-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:363 |
-| paperclipGetIssue | eval:se-get-issue-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:379 |
-| paperclipGetHeartbeatContext | eval:hb-context-01 | control_plane_owned | packages/mcp-server/src/tools.ts:385 |
-| paperclipListComments | eval:se-get-issue-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:394 |
-| paperclipGetComment | eval:hb-wake-comment-01 | control_plane_owned | packages/mcp-server/src/tools.ts:407 |
-| paperclipListIssueApprovals | eval:ap-board-approval-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:414 |
-| paperclipListDocuments | eval:dp-base-revision-01 | always_agent_tool | packages/mcp-server/src/tools.ts:420 |
-| paperclipGetDocument | eval:dp-base-revision-01 | always_agent_tool | packages/mcp-server/src/tools.ts:426 |
-| paperclipListDocumentRevisions | eval:dp-base-revision-01 | always_agent_tool | packages/mcp-server/src/tools.ts:433 |
-| paperclipListProjects | eval:rf-wf-project-setup-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:443 |
-| paperclipGetProject | eval:rf-wf-project-setup-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:449 |
-| paperclipGetProjectOverview | eval:rf-wf-project-setup-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:458 |
-| paperclipGetIssueWorkspaceRuntime | eval:rf-iws-start-url-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:509 |
-| paperclipControlIssueWorkspaceServices | eval:rf-iws-start-url-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:515 |
-| paperclipWaitForIssueWorkspaceService | eval:rf-iws-target-restart-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:532 |
-| paperclipListGoals | eval:su-parent-goal-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:558 |
-| paperclipGetGoal | eval:su-parent-goal-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:564 |
-| paperclipListApprovals | eval:ap-approval-wake-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:570 |
-| paperclipCreateApproval | eval:ap-board-approval-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:579 |
-| paperclipGetApproval | eval:ap-approval-wake-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:588 |
-| paperclipGetApprovalIssues | eval:ap-approval-wake-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:594 |
-| paperclipListApprovalComments | eval:ap-approval-deny-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:600 |
-| paperclipCreateIssue | eval:su-parent-goal-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:606 |
-| paperclipUpdateIssue | eval:st-done-comment-01 | always_agent_tool | packages/mcp-server/src/tools.ts:613 |
-| paperclipCheckoutIssue | eval:co-body-contract-01 | control_plane_owned | packages/mcp-server/src/tools.ts:620 |
-| paperclipReleaseIssue | eval:er-release-01 | control_plane_owned | packages/mcp-server/src/tools.ts:632 |
-| paperclipAddComment | eval:cm-multiline-01 | always_agent_tool | packages/mcp-server/src/tools.ts:638 |
-| paperclipSuggestTasks | eval:ix-suggest-tasks-01 | always_agent_tool | packages/mcp-server/src/tools.ts:645 |
-| paperclipAskUserQuestions | eval:ix-questions-01 | always_agent_tool | packages/mcp-server/src/tools.ts:657 |
-| paperclipRequestConfirmation | eval:ix-confirmation-plan-01 | always_agent_tool | packages/mcp-server/src/tools.ts:669 |
-| paperclipRequestCheckboxConfirmation | eval:ix-checkbox-01 | always_agent_tool | packages/mcp-server/src/tools.ts:681 |
-| paperclipUpsertIssueDocument | eval:dp-plan-doc-01 | always_agent_tool | packages/mcp-server/src/tools.ts:693 |
-| paperclipRestoreIssueDocumentRevision | eval:dp-base-revision-01 | always_agent_tool | packages/mcp-server/src/tools.ts:704 |
-| paperclipLinkIssueApproval | eval:ap-board-approval-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:719 |
-| paperclipUnlinkIssueApproval | eval:ap-board-approval-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:728 |
-| paperclipApprovalDecision | eval:ap-approval-wake-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:738 |
-| paperclipAddApprovalComment | eval:ap-approval-deny-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:760 |
-| paperclipApiRequest | eval:rf-api-404-report-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:769 |
+| paperclipMe | eval:hb-inbox-lite-01 | control_plane_owned | packages/mcp-server/src/tools.ts:290 |
+| paperclipInboxLite | eval:hb-inbox-lite-01 | control_plane_owned | packages/mcp-server/src/tools.ts:296 |
+| paperclipListAgents | eval:rf-api-mgr-heartbeat-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:302 |
+| paperclipListSkills | eval:rf-cskill-audit-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:308 |
+| paperclipGetAgent | eval:rf-api-mgr-heartbeat-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:314 |
+| paperclipListIssues | eval:se-q-filters-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:323 |
+| paperclipGetIssue | eval:se-get-issue-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:338 |
+| paperclipGetHeartbeatContext | eval:hb-context-01 | control_plane_owned | packages/mcp-server/src/tools.ts:344 |
+| paperclipListComments | eval:se-get-issue-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:353 |
+| paperclipGetComment | eval:hb-wake-comment-01 | control_plane_owned | packages/mcp-server/src/tools.ts:366 |
+| paperclipListIssueApprovals | eval:ap-board-approval-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:373 |
+| paperclipListDocuments | eval:dp-base-revision-01 | always_agent_tool | packages/mcp-server/src/tools.ts:379 |
+| paperclipGetDocument | eval:dp-base-revision-01 | always_agent_tool | packages/mcp-server/src/tools.ts:385 |
+| paperclipListDocumentRevisions | eval:dp-base-revision-01 | always_agent_tool | packages/mcp-server/src/tools.ts:392 |
+| paperclipListProjects | eval:rf-wf-project-setup-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:402 |
+| paperclipGetProject | eval:rf-wf-project-setup-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:408 |
+| paperclipGetIssueWorkspaceRuntime | eval:rf-iws-start-url-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:417 |
+| paperclipControlIssueWorkspaceServices | eval:rf-iws-start-url-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:423 |
+| paperclipWaitForIssueWorkspaceService | eval:rf-iws-target-restart-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:440 |
+| paperclipListGoals | eval:su-parent-goal-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:466 |
+| paperclipGetGoal | eval:su-parent-goal-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:472 |
+| paperclipListApprovals | eval:ap-approval-wake-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:478 |
+| paperclipCreateApproval | eval:ap-board-approval-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:487 |
+| paperclipGetApproval | eval:ap-approval-wake-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:496 |
+| paperclipGetApprovalIssues | eval:ap-approval-wake-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:502 |
+| paperclipListApprovalComments | eval:ap-approval-deny-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:508 |
+| paperclipCreateIssue | eval:su-parent-goal-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:514 |
+| paperclipUpdateIssue | eval:st-done-comment-01 | always_agent_tool | packages/mcp-server/src/tools.ts:521 |
+| paperclipCheckoutIssue | eval:co-body-contract-01 | control_plane_owned | packages/mcp-server/src/tools.ts:528 |
+| paperclipReleaseIssue | eval:er-release-01 | control_plane_owned | packages/mcp-server/src/tools.ts:540 |
+| paperclipAddComment | eval:cm-multiline-01 | always_agent_tool | packages/mcp-server/src/tools.ts:546 |
+| paperclipSuggestTasks | eval:ix-suggest-tasks-01 | always_agent_tool | packages/mcp-server/src/tools.ts:553 |
+| paperclipAskUserQuestions | eval:ix-questions-01 | always_agent_tool | packages/mcp-server/src/tools.ts:565 |
+| paperclipRequestConfirmation | eval:ix-confirmation-plan-01 | always_agent_tool | packages/mcp-server/src/tools.ts:577 |
+| paperclipRequestCheckboxConfirmation | eval:ix-checkbox-01 | always_agent_tool | packages/mcp-server/src/tools.ts:589 |
+| paperclipUpsertIssueDocument | eval:dp-plan-doc-01 | always_agent_tool | packages/mcp-server/src/tools.ts:601 |
+| paperclipRestoreIssueDocumentRevision | eval:dp-base-revision-01 | always_agent_tool | packages/mcp-server/src/tools.ts:612 |
+| paperclipLinkIssueApproval | eval:ap-board-approval-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:627 |
+| paperclipUnlinkIssueApproval | eval:ap-board-approval-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:636 |
+| paperclipApprovalDecision | eval:ap-approval-wake-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:646 |
+| paperclipAddApprovalComment | eval:ap-approval-deny-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:668 |
+| paperclipApiRequest | eval:rf-api-404-report-01 | optional_agent_tool | packages/mcp-server/src/tools.ts:677 |
