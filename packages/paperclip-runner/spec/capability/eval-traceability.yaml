@@ -2173,13 +2173,11 @@
       "evidenceIds": [
         "eval:rf-api-mgr-heartbeat-01",
         "mcp:paperclipListAgents",
-        "mcp:paperclipGetAgent",
-        "mcp:paperclipGetDecisionQueueOverview"
+        "mcp:paperclipGetAgent"
       ],
       "legacyMcpAliases": [
         "mcp:paperclipListAgents",
-        "mcp:paperclipGetAgent",
-        "mcp:paperclipGetDecisionQueueOverview"
+        "mcp:paperclipGetAgent"
       ]
     },
     {
@@ -2867,13 +2865,11 @@
       "evidenceIds": [
         "eval:rf-wf-project-setup-01",
         "mcp:paperclipListProjects",
-        "mcp:paperclipGetProject",
-        "mcp:paperclipGetProjectOverview"
+        "mcp:paperclipGetProject"
       ],
       "legacyMcpAliases": [
         "mcp:paperclipListProjects",
-        "mcp:paperclipGetProject",
-        "mcp:paperclipGetProjectOverview"
+        "mcp:paperclipGetProject"
       ]
     },
     {
