@@ -8,6 +8,8 @@ permissions:
   contents: read
   pull-requests: read
 
+# Keep the fork-local, MIT-provenance reusable paired with this caller.
+# Portable Linux checks use Spark; x64 Chrome e2e coverage remains hosted.
 jobs:
   ci:
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@f038633bf5b04163ff985ef0542876bd9f455379
+    uses: ./.github/workflows/pr-trusted.yml
