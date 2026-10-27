@@ -1,3 +1,11 @@
+# Vendored reusable-workflow provenance:
+# - Upstream source: paperclipai/paperclip/.github/workflows/pr-trusted.yml.
+# - Upstream license: MIT; full notice is in LICENSES/PAPERCLIPAI-MIT.txt.
+# - Caller pin before this fork-local activation: f038633bf5b04163ff985ef0542876bd9f455379.
+# - Preserve baseline fork-local steps (agent merge-gate test and lockfile repair).
+# Local runner-only changes: portable PR jobs use spark-paperclip; e2e_shards
+# remain ubuntu-latest for x64 Chrome. Do not remove or rewrite the checks below
+# when syncing from upstream.
 name: Trusted PR CI
 
 # Rollout is intentionally two-step: merge this reusable workflow first, then
@@ -48,7 +56,8 @@ jobs:
         run: |
           set -u
 
-          github_runner='ubuntu-latest'
+          # The fork's non-AWS PR checks use its repo-scoped, ephemeral ARC set.
+          github_runner='spark-paperclip'
           aws_runner='runs-on/fleet=paperclip-public-pr-x64/env=public-ci'
 
           fail_closed() {
@@ -688,7 +697,8 @@ jobs:
     name: e2e shard (${{ matrix.shard_label }})
     needs: [gate, policy]
     if: ${{ needs.gate.outputs.full_ci == 'true' }}
-    runs-on: ${{ needs.gate.outputs.runner }}
+    # Keep the existing x64 Google Chrome browser-test environment.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
