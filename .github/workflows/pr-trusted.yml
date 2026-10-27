@@ -26,13 +26,42 @@ concurrency:
 jobs:
   gate:
     name: Select trusted runner
-    runs-on: ubuntu-latest
+    runs-on: spark-paperclip
     timeout-minutes: 5
     outputs:
       runner: ${{ steps.route.outputs.runner }}
       full_ci: ${{ steps.scope.outputs.full_ci }}
 
     steps:
+      - name: Bootstrap pinned ARM64 GitHub API tools
+        shell: bash
+        env:
+          GH_VERSION: 2.103.3
+          GH_ARCHIVE_SHA256: ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63
+          JQ_SHA256: 8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_ARCH}" != "ARM64" || "$(uname -m)" != "aarch64" ]]; then
+            echo "Expected the Spark ARM64 runner; got ${RUNNER_ARCH}/$(uname -m)" >&2
+            exit 1
+          fi
+          tool_dir="${RUNNER_TEMP}/paperclip-pr-gate-tools"
+          mkdir -p "${tool_dir}/bin"
+          gh_archive="${RUNNER_TEMP}/gh-${GH_VERSION}-linux-arm64.tar.gz"
+          curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 \
+            -o "${gh_archive}" \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_arm64.tar.gz"
+          echo "${GH_ARCHIVE_SHA256}  ${gh_archive}" | sha256sum --check --status
+          tar -xzf "${gh_archive}" --strip-components=1 -C "${tool_dir}" "gh_${GH_VERSION}_linux_arm64/bin/gh"
+          curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 \
+            -o "${tool_dir}/bin/jq" \
+            https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-arm64
+          echo "${JQ_SHA256}  ${tool_dir}/bin/jq" | sha256sum --check --status
+          chmod 0755 "${tool_dir}/bin/gh" "${tool_dir}/bin/jq"
+          echo "${tool_dir}/bin" >> "${GITHUB_PATH}"
+          "${tool_dir}/bin/gh" --version
+          "${tool_dir}/bin/jq" --version
+
       - name: Validate PR identity and select runner
         id: route
         shell: bash
