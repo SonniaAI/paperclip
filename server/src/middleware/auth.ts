@@ -246,6 +246,28 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     }
 
     if (!hasBearerCredentials) {
+      // A non-empty Authorization header that is not a Bearer credential can
+      // never authenticate. Letting it fall through to the anonymous actor
+      // made a broken credential indistinguishable from a missing record:
+      // company-scoped routes answer anonymous actors with a resource-level
+      // 404 ("Issue not found"), which is how a seat with a malformed
+      // Authorization header (missing Bearer scheme/space) read every issue
+      // as not-found for days (SON-6093). Fail loudly with 401 instead.
+      // local_trusted deployments keep the implicit board actor regardless of
+      // headers, and the public routine webhook path above authenticates
+      // itself before this middleware ever parses Authorization.
+      if (
+        authHeader !== undefined &&
+        authHeader.trim().length > 0 &&
+        opts.deploymentMode !== "local_trusted"
+      ) {
+        next(
+          unauthorized(
+            "Unsupported authorization scheme; use 'Authorization: Bearer <token>'",
+          ),
+        );
+        return;
+      }
       if (opts.deploymentMode === "authenticated" && opts.resolveSession) {
         const cloudTenantActor = await resolveCloudTenantActor(db, req);
         if (cloudTenantActor) {
