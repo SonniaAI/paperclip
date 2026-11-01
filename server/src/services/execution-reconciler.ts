@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, exists, gte, inArray, lt, ne, isNotNull, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -58,6 +58,17 @@ import { visibleIssueCondition } from "./issue-visibility.js";
  * self-wake path. At most one corrective action per card per tick; receipts
  * are comments on the affected card.
  *
+ * FOUNDER READABILITY (FD-2026-1101-01, folded in 1 Nov): every founder-facing
+ * emission — CEO escalations and the rule-4 founder ask — carries the direct
+ * card link plus a <=3-sentence ask (what is asked / who acts / what happens
+ * next / cost of waiting), and escalation incidents open with a short
+ * "Founder view" block above the operational detail. The blocked-card founder
+ * ask is delivered once with an activity-ledger receipt; no re-ask within the
+ * founder-ask window unless the card's blocked facts (unblock descriptor)
+ * changed. Payment boundary: the reconciler only ever DISPATCHES a funding
+ * request with a card link — it never holds, moves, or spends money; funding
+ * decisions remain founder-reserved.
+ *
  * Worker-lease recovery is intentionally NOT part of this module on the
  * current schema: the native wake-queue/run-dispatch/active-run-watchdog
  * modules own queued-run and dead-worker recovery.
@@ -110,6 +121,11 @@ export const TRANSITION_BLOCKED_DISPOSITION_LEDGER_ACTION = "issue.execution_rec
 export const TRANSITION_LANE_LIVENESS_LEDGER_ACTION = "issue.execution_reconciler_lane_liveness";
 export const TRANSITION_WAKE_DEAD_LEDGER_ACTION = "issue.execution_reconciler_wake_receipt_dead";
 export const TRANSITION_ESCALATION_LEDGER_ACTION = "issue.execution_reconciler_transition_escalated";
+export const TRANSITION_FOUNDER_ASK_LEDGER_ACTION = "issue.execution_reconciler_founder_ask";
+
+/** Public board base URL for founder-facing card links (FD-2026-1101-01);
+ *  override per deployment with EXECUTION_RECONCILER_BOARD_BASE_URL. */
+export const EXECUTION_RECONCILER_BOARD_BASE_URL_DEFAULT = "https://paperclip.tail3eb9a6.ts.net/SON";
 
 /** Origin id prefix for transition-deadline escalation incidents, scoped per
  *  card and rule (one CEO escalation per card, ever). */
@@ -235,6 +251,11 @@ export type ExecutionReconcilerSettings = {
   inReviewVerdictMs: number;
   shipDispatchDelayMs: number;
   blockedDispositionMs: number;
+  /** Founder-ask window (FD-2026-1101-01): delay between the rule-4 owner
+   *  notification and the single founder ask, and the no-re-ask window. */
+  founderAskDelayMs: number;
+  /** Public board base URL for founder-facing card links. */
+  boardBaseUrl: string;
   wakeReceiptGraceMs: number;
   fallbackReviewerAgentId: string | null;
   releaseLaneAgentId: string | null;
@@ -298,6 +319,12 @@ export function resolveExecutionReconcilerSettings(): ExecutionReconcilerSetting
       300_000,
       Number(env.EXECUTION_RECONCILER_BLOCKED_DISPOSITION_MS) || 24 * 60 * 60 * 1000,
     ),
+    founderAskDelayMs: Math.max(
+      300_000,
+      Number(env.EXECUTION_RECONCILER_FOUNDER_ASK_DELAY_MS) || 24 * 60 * 60 * 1000,
+    ),
+    boardBaseUrl:
+      env.EXECUTION_RECONCILER_BOARD_BASE_URL?.trim() || EXECUTION_RECONCILER_BOARD_BASE_URL_DEFAULT,
     wakeReceiptGraceMs: Math.max(
       60_000,
       Number(env.EXECUTION_RECONCILER_WAKE_RECEIPT_GRACE_MS) || 30 * 60 * 1000,
@@ -442,12 +469,45 @@ export type TransitionDeadlineScanResult = {
   reviewerReassigned: number;
   shipDispatchQueued: number;
   blockedDisposition: number;
+  founderAskDelivered: number;
   wakeReceiptsDead: number;
   wakeReceiptsRetried: number;
   escalatedToCeo: number;
   skippedLaneUnhealthy: number;
   skippedOneActionPerCard: number;
 };
+
+// Stable stall signature: the sorted stuck-classification counts, matching the
+// "Stuck classification:" line rendered into every notice body.
+export function founderAskCardUrl(boardBaseUrl: string, identifier: string | null, issueId: string): string {
+  const base = boardBaseUrl.replace(/\/+$/, "");
+  return `${base}/issues/${encodeURIComponent(identifier ?? issueId)}`;
+}
+
+/** <=3-sentence founder-readable ask (FD-2026-1101-01): what is asked, who
+ *  acts, what happens next, cost of waiting — direct card link on line 1. */
+export function formatFounderAsk(input: {
+  title: string;
+  url: string;
+  asked: string;
+  whoActs: string;
+}): string {
+  return [
+    `${input.title} — ${input.url}`,
+    `Asked: ${input.asked.replace(/\s+/g, " ").trim()}`,
+    `Who acts: ${input.whoActs}.`,
+    `Next: the ask stays open until the card moves; waiting costs: the work stays stalled.`,
+  ].join("\n");
+}
+
+/** Material-facts digest for the rule-4 founder-ask re-ask gate: the card's
+ *  unblock descriptor IS the blocked card's material facts. */
+function blockedFactsDigest(unblockDescriptor: unknown): string {
+  return createHash("sha256")
+    .update(JSON.stringify(unblockDescriptor ?? null))
+    .digest("hex")
+    .slice(0, 16);
+}
 
 function stallSignature(classification: Partial<Record<StallClass, number>>): string {
   const lines = Object.entries(classification)
@@ -2123,6 +2183,7 @@ export function executionReconcilerService(
     target: TransitionEscalationTarget,
     rule: string,
     body: string,
+    founderAsk?: { asked?: string; whoActs?: string },
   ): Promise<{ created: boolean }> {
     if (settings().dryRun) {
       logger.warn(
@@ -2137,9 +2198,20 @@ export function executionReconcilerService(
     const originId = `${TRANSITION_ESCALATION_ORIGIN_PREFIX}${target.id}:${rule}`;
     const boardOwnerId = await resolveCompanyBoardOwner(companyId);
     try {
+      // FD-2026-1101-01: card-targeted escalations open with the founder view
+      // (direct card link + <=3-sentence ask) above the operational detail.
+      const cardLike = Boolean(target.identifier) && !target.identifier!.startsWith("agent:");
+      const founderHeader = cardLike
+        ? `${formatFounderAsk({
+            title: target.title,
+            url: founderAskCardUrl(settings().boardBaseUrl, target.identifier, target.id),
+            asked: founderAsk?.asked ?? `decide how to unblock this card (${rule})`,
+            whoActs: founderAsk?.whoActs ?? "the CEO loop (board owner)",
+          })}\n\n---\n\n`
+        : "";
       const created = await issuesSvc.create(companyId, {
         title: `[orchestration] stalled: ${rule} on ${target.identifier ?? target.id}`.slice(0, 180),
-        description: body,
+        description: `${founderHeader}${body}`,
         status: "todo",
         priority: "critical",
         projectId: target.projectId ?? undefined,
@@ -2196,6 +2268,7 @@ export function executionReconcilerService(
       reviewerReassigned: 0,
       shipDispatchQueued: 0,
       blockedDisposition: 0,
+      founderAskDelivered: 0,
       wakeReceiptsDead: 0,
       wakeReceiptsRetried: 0,
       escalatedToCeo: 0,
@@ -2379,6 +2452,7 @@ export function executionReconcilerService(
             issue,
             "in_progress_stall",
             `Transition deadline: issue \`${issue.identifier ?? issue.id}\` stayed \`in_progress\` with no executor run activity for ${Math.round(conf.inProgressStallMs / 3_600_000)}h. The owner was re-woken ${attempts} time(s) without producing a run receipt. Bounded retries exhausted; the CEO loop owns recovery from here.`,
+            { asked: `decide recovery for the stalled in_progress card ${issue.identifier ?? issue.id}` },
           );
           if (escalated.created) {
             result.escalatedToCeo += 1;
@@ -2517,6 +2591,7 @@ export function executionReconcilerService(
           issue,
           "review_stall",
           `Transition deadline: issue \`${issue.identifier ?? issue.id}\` stayed \`in_review\` without a reviewer verdict for ${Math.round(conf.inReviewVerdictMs / 3_600_000)}h. The reviewer was nudged${fallbackReviewerId ? " and the fallback-reviewer reassignment was applied or unavailable" : ""}. The CEO loop owns review recovery from here.`,
+          { asked: `decide recovery for the stalled review on ${issue.identifier ?? issue.id}` },
         );
         if (escalated.created) result.escalatedToCeo += 1;
       }
@@ -2646,10 +2721,134 @@ export function executionReconcilerService(
           await addSystemComment(
             companyId,
             issue.id,
-            `Execution reconciler: **BLOCKED_DISPOSITION** — this card has been blocked for more than ${Math.round(conf.blockedDispositionMs / 3_600_000)}h without a recorded disposition. Owner notified once: unblock it yourself, or hand it to the CEO loop with one comment naming the exact action, the owner who can do it, and what waiting costs.`,
+            `Execution reconciler: **BLOCKED_DISPOSITION** — this card has been blocked for more than ${Math.round(conf.blockedDispositionMs / 3_600_000)}h without a recorded disposition. Owner notified once: unblock it yourself, or hand it to the CEO loop with one comment naming the exact action, the owner who can do it, and what waiting costs. If this card carries a founder gate, keep a "Founder view" block at the top (decision in <=5 lines) so founders never need the operational detail below.`,
           );
         }
         result.blockedDisposition += 1;
+      }
+
+      // Rule 4b — FOUNDER ASK (FD-2026-1101-01): a card still blocked after the
+      // owner notification AND the founder-ask window, with no recorded
+      // disposition, gets exactly ONE founder-readable ask delivered to the
+      // CEO loop: direct card link + <=3-sentence ask (what / who acts / next
+      // / cost), receipted in the activity ledger AND on the card. No re-ask
+      // within the founder-ask window unless the card's blocked facts (unblock
+      // descriptor digest) changed. Payment boundary: the reconciler may
+      // DISPATCH a funding request with a card link — never a payment.
+      const founderCutoff = new Date(now.getTime() - conf.founderAskDelayMs);
+      const founderCandidates = await db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            eq(issues.status, "blocked"),
+            isNotNull(issues.blockedOwnerNotifiedAt),
+            lt(issues.blockedOwnerNotifiedAt, founderCutoff),
+            visibleIssueCondition(),
+          ),
+        )
+        .orderBy(asc(issues.blockedTransitionAt))
+        .limit(25);
+      for (const issue of founderCandidates) {
+        if (processedCards.has(issue.id)) {
+          result.skippedOneActionPerCard += 1;
+          continue;
+        }
+        const [lastAsk] = await db
+          .select()
+          .from(activityLog)
+          .where(
+            and(
+              eq(activityLog.companyId, companyId),
+              eq(activityLog.action, TRANSITION_FOUNDER_ASK_LEDGER_ACTION),
+              eq(activityLog.entityType, "issue"),
+              eq(activityLog.entityId, issue.id),
+            ),
+          )
+          .orderBy(desc(activityLog.createdAt))
+          .limit(1);
+        const digest = blockedFactsDigest(issue.unblockDescriptor);
+        if (lastAsk) {
+          const askedAt = lastAsk.createdAt ? new Date(lastAsk.createdAt) : null;
+          const withinWindow = askedAt
+            ? now.getTime() - askedAt.getTime() < conf.founderAskDelayMs
+            : true;
+          const priorDigest = typeof lastAsk.details?.digest === "string" ? lastAsk.details.digest : null;
+          if (withinWindow || priorDigest === digest) {
+            // Single founder ask per window; re-ask only on material change.
+            continue;
+          }
+        }
+        processedCards.add(issue.id);
+        if (budget <= 0) continue;
+        budget -= 1;
+        const descriptor = (issue.unblockDescriptor ?? null) as {
+          action?: unknown;
+          owner?: { agentId?: unknown } | string;
+        } | null;
+        const askedAction =
+          typeof descriptor?.action === "string" && descriptor.action.trim()
+            ? descriptor.action.trim()
+            : "record a disposition: unblock this card, or hand it to the CEO loop with the exact action, owner, and cost of waiting";
+        const descriptorOwner =
+          typeof descriptor?.owner === "object" && descriptor?.owner && typeof descriptor.owner.agentId === "string"
+            ? descriptor.owner.agentId
+            : null;
+        const askOwner = descriptorOwner ?? issue.assigneeAgentId ?? issue.createdByAgentId ?? null;
+        const askUrl = founderAskCardUrl(conf.boardBaseUrl, issue.identifier, issue.id);
+        const founderView = formatFounderAsk({
+          title: issue.title,
+          url: askUrl,
+          asked: askedAction,
+          whoActs: askOwner ? `the card owner (${askOwner}) — or the CEO loop` : "the CEO loop (board owner)",
+        });
+        const askNumber = (await countLedgerActions(companyId, TRANSITION_FOUNDER_ASK_LEDGER_ACTION, issue.id)) + 1;
+        if (!conf.dryRun) {
+          const boardOwnerId = await resolveCompanyBoardOwner(companyId);
+          const originId = `${TRANSITION_ESCALATION_ORIGIN_PREFIX}${issue.id}:founder_ask:${askNumber}`;
+          try {
+            const created = await issuesSvc.create(companyId, {
+              title: `[orchestration] founder ask: ${issue.identifier ?? issue.id}`.slice(0, 180),
+              description: `${founderView}\n\n---\n\nFounder ask ${askNumber} for card \`${issue.identifier ?? issue.id}\`, delivered by the execution reconciler after the owner disposition receipt went unanswered. The card link above is the founder-facing surface; operational detail lives on the card itself.`,
+              status: "todo",
+              priority: "critical",
+              projectId: issue.projectId ?? undefined,
+              originKind: ORCHESTRATION_INCIDENT_ORIGIN_KIND,
+              originId,
+              assigneeAgentId: boardOwnerId ?? undefined,
+              originFingerprint: originId,
+            });
+            if (created) {
+              await logActivity(db, {
+                companyId,
+                actorType: "system",
+                actorId: "execution-reconciler",
+                action: TRANSITION_FOUNDER_ASK_LEDGER_ACTION,
+                entityType: "issue",
+                entityId: issue.id,
+                issueId: created.id,
+                details: {
+                  rule: "blocked_disposition_founder_ask",
+                  digest,
+                  askNumber,
+                  url: askUrl,
+                  incidentId: created.id,
+                },
+              });
+              await addSystemComment(
+                companyId,
+                issue.id,
+                `Execution reconciler: **FOUNDER_ASK** — the founder-readable ask was delivered once to the CEO loop (incident \`${created.id}\`): direct card link + <=3-sentence ask, receipted here. No re-ask within ${Math.round(conf.founderAskDelayMs / 3_600_000)}h unless the blocked facts change.\n\n${founderView}`,
+              );
+              result.founderAskDelivered += 1;
+            }
+          } catch (error) {
+            if (!isUniqueViolation(error)) throw error;
+          }
+        } else {
+          result.founderAskDelivered += 1;
+        }
       }
 
       // Rule 5 — WAKE RECEIPTS: every reconciler wake must produce a run id
@@ -2733,13 +2932,22 @@ export function executionReconcilerService(
         .limit(10);
       for (const wake of lostRetries) {
         const wakeIssueId = typeof wake.payload?.issueId === "string" ? wake.payload.issueId : null;
+        let wakeIdentifier: string | null = null;
+        if (wakeIssueId) {
+          const [wakeIssue] = await db
+            .select({ identifier: issues.identifier })
+            .from(issues)
+            .where(and(eq(issues.id, wakeIssueId), eq(issues.companyId, companyId)))
+            .limit(1);
+          wakeIdentifier = wakeIssue?.identifier ?? null;
+        }
         const target: TransitionEscalationTarget = wakeIssueId
           ? {
               id: wakeIssueId,
-              identifier: wakeIssueId,
+              identifier: wakeIdentifier ?? wakeIssueId,
               projectId: null,
               parentId: null,
-              title: `wake receipt lost for ${wakeIssueId}`,
+              title: `wake receipt lost for ${wakeIdentifier ?? wakeIssueId}`,
             }
           : {
               id: `agent:${wake.agentId}`,
@@ -2753,6 +2961,7 @@ export function executionReconcilerService(
           target,
           "wake_receipt_loss",
           `Transition deadline: wake \`${wake.id}\` (${wake.reason ?? "unknown"}) produced no run id within ${Math.round(conf.wakeReceiptGraceMs / 60_000)} min, and the alternate-path retry also produced no receipt. The CEO loop owns lane recovery from here.`,
+          { asked: `recover a lane whose reconciler wake produced no run receipt` },
         );
         if (escalated.created) result.escalatedToCeo += 1;
       }
@@ -2764,6 +2973,7 @@ export function executionReconcilerService(
       result.reviewerReassigned > 0 ||
       result.shipDispatchQueued > 0 ||
       result.blockedDisposition > 0 ||
+      result.founderAskDelivered > 0 ||
       result.wakeReceiptsDead > 0 ||
       result.escalatedToCeo > 0 ||
       result.lanesReAdmitted > 0

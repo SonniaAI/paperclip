@@ -23,6 +23,7 @@ import {
   resolveExecutionReconcilerSettings,
   TRANSITION_BLOCKED_DISPOSITION_LEDGER_ACTION,
   TRANSITION_ESCALATION_LEDGER_ACTION,
+  TRANSITION_FOUNDER_ASK_LEDGER_ACTION,
   TRANSITION_LANE_LIVENESS_LEDGER_ACTION,
   TRANSITION_REAWAKE_LEDGER_ACTION,
   TRANSITION_REVIEWER_REASSIGN_LEDGER_ACTION,
@@ -364,6 +365,10 @@ describeEmbeddedPostgres("execution reconciler transition deadlines", () => {
     expect(incident).toBeDefined();
     expect(incident.assigneeAgentId).toBe(seed.ceoId);
     expect(incident.originId).toBe(`transition:${issueId}:in_progress_stall`);
+    // FD-2026-1101-01: the escalation opens with the founder view — direct
+    // card link + short ask — above the operational detail.
+    expect(incident.description).toContain("https://paperclip.tail3eb9a6.ts.net/SON/issues/");
+    expect(incident.description.indexOf("Asked:")).toBeLessThan(incident.description.indexOf("Bounded retries"));
     const cardComments = await commentsFor(issueId);
     expect(cardComments.some((c) => c.body.includes("CEO_ESCALATION"))).toBe(true);
     const fourth = await reconciler.reconcileTransitionDeadlines({});
@@ -553,6 +558,102 @@ describeEmbeddedPostgres("execution reconciler transition deadlines", () => {
     const second = await reconciler.reconcileTransitionDeadlines({});
     expect(second.blockedDisposition).toBe(0);
     expect(wakes).toHaveLength(1);
+  });
+
+  it("delivers the founder ask once for a blocked card whose owner notification went unanswered", async () => {
+    const seed = await seedCompany();
+    const issueId = await insertIssue({
+      companyId: seed.companyId,
+      title: "blocked and silent",
+      status: "blocked",
+      number: 11,
+      assigneeAgentId: seed.ownerId,
+      ageHours: 40,
+      blockedTransitionAt: new Date(Date.now() - 40 * 60 * 60 * 1000),
+      blockedOwnerNotifiedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    });
+    const { reconciler, wakes } = makeReconciler(
+      seed,
+      transitionSettings({ founderAskDelayMs: 60 * 60 * 1000 }),
+    );
+    const result = await reconciler.reconcileTransitionDeadlines({});
+    expect(result.founderAskDelivered).toBe(1);
+    expect(wakes).toHaveLength(0);
+    expect(await ledgerCount(seed.companyId, TRANSITION_FOUNDER_ASK_LEDGER_ACTION, issueId)).toBe(1);
+    const [incident] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, seed.companyId), eq(issues.originKind, "orchestration_incident")));
+    expect(incident).toBeDefined();
+    expect(incident.assigneeAgentId).toBe(seed.ceoId);
+    expect(incident.originId).toBe(`transition:${issueId}:founder_ask:1`);
+    const [company] = await db.select().from(companies).where(eq(companies.id, seed.companyId));
+    expect(incident.description).toContain(
+      `https://paperclip.tail3eb9a6.ts.net/SON/issues/${company.issuePrefix}-11`,
+    );
+    expect(incident.description).toContain("Asked:");
+    expect(incident.description).toContain("Who acts:");
+    const comments = await commentsFor(issueId);
+    expect(comments.some((c) => c.body.includes("FOUNDER_ASK"))).toBe(true);
+    const second = await reconciler.reconcileTransitionDeadlines({});
+    expect(second.founderAskDelivered).toBe(0);
+    expect(await ledgerCount(seed.companyId, TRANSITION_FOUNDER_ASK_LEDGER_ACTION, issueId)).toBe(1);
+  });
+
+  it("re-asks the founder after the window only when the blocked facts materially change", async () => {
+    const seed = await seedCompany();
+    const issueId = await insertIssue({
+      companyId: seed.companyId,
+      title: "blocked, facts changed",
+      status: "blocked",
+      number: 12,
+      assigneeAgentId: seed.ownerId,
+      ageHours: 40,
+      blockedTransitionAt: new Date(Date.now() - 40 * 60 * 60 * 1000),
+      blockedOwnerNotifiedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    });
+    await db
+      .update(issues)
+      .set({ unblockDescriptor: { owner: { agentId: seed.ownerId }, action: "waiting on AWS quota increase" } })
+      .where(eq(issues.id, issueId));
+    const { reconciler } = makeReconciler(
+      seed,
+      transitionSettings({ founderAskDelayMs: 60 * 60 * 1000 }),
+    );
+    const first = await reconciler.reconcileTransitionDeadlines({});
+    expect(first.founderAskDelivered).toBe(1);
+    // Window not yet elapsed + facts unchanged: no re-ask.
+    const second = await reconciler.reconcileTransitionDeadlines({});
+    expect(second.founderAskDelivered).toBe(0);
+    // Window elapsed, facts UNCHANGED: still no re-ask.
+    await db
+      .update(activityLog)
+      .set({ createdAt: new Date(Date.now() - 3 * 60 * 60 * 1000) })
+      .where(
+        and(
+          eq(activityLog.companyId, seed.companyId),
+          eq(activityLog.action, TRANSITION_FOUNDER_ASK_LEDGER_ACTION),
+          eq(activityLog.entityId, issueId),
+        ),
+      );
+    const third = await reconciler.reconcileTransitionDeadlines({});
+    expect(third.founderAskDelivered).toBe(0);
+    // Window elapsed AND facts materially changed: exactly one re-ask.
+    await db
+      .update(issues)
+      .set({ unblockDescriptor: { owner: { agentId: seed.ceoId }, action: "needs founder funding decision" } })
+      .where(eq(issues.id, issueId));
+    const fourth = await reconciler.reconcileTransitionDeadlines({});
+    expect(fourth.founderAskDelivered).toBe(1);
+    expect(await ledgerCount(seed.companyId, TRANSITION_FOUNDER_ASK_LEDGER_ACTION, issueId)).toBe(2);
+    const incidents = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, seed.companyId), eq(issues.originKind, "orchestration_incident")));
+    expect(incidents).toHaveLength(2);
+    expect(incidents.some((i) => i.originId === `transition:${issueId}:founder_ask:2`)).toBe(true);
+    const [company] = await db.select().from(companies).where(eq(companies.id, seed.companyId));
+    expect(incidents.every((i) => i.description.includes(`https://paperclip.tail3eb9a6.ts.net/SON/issues/${company.issuePrefix}-12`))).toBe(true);
   });
 
   it("marks dead wakes and retries them via the alternate path", async () => {
