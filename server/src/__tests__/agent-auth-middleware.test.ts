@@ -206,6 +206,41 @@ describe("agent auth middleware", () => {
     expect(commentWrites).toBe(0);
   });
 
+  it.each([
+    ["a Basic scheme", "Basic dXNlcjpwYXNz"],
+    ["a scheme-less raw token", "raw-credential-value"],
+    ["a Bearer token missing its separating space", "BearerXnot-a-token"],
+  ])("rejects %s with 401 instead of an anonymous fallthrough (SON-6093)", async (_label, authorization) => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+
+    const res = await request(createApp(db, "authenticated"))
+      .get("/actor")
+      .set("Authorization", authorization);
+
+    expect(res.status).toBe(401);
+    expect(res.body.error).toContain("Unsupported authorization scheme");
+  });
+
+  it("still treats a missing Authorization header as anonymous in authenticated mode", async () => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+
+    const res = await request(createApp(db, "authenticated")).get("/actor");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ type: "none", source: "none" });
+  });
+
+  it("keeps local_trusted implicit board access when a non-bearer header is present", async () => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+
+    const res = await request(createApp(db, "local_trusted"))
+      .get("/actor")
+      .set("Authorization", "Basic dXNlcjpwYXNz");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ type: "board", userId: "local-board" });
+  });
+
   it("leaves public MCP gateway bearers for the gateway protocol to validate", async () => {
     const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
     const publicId = `gw_${"a".repeat(32)}`;
