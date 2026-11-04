@@ -325,7 +325,8 @@ jobs:
   daytona_image:
     name: Publish verified Daytona image
     needs: [authorize, target_lock, catalog]
-    runs-on: ubuntu-latest
+    # FD-2026-1026-01: image builds run on the repo's spark self-hosted ARM64 runner.
+    runs-on: spark-paperclip
     timeout-minutes: 45
     permissions:
       contents: read
@@ -366,6 +367,11 @@ jobs:
         if: needs.catalog.outputs.needs_daytona != 'true'
         run: echo "image=" >> "$GITHUB_OUTPUT"
 
+      - name: Set up QEMU (amd64 cross-build on the arm64 Spark runner)
+        if: needs.catalog.outputs.needs_daytona == 'true'
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          platforms: amd64
       - name: Set up Docker Buildx
         if: needs.catalog.outputs.needs_daytona == 'true'
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
