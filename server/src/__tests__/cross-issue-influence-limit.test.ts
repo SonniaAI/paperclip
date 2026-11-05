@@ -349,4 +349,40 @@ describe("cross-issue influence limit rollout", () => {
     expect(error.message).toContain("run is registered");
     expect(fake.inserted).toEqual([]);
   });
+
+  it("anchors a decision-controller coordination wake on its named sourceIssueId (SON-6224)", async () => {
+    const fake = counterDb(0, {
+      contextSnapshot: {
+        wakeReason: "decision_controller_ask",
+        taskKey: "ask-wake:abc123",
+        sourceIssueId: "44444444-4444-4444-8444-444444444444",
+      },
+    });
+
+    // Writes to the named source issue are same-source work: no gate, no cap.
+    await expect(
+      observeCrossIssueInfluence(fake.db as never, {
+        companyId: "22222222-2222-4222-8222-222222222222",
+        runId: "11111111-1111-4111-8111-111111111111",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        targetIssueId: "44444444-4444-4444-8444-444444444444",
+        kind: "interaction_resolution",
+        now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+      }),
+    ).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+
+    // Other targets are not covered by the named anchor: they still count
+    // against the same per-run cap as any source-anchored run.
+    await expect(
+      observeCrossIssueInfluence(fake.db as never, {
+        companyId: "22222222-2222-4222-8222-222222222222",
+        runId: "11111111-1111-4111-8111-111111111111",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        targetIssueId: "55555555-5555-4555-8555-555555555555",
+        kind: "comment",
+        now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+      }),
+    ).resolves.toMatchObject({ allowed: true, count: 1 });
+  });
 });
