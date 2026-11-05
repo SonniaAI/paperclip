@@ -6562,6 +6562,46 @@ function enrichWakeContextSnapshot(input: {
   ) {
     contextSnapshot.commentId = commentIdFromPayload;
   }
+  // SON-6224: decision-controller coordination wakes carry their instruction
+  // and references under namespaced payload keys (`message`, `sourceIssueId`,
+  // `sourceIssueIds`, `sourceInteractionId`) and deliberately omit
+  // `issueId`/`taskId` — binding the issue would route these wakes through
+  // the execution-lock and dependency gates, deferring or skipping exactly
+  // the blocked / actively-held issues they exist to escalate. Surface the
+  // keys on the snapshot without binding so the wake payload builder can
+  // render the instruction and the cross-issue gate can anchor the named
+  // source issue. Canonical keys keep precedence when a caller sends both.
+  if (!readNonEmptyString(contextSnapshot["wakeMessage"])) {
+    const wakeMessage = readNonEmptyString(payload?.["message"]);
+    if (wakeMessage) {
+      contextSnapshot.wakeMessage = wakeMessage;
+    }
+  }
+  if (!readNonEmptyString(contextSnapshot["sourceIssueId"])) {
+    const sourceIssueId = readNonEmptyString(payload?.["sourceIssueId"]);
+    if (sourceIssueId) {
+      contextSnapshot.sourceIssueId = sourceIssueId;
+    }
+  }
+  if (!readNonEmptyString(contextSnapshot["sourceInteractionId"])) {
+    const sourceInteractionId = readNonEmptyString(
+      payload?.["sourceInteractionId"],
+    );
+    if (sourceInteractionId) {
+      contextSnapshot.sourceInteractionId = sourceInteractionId;
+    }
+  }
+  if (
+    !Array.isArray(contextSnapshot["sourceIssueIds"]) &&
+    Array.isArray(payload?.["sourceIssueIds"])
+  ) {
+    const sourceIssueIds = (payload["sourceIssueIds"] as unknown[])
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .slice(0, 12);
+    if (sourceIssueIds.length > 0) {
+      contextSnapshot.sourceIssueIds = sourceIssueIds;
+    }
+  }
   if (wakeCommentIds.length > 0) {
     const latestCommentId = wakeCommentIds[wakeCommentIds.length - 1];
     contextSnapshot[WAKE_COMMENT_IDS_KEY] = wakeCommentIds;
@@ -7118,6 +7158,28 @@ export async function buildPaperclipWakePayload(input: {
         : null,
     interactionKind,
     interactionStatus,
+    wakeInstruction:
+      readNonEmptyString(input.contextSnapshot.wakeMessage) ||
+      readNonEmptyString(input.contextSnapshot.sourceIssueId) ||
+      readNonEmptyString(input.contextSnapshot.sourceInteractionId)
+        ? {
+            message: readNonEmptyString(input.contextSnapshot.wakeMessage),
+            sourceIssueId: readNonEmptyString(
+              input.contextSnapshot.sourceIssueId,
+            ),
+            sourceIssueIds: Array.isArray(
+              input.contextSnapshot.sourceIssueIds,
+            )
+              ? input.contextSnapshot.sourceIssueIds.filter(
+                  (value): value is string =>
+                    typeof value === "string" && value.length > 0,
+                )
+              : [],
+            sourceInteractionId: readNonEmptyString(
+              input.contextSnapshot.sourceInteractionId,
+            ),
+          }
+        : null,
     checkboxSelection:
       Object.keys(checkboxSelection).length > 0 ? checkboxSelection : null,
     checkedOutByHarness:
@@ -23542,6 +23604,27 @@ export function heartbeatService(
         },
       });
     };
+
+    // SON-6224: decision-controller coordination wakes are only actionable
+    // through their caller message and source refs (their design omits
+    // issue/task binding). When a coordination wake carries none of those —
+    // and no issue, comment, or task binding either — nothing on the
+    // receiving side can act on it; dispatching it only burns the agent's
+    // run on bounded no-op reads. Skip it at dispatch instead.
+    if (
+      (reason === "decision_controller_ask" ||
+        reason === "decision_controller_escalation") &&
+      !readNonEmptyString(enrichedContextSnapshot.wakeMessage) &&
+      !issueId &&
+      !readNonEmptyString(enrichedContextSnapshot.taskKey) &&
+      !wakeCommentId
+    ) {
+      await writeSkippedRequest("decision_controller.empty_payload", {
+        error:
+          "Decision-controller coordination wake carried no message, source refs, or issue binding",
+      });
+      return null;
+    }
 
     const schedulingSuppression = await getSchedulingSuppression();
     if (schedulingSuppression.suppressed) {
