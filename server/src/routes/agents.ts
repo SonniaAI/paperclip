@@ -1830,6 +1830,27 @@ export function agentRoutes(
     return agent;
   }
 
+  // SON-6222: peer-lane recovery. The company's CEO-role agent may recover
+  // peer lanes (clear a latched error, retry a wakeup) without board access;
+  // every such action stays audit-logged with the agent actor attributed.
+  async function isCeoAgentForCompany(req: Request, companyId: string): Promise<boolean> {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+    const actorAgent = await svc.getById(req.actor.agentId);
+    return Boolean(
+      actorAgent && actorAgent.companyId === companyId && actorAgent.role === "ceo",
+    );
+  }
+
+  async function assertBoardOrCeoAgentForCompany(req: Request, companyId: string) {
+    if (req.actor.type === "agent") {
+      if (!(await isCeoAgentForCompany(req, companyId))) {
+        throw forbidden("Board access required");
+      }
+      return;
+    }
+    assertBoard(req);
+  }
+
   async function actorCanReadConfigurationsForCompany(req: Request, companyId: string) {
     // Mirrors assertCanReadConfigurations but returns a boolean instead of
     // throwing. Board actors only need company access; agent actors must pass
@@ -4854,11 +4875,18 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/clear-error", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
     const existing = await getAccessibleAgent(req, res, id);
     if (!existing) {
       return;
+    }
+    // SON-6222: board OR the company's CEO-role agent may clear a latched
+    // lane error; the action stays audit-logged below with the real actor.
+    if (req.actor.type === "agent") {
+      if (!(await isCeoAgentForCompany(req, existing.companyId))) {
+        res.status(403).json({ error: "Board access required" });
+        return;
+      }
     }
     if (existing.orgChainHealth?.status === "invalid_org_chain") {
       res.status(409).json({
@@ -4873,13 +4901,18 @@ export function agentRoutes(
       return;
     }
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
       action: "agent.error_cleared",
       entityType: "agent",
       entityId: agent.id,
+      details: actor.actorType === "agent"
+        ? { clearedBy: "ceo_agent", clearedByAgentId: actor.agentId }
+        : { clearedBy: "board" },
     });
 
     res.json(redactAgentRowForResponse(agent));
@@ -5131,7 +5164,10 @@ export function agentRoutes(
     if (!agent) return;
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
+      if (
+        req.actor.agentId !== id &&
+        !(await isCeoAgentForCompany(req, agent.companyId))
+      ) {
         res.status(403).json({ error: "Agent can only invoke itself" });
         return;
       }
@@ -5231,7 +5267,10 @@ export function agentRoutes(
     if (!agent) return;
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
+      if (
+        req.actor.agentId !== id &&
+        !(await isCeoAgentForCompany(req, agent.companyId))
+      ) {
         res.status(403).json({ error: "Agent can only invoke itself" });
         return;
       }

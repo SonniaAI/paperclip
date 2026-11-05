@@ -13,6 +13,7 @@ import {
   gte,
   inArray,
   isNull,
+  like,
   lt,
   lte,
   ne,
@@ -248,6 +249,15 @@ import {
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
 import { issueService } from "./issues.js";
+import { agentService } from "./agents.js";
+import {
+  reconcileStaleErroredAgents as runStaleAgentErrorRecovery,
+} from "./stale-agent-error-recovery.js";
+import {
+  surfaceSkippedWake,
+  SKIPPED_WAKE_COMMENT_PREFIX,
+  type SkippedWakeSurfaceDeps,
+} from "./skipped-wake-surface.js";
 import { projectService } from "./projects.js";
 import {
   authorizationService,
@@ -8298,6 +8308,7 @@ export function heartbeatService(
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
   const issuesSvc = issueService(db);
+  const agentsSvc = agentService(db);
   const treeControlSvc = issueTreeControlService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
   const environmentsSvc = environmentService(db);
@@ -15078,6 +15089,78 @@ export function heartbeatService(
     return null;
   }
 
+  // SON-6222: skipped wakes used to die silently — the wake diagnostics
+  // endpoint recorded them, but the affected issue never saw a trace. Post a
+  // deduplicated comment on the affected issue so silent wake loss is visible
+  // where the assigned work lives, and call out errored addressee lanes.
+  function skippedWakeSurfaceDeps(): SkippedWakeSurfaceDeps {
+    return {
+      issueExists: async (surfaceCompanyId, surfaceIssueId) => {
+        const rows = await db
+          .select({ id: issues.id })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.id, surfaceIssueId),
+              eq(issues.companyId, surfaceCompanyId),
+            ),
+          )
+          .limit(1);
+        return rows.length > 0;
+      },
+      hasRecentSkippedWakeComment: async (surfaceIssueId, since) => {
+        const rows = await db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.issueId, surfaceIssueId),
+              like(issueComments.body, `${SKIPPED_WAKE_COMMENT_PREFIX}%`),
+              gte(issueComments.createdAt, since),
+            ),
+          )
+          .limit(1);
+        return rows.length > 0;
+      },
+      addComment: (commentIssueId, body, actor) =>
+        issuesSvc.addComment(commentIssueId, body, actor),
+    };
+  }
+
+  async function surfaceSkippedWakeForRun(
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "id" | "companyId" | "agentId" | "contextSnapshot" | "invocationSource"
+    >,
+    skipCode: string,
+    reason: string,
+  ): Promise<void> {
+    try {
+      const surfacedIssueId = issueIdFromRunContext(run.contextSnapshot);
+      if (!surfacedIssueId) return;
+      const wakeAgent = await getAgent(run.agentId);
+      await surfaceSkippedWake(
+        skippedWakeSurfaceDeps(),
+        {
+          companyId: run.companyId,
+          issueId: surfacedIssueId,
+          agentId: run.agentId,
+          agentName: wakeAgent?.name ?? null,
+          agentStatus: wakeAgent?.status ?? null,
+          skipCode,
+          reason,
+          wakeSource: run.invocationSource ?? null,
+          runId: run.id,
+        },
+      );
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id, skipCode },
+        "failed to surface skipped wake on the affected issue",
+      );
+    }
+  }
+
   async function cancelQueuedRunForHeartbeatDailyCap(
     run: typeof heartbeatRuns.$inferSelect,
     dailyCapBlock: NonNullable<
@@ -15124,6 +15207,12 @@ export function heartbeatService(
     await releaseIssueExecutionAndPromote(cancelled, {
       suppressImmediateRecovery: true,
     });
+
+    await surfaceSkippedWakeForRun(
+      cancelled,
+      "heartbeat_daily_cap_gate",
+      "Per-agent heartbeat daily cap reached before adapter invocation",
+    );
 
     return cancelled;
   }
@@ -15847,6 +15936,12 @@ export function heartbeatService(
       },
     });
 
+    await surfaceSkippedWakeForRun(
+      cancelled,
+      "issue_dependencies_blocked",
+      "Issue dependencies are still blocked; the assignee will be woken when blockers resolve",
+    );
+
     return cancelled;
   }
 
@@ -16142,6 +16237,12 @@ export function heartbeatService(
       message: staleness.reason,
       payload: staleness.details,
     });
+
+    await surfaceSkippedWakeForRun(
+      cancelled,
+      staleness.errorCode,
+      staleness.reason.replace(/^Cancelled because /, ""),
+    );
 
     return cancelled;
   }
@@ -17314,6 +17415,64 @@ export function heartbeatService(
 
   async function sweepStaleIssueLocks() {
     return recovery.sweepStaleIssueLocks();
+  }
+
+  // SON-6222: supervised recovery for latched agent lane errors. An agent
+  // whose run timed out stays status="error" until a board-only clear; lanes
+  // with periodic heartbeats disabled never self-heal. This sweep clears the
+  // latch once it is provably stale (bounded interval, no in-flight runs) and
+  // enqueues one idempotent recovery wake. Env:
+  // PAPERCLIP_STALE_AGENT_ERROR_CLEAR_MINUTES (0 disables).
+  async function reconcileStaleErroredAgents() {
+    return runStaleAgentErrorRecovery({
+      listErroredAgents: async () =>
+        db
+          .select({
+            id: agents.id,
+            companyId: agents.companyId,
+            name: agents.name,
+            status: agents.status,
+            errorReason: agents.errorReason,
+            lastHeartbeatAt: agents.lastHeartbeatAt,
+          })
+          .from(agents)
+          .where(eq(agents.status, "error")),
+      hasActiveRuns: async (agentId) => {
+        const rows = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.agentId, agentId),
+              inArray(heartbeatRuns.status, [
+                "queued",
+                "running",
+                "scheduled_retry",
+              ]),
+            ),
+          )
+          .limit(1);
+        return rows.length > 0;
+      },
+      clearError: (agentId) => agentsSvc.clearError(agentId),
+      enqueueWakeup: (agentId, opts) =>
+        enqueueWakeup(agentId, {
+          source: opts.source,
+          triggerDetail: opts.triggerDetail,
+          reason: opts.reason ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          requestedByActorType: "system",
+          requestedByActorId: opts.requestedByActorId ?? null,
+        }),
+      logActivity: (input) => logActivity(db, input),
+      publishLiveEvent: (event) => {
+        publishLiveEvent({
+          companyId: event.companyId,
+          type: "agent.status",
+          payload: event.payload,
+        });
+      },
+    });
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -23894,7 +24053,7 @@ export function heartbeatService(
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
           });
-          return { kind: "skipped" as const };
+          return { kind: "skipped" as const, skipSurface: null };
         }
 
         const issueStateGuard = opts.issueStateGuard;
@@ -23927,7 +24086,16 @@ export function heartbeatService(
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
           });
-          return { kind: "skipped" as const };
+          return {
+            kind: "skipped" as const,
+            skipSurface: {
+              issueId: issue.id,
+              skipCode: "issue_state_guard_mismatch",
+              reason:
+                "Issue status or assignee changed before the wake could be queued",
+              wakeSource: source,
+            },
+          };
         }
 
         if (
@@ -23954,7 +24122,16 @@ export function heartbeatService(
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
           });
-          return { kind: "skipped" as const };
+          return {
+            kind: "skipped" as const,
+            skipSurface: {
+              issueId: issue.id,
+              skipCode: "heartbeat.worktree_execution_cutoff",
+              reason:
+                "The issue predates the worktree execution cutoff, so the wake was not queued",
+              wakeSource: source,
+            },
+          };
         }
 
         const cancelStaleScheduledRetry = async (
@@ -24272,7 +24449,16 @@ export function heartbeatService(
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
           });
-          return { kind: "skipped" as const };
+          return {
+            kind: "skipped" as const,
+            skipSurface: {
+              issueId,
+              skipCode: "issue_dependencies_blocked",
+              reason:
+                "Issue dependencies are still blocked; the assignee will be woken when blockers resolve",
+              wakeSource: source,
+            },
+          };
         }
 
         if (
@@ -24409,7 +24595,7 @@ export function heartbeatService(
                 hasResolvablePriorSessionWorkspace,
               },
             });
-            return { kind: "skipped" as const };
+            return { kind: "skipped" as const, skipSurface: null };
           }
         }
 
@@ -24677,7 +24863,7 @@ export function heartbeatService(
                 idempotencyKey: opts.idempotencyKey ?? null,
                 finishedAt: throttleNow,
               });
-              return { kind: "skipped" as const };
+              return { kind: "skipped" as const, skipSurface: null };
             }
           }
         }
@@ -24720,7 +24906,7 @@ export function heartbeatService(
               })
               .where(eq(agents.id, agentId));
           }
-          return { kind: "skipped" as const };
+          return { kind: "skipped" as const, skipSurface: null };
         }
 
         const wakeupRequest = await tx
@@ -24772,8 +24958,35 @@ export function heartbeatService(
         return { kind: "queued" as const, run: newRun };
       });
 
-      if (outcome.kind === "deferred" || outcome.kind === "skipped")
+      if (outcome.kind === "deferred") return null;
+      if (outcome.kind === "skipped") {
+        // SON-6222: make the skip visible on the affected issue instead of
+        // dying silently in the wake diagnostics.
+        if (outcome.skipSurface) {
+          try {
+            await surfaceSkippedWake(
+              skippedWakeSurfaceDeps(),
+              {
+                companyId: agent.companyId,
+                issueId: outcome.skipSurface.issueId,
+                agentId: agent.id,
+                agentName: agent.name,
+                agentStatus: agent.status,
+                skipCode: outcome.skipSurface.skipCode,
+                reason: outcome.skipSurface.reason,
+                wakeSource: outcome.skipSurface.wakeSource,
+                runId: null,
+              },
+            );
+          } catch (err) {
+            logger.warn(
+              { err, agentId: agent.id, skipCode: outcome.skipSurface.skipCode },
+              "failed to surface skipped wake on the affected issue",
+            );
+          }
+        }
         return null;
+      }
       if (outcome.kind === "coalesced") {
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;
@@ -26009,6 +26222,8 @@ export function heartbeatService(
     releaseEnvironmentLeasesForRun,
 
     sweepStaleIssueLocks,
+
+    reconcileStaleErroredAgents,
 
     reconcileResolvedDependencyWakes,
 
