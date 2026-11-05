@@ -236,6 +236,7 @@ import {
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
+  stripMonitorFromExecutionPolicy,
 } from "../services/issue-execution-policy.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -10274,6 +10275,19 @@ export function issueRoutes(
       );
     }
     const previousExecutionPolicy = hydrateStoredIssueExecutionPolicy(existing.executionPolicy ?? null);
+    if (
+      updateFields.executionPolicy === null &&
+      req.body.executionPolicy !== null &&
+      typeof req.body.executionPolicy === "object" &&
+      (req.body.executionPolicy as Record<string, unknown>).monitor === null &&
+      previousExecutionPolicy?.monitor
+    ) {
+      // An explicit `monitor: null` clear must remove only the monitor
+      // sub-object. Normalizing such a payload otherwise collapses to a null
+      // policy, destroying mode/stages/commentRequired (and review presets)
+      // that the caller never asked to change.
+      updateFields.executionPolicy = stripMonitorFromExecutionPolicy(previousExecutionPolicy);
+    }
     const nextExecutionPolicy =
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
