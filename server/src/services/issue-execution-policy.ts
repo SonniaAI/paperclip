@@ -323,6 +323,27 @@ function exhaustedMonitorClearReason(input: {
   return null;
 }
 
+/**
+ * A monitor arm starts a new cycle (attempt counter reset to 0) when there is
+ * no live previous monitor, when the previous monitor already reached a
+ * terminal state (triggered/cleared — including max_attempts_exhausted), or
+ * when the new arm schedules its first check beyond the previous cycle's
+ * timeout horizon. Re-arming inside a still-scheduled cycle keeps the
+ * accumulated attempt count so the per-cycle wake bound cannot be dodged by
+ * re-arming mid-cycle.
+ */
+function isFreshMonitorArm(
+  previous: IssueExecutionMonitorState | null,
+  monitor: IssueExecutionMonitorPolicy,
+): boolean {
+  if (!previous) return true;
+  if (previous.status !== "scheduled") return true;
+  const previousTimeoutAt = parseMonitorDate(previous.timeoutAt ?? null);
+  if (!previousTimeoutAt) return false;
+  const nextCheckAt = parseMonitorDate(monitor.nextCheckAt);
+  return Boolean(nextCheckAt && nextCheckAt.getTime() >= previousTimeoutAt.getTime());
+}
+
 function nextAssigneeIds(input: {
   issue: IssueLike;
   requestedAssigneePatch: RequestedAssigneePatch;
@@ -346,11 +367,14 @@ function nextAssigneeIds(input: {
 export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | null): IssueExecutionPolicy | null {
   if (!policy) return null;
   if (!policy.monitor) return policy;
-  if (policy.stages.length === 0) return null;
+  if (policy.stages.length === 0 && !policy.reviewPreset && !policy.authorizationPolicy) return null;
   return {
     mode: policy.mode,
     commentRequired: policy.commentRequired,
     stages: policy.stages,
+    ...(policy.reviewPreset ? { reviewPreset: policy.reviewPreset } : {}),
+    ...(policy.authorizationPolicy ? { authorizationPolicy: policy.authorizationPolicy } : {}),
+    ...(policy.maxReviewRounds != null ? { maxReviewRounds: policy.maxReviewRounds } : {}),
   };
 }
 
@@ -1277,9 +1301,15 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
         clearedAt: new Date(),
       });
     } else {
+      // Only an explicit monitor arm (the caller PATCHed executionPolicy.monitor)
+      // starts a new cycle. Incidental transitions that re-apply the stored
+      // policy keep the accumulated attempt count of the live cycle.
+      const freshArm =
+        Boolean(input.monitorExplicitlyUpdated) &&
+        isFreshMonitorArm(currentMonitorState, input.policy.monitor);
       const exhaustedReason = exhaustedMonitorClearReason({
         monitor: input.policy.monitor,
-        attemptCount: currentMonitorState?.attemptCount ?? 0,
+        attemptCount: freshArm ? 0 : (currentMonitorState?.attemptCount ?? 0),
         now: new Date(),
       });
       if (exhaustedReason) {
@@ -1299,7 +1329,17 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
         patch.monitorWakeRequestedAt = null;
         patch.monitorNotes = input.policy.monitor.notes ?? null;
         patch.monitorScheduledBy = input.policy.monitor.scheduledBy;
-        targetMonitorState = buildScheduledMonitorState(currentMonitorState, input.policy.monitor);
+        if (freshArm) {
+          // New monitor cycle: reset the persisted wake-attempt counter so
+          // daily re-arms with the same maxAttempts work indefinitely
+          // instead of ratcheting into permanent exhaustion.
+          patch.monitorAttemptCount = 0;
+          patch.monitorLastTriggeredAt = null;
+        }
+        targetMonitorState = buildScheduledMonitorState(
+          freshArm ? null : currentMonitorState,
+          input.policy.monitor,
+        );
       }
     }
   } else if (previousPolicy?.monitor) {
