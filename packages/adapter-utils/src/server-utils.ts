@@ -712,10 +712,18 @@ type PaperclipWakeRecovery = {
   routingFallbackReason: string | null;
 };
 
+type PaperclipWakeInstruction = {
+  message: string | null;
+  sourceIssueId: string | null;
+  sourceIssueIds: string[];
+  sourceInteractionId: string | null;
+};
+
 type PaperclipWakePayload = {
   reason: string | null;
   recovery: PaperclipWakeRecovery | null;
   issue: PaperclipWakeIssue | null;
+  wakeInstruction: PaperclipWakeInstruction | null;
   checkedOutByHarness: boolean;
   // Experimental: write user-interaction content in ASD-STE100 Simplified
   // Technical English with brief decision context.
@@ -768,6 +776,33 @@ function normalizePaperclipWakeRecovery(value: unknown): PaperclipWakeRecovery |
     maxAttempts: typeof recovery.maxAttempts === "number" ? recovery.maxAttempts : null,
     nextAction: asString(recovery.nextAction, "").trim() || null,
     routingFallbackReason: asString(recovery.routingFallbackReason, "").trim() || null,
+  };
+}
+
+const MAX_WAKE_INSTRUCTION_CHARS = 4_000;
+
+function normalizePaperclipWakeInstruction(value: unknown): PaperclipWakeInstruction | null {
+  const instruction = parseObject(value);
+  const message = asString(instruction.message, "").trim();
+  const sourceIssueId = asString(instruction.sourceIssueId, "").trim() || null;
+  const sourceInteractionId = asString(instruction.sourceInteractionId, "").trim() || null;
+  const sourceIssueIds = Array.isArray(instruction.sourceIssueIds)
+    ? instruction.sourceIssueIds
+        .map((entry) => asString(entry, "").trim())
+        .filter((entry) => entry.length > 0)
+        .slice(0, 12)
+    : [];
+  if (!message && !sourceIssueId && !sourceInteractionId && sourceIssueIds.length === 0) {
+    return null;
+  }
+  const truncated = message.length > MAX_WAKE_INSTRUCTION_CHARS;
+  return {
+    message: message
+      ? `${message.slice(0, MAX_WAKE_INSTRUCTION_CHARS)}${truncated ? "… [wake instruction truncated]" : ""}`
+      : null,
+    sourceIssueId,
+    sourceIssueIds,
+    sourceInteractionId,
   };
 }
 
@@ -1414,7 +1449,8 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
     : null;
   const executionWorkspace = normalizePaperclipWakeExecutionWorkspace(payload.executionWorkspace);
   const agentMessage = normalizePaperclipWakeAgentMessage(payload.agentMessage);
-  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !documentReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !questionResponse && !executionWorkspace && !agentMessage && !recovery && !normalizePaperclipWakeIssue(payload.issue)) {
+  const wakeInstruction = normalizePaperclipWakeInstruction(payload.wakeInstruction);
+  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !documentReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !questionResponse && !executionWorkspace && !agentMessage && !recovery && !wakeInstruction && !normalizePaperclipWakeIssue(payload.issue)) {
     return null;
   }
 
@@ -1422,6 +1458,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
     reason: asString(payload.reason, "").trim() || null,
     recovery,
     issue: normalizePaperclipWakeIssue(payload.issue),
+    wakeInstruction,
     checkedOutByHarness: asBoolean(payload.checkedOutByHarness, false),
     simplifiedEnglishInteractions: asBoolean(payload.simplifiedEnglishInteractions, false),
     dependencyBlockedInteraction: asBoolean(payload.dependencyBlockedInteraction, false),
@@ -1633,6 +1670,23 @@ export function renderPaperclipWakePrompt(
       : []),
     ...(normalized.reason === "issue_recovery_action_restored"
       ? ["- instruction: Do not narrate the recovery in your next comment — at most one short sentence; lead with the work."]
+      : []),
+    ...(normalized.wakeInstruction
+      ? [
+          "",
+          "## Wake instruction",
+          "",
+          normalized.wakeInstruction.message ?? "(no instruction text supplied)",
+          ...(normalized.wakeInstruction.sourceIssueId
+            ? [`- source issue: ${normalized.wakeInstruction.sourceIssueId}`]
+            : []),
+          ...(normalized.wakeInstruction.sourceIssueIds.length > 0
+            ? [`- related source issues: ${normalized.wakeInstruction.sourceIssueIds.join(", ")}`]
+            : []),
+          ...(normalized.wakeInstruction.sourceInteractionId
+            ? [`- source interaction: ${normalized.wakeInstruction.sourceInteractionId}`]
+            : []),
+        ]
       : []),
   ];
   const lines = resumedSession
