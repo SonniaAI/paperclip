@@ -5151,7 +5151,135 @@ function allowsIssueInteractionWake(
     !ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has(wakeReason)
   )
     return false;
+  // Interaction-delivery wakes (typed asks, confirmations, decision requests)
+  // carry an interactionId instead of a commentId. They are addressed to a
+  // specific addressee, not to the issue assignee, so they must reach that
+  // addressee even when the assignee changed or issue blockers are unresolved.
+  // Skipping them strands founder/participant decisions (SON-6247).
+  if (readNonEmptyString(contextSnapshot?.interactionId)) return true;
   return Boolean(deriveCommentId(contextSnapshot, null));
+}
+
+const SKIP_STORM_COALESCE_WINDOW_MS = 15 * 60 * 1000;
+const SKIP_STORM_ALERT_THRESHOLDS = [10, 50, 200];
+
+/**
+ * Queue-time skips are recorded with a storm breaker: repeated identical
+ * skips (same company, agent, issue and reason) inside the coalesce window
+ * collapse into the latest skipped row (coalesced_count) instead of inserting
+ * a new row per attempt. Crossing an alert threshold writes a single
+ * activity_log entry so persistent skip loops surface to humans instead of
+ * silently vanishing (SON-6247).
+ */
+async function recordSkippedWakeupWithStormBreaker(
+  dbOrTx: Pick<Db, "select" | "insert" | "update">,
+  input: {
+    companyId: string;
+    agentId: string;
+    source: string;
+    triggerDetail: string | null;
+    reason: string;
+    payload: Record<string, unknown> | null;
+    requestedByActorType: "user" | "agent" | "system" | null;
+    requestedByActorId: string | null;
+    idempotencyKey: string | null;
+    issueId: string | null;
+  },
+) {
+  const now = new Date();
+  const windowStart = new Date(now.getTime() - SKIP_STORM_COALESCE_WINDOW_MS);
+  const latest = await dbOrTx
+    .select({
+      id: agentWakeupRequests.id,
+      coalescedCount: agentWakeupRequests.coalescedCount,
+      payload: agentWakeupRequests.payload,
+    })
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        eq(agentWakeupRequests.status, "skipped"),
+        eq(agentWakeupRequests.reason, input.reason),
+        input.issueId
+          ? sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`
+          : sql`${agentWakeupRequests.payload} ->> 'issueId' is null`,
+        gt(agentWakeupRequests.updatedAt, windowStart),
+      ),
+    )
+    .orderBy(desc(agentWakeupRequests.updatedAt))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  if (latest) {
+    const previousCount = latest.coalescedCount ?? 1;
+    const nextCount = previousCount + 1;
+    const latestPayload = parseObject(latest.payload);
+    const storm = parseObject(latestPayload.skipStorm);
+    const alertedThresholds = Array.isArray(storm.alertedThresholds)
+      ? storm.alertedThresholds.filter(
+          (value): value is number => typeof value === "number",
+        )
+      : [];
+    const hitThreshold = SKIP_STORM_ALERT_THRESHOLDS.find(
+      (threshold) =>
+        nextCount >= threshold && !alertedThresholds.includes(threshold),
+    );
+    await dbOrTx
+      .update(agentWakeupRequests)
+      .set({
+        coalescedCount: nextCount,
+        finishedAt: now,
+        updatedAt: now,
+        ...(hitThreshold != null
+          ? {
+              payload: {
+                ...latestPayload,
+                skipStorm: {
+                  ...storm,
+                  alertedThresholds: [...alertedThresholds, hitThreshold],
+                  lastAlertedAt: now.toISOString(),
+                },
+              },
+            }
+          : {}),
+      })
+      .where(eq(agentWakeupRequests.id, latest.id));
+    if (hitThreshold != null) {
+      await dbOrTx.insert(activityLog).values({
+        companyId: input.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        action: "wakeup.skip_storm",
+        entityType: input.issueId ? "issue" : "agent",
+        entityId: input.issueId ?? input.agentId,
+        agentId: input.agentId,
+        details: {
+          reason: input.reason,
+          coalescedCount: nextCount,
+          threshold: hitThreshold,
+          windowMinutes: SKIP_STORM_COALESCE_WINDOW_MS / 60000,
+          note: "Repeated identical wake skips coalesced; investigate the underlying skip cause.",
+        },
+      });
+    }
+    return;
+  }
+
+  await dbOrTx.insert(agentWakeupRequests).values({
+    companyId: input.companyId,
+    agentId: input.agentId,
+    source: input.source,
+    triggerDetail: input.triggerDetail,
+    reason: input.reason,
+    payload: input.payload,
+    status: "skipped",
+    requestedByActorType: input.requestedByActorType,
+    requestedByActorId: input.requestedByActorId,
+    idempotencyKey: input.idempotencyKey,
+    coalescedCount: 1,
+    finishedAt: now,
+  });
 }
 
 async function listUnresolvedBlockerSummaries(
@@ -16119,6 +16247,65 @@ export function heartbeatService(
       error: staleness.reason,
     });
 
+    // Honor the cancel promise for reassignment races: the new owner is
+    // actually woken instead of the message vanishing with the stale run.
+    // Bounded to one handoff hop (payload depth marker) so a chain of
+    // reassignments cannot loop forever. (SON-6247)
+    if (staleness.errorCode === "issue_assignee_changed") {
+      const handoffContext = parseObject(run.contextSnapshot);
+      const handoff = parseObject(handoffContext.assigneeHandoff);
+      const handoffDepth =
+        typeof handoff.depth === "number" ? handoff.depth : 0;
+      const currentAssigneeAgentId = readNonEmptyString(
+        staleness.details.currentAssigneeAgentId,
+      );
+      if (
+        currentAssigneeAgentId &&
+        currentAssigneeAgentId !== run.agentId &&
+        handoffDepth < 1
+      ) {
+        try {
+          await enqueueWakeup(currentAssigneeAgentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "issue_assigned",
+            payload: {
+              issueId,
+              mutation: "assignee_handoff",
+              assigneeHandoff: {
+                fromAgentId: run.agentId,
+                cancelledWakeupId: run.wakeupRequestId ?? null,
+                depth: handoffDepth + 1,
+              },
+            },
+            requestedByActorType: "system",
+            requestedByActorId: "system:assignee-handoff",
+            contextSnapshot: {
+              issueId,
+              taskId: issueId,
+              source: "assignee_handoff",
+              wakeReason: "issue_assigned",
+              assigneeHandoff: {
+                fromAgentId: run.agentId,
+                cancelledWakeupId: run.wakeupRequestId ?? null,
+                depth: handoffDepth + 1,
+              },
+            },
+          });
+        } catch (err) {
+          logger.warn(
+            {
+              err,
+              issueId,
+              runId: run.id,
+              handoffAgentId: currentAssigneeAgentId,
+            },
+            "failed to wake new assignee after stale-run assignee handoff",
+          );
+        }
+      }
+    }
+
     await db
       .update(issues)
       .set({
@@ -23903,7 +24090,7 @@ export function heartbeatService(
           (!issueStateGuard.statuses.includes(issue.status) ||
             issue.assigneeAgentId !== issueStateGuard.assigneeAgentId)
         ) {
-          await tx.insert(agentWakeupRequests).values({
+          await recordSkippedWakeupWithStormBreaker(tx, {
             companyId: agent.companyId,
             agentId,
             source,
@@ -23921,11 +24108,10 @@ export function heartbeatService(
                 actualAssigneeAgentId: issue.assigneeAgentId,
               },
             },
-            status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
-            finishedAt: new Date(),
+            issueId: issue.id,
           });
           return { kind: "skipped" as const };
         }
@@ -24254,7 +24440,7 @@ export function heartbeatService(
           !blockedInteractionWake &&
           !blockedExternalMonitorWake
         ) {
-          await tx.insert(agentWakeupRequests).values({
+          await recordSkippedWakeupWithStormBreaker(tx, {
             companyId: agent.companyId,
             agentId,
             source,
@@ -24266,11 +24452,10 @@ export function heartbeatService(
               unresolvedBlockerIssueIds:
                 dependencyReadiness.unresolvedBlockerIssueIds,
             },
-            status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,
             requestedByActorId: opts.requestedByActorId ?? null,
             idempotencyKey: opts.idempotencyKey ?? null,
-            finishedAt: new Date(),
+            issueId,
           });
           return { kind: "skipped" as const };
         }
