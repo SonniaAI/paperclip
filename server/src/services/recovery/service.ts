@@ -1228,12 +1228,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
   }) {
+    let predecessorExecutionStage: Record<string, unknown> | null = null;
+    if (input.retryOfRunId) {
+      const [predecessor] = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, input.retryOfRunId))
+        .limit(1);
+      // SON-6211: recovery runs must inherit the predecessor's execution-stage
+      // contract, or a pending review/approval stage strands permanently after
+      // participant-recovery (the stage wake that created the predecessor
+      // carried executionStage; a fresh recovery context would drop it).
+      const predecessorStage = parseObject(
+        parseObject(predecessor?.contextSnapshot).executionStage,
+      );
+      if (Object.keys(predecessorStage).length > 0) {
+        predecessorExecutionStage = predecessorStage;
+      }
+    }
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
       reason: input.reason,
       payload: withRecoveryContext({
         issueId: input.issueId,
+        ...(predecessorExecutionStage
+          ? { executionStage: predecessorExecutionStage }
+          : {}),
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
         ...(input.extraContext ?? {}),
       }, "normal_model"),
@@ -1245,6 +1266,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         wakeReason: input.reason,
         retryReason: input.retryReason,
         source: input.source,
+        ...(predecessorExecutionStage
+          ? { executionStage: predecessorExecutionStage }
+          : {}),
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
         ...(input.extraContext ?? {}),
       }, "normal_model"),
