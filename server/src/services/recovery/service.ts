@@ -44,6 +44,10 @@ import {
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";
 import {
+  buildExecutionStageWakeContext,
+  executionStageWakeRoleForStageType,
+} from "../execution-stage-wake.js";
+import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
@@ -4123,6 +4127,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           extraContext: {
             currentStageId: pendingExecutionState.currentStageId ?? null,
             currentStageType: pendingExecutionState.currentStageType ?? null,
+            // SON-6211: bind the recovery wake to the pending execution stage
+            // exactly like a fresh stage dispatch, so the recovered run can
+            // satisfy stage completion gates (wakeRole/stageId/currentParticipant/
+            // allowedActions) instead of stranding evidence-gated stages forever.
+            executionStage: buildExecutionStageWakeContext({
+              state: pendingExecutionState,
+              wakeRole: executionStageWakeRoleForStageType(pendingExecutionState.currentStageType),
+              allowedActions: ["approve", "request_changes"],
+            }),
             reviewRecoveryInstruction:
               "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
           },

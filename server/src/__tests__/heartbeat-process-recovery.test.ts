@@ -6295,6 +6295,80 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).not.toHaveProperty("modelProfile");
   });
 
+  it("binds executionStage context to the review participant recovery wake (SON-6211)", async () => {
+    const { agentId, issueId, runId, wakeupRequestId, stageId } =
+      await seedInReviewParticipantRunFixture();
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({
+        status: "completed",
+        finishedAt,
+        updatedAt: finishedAt,
+      })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.reviewParticipantRequeued).toBe(1);
+
+    // The recovery wake must carry the same executionStage binding a fresh
+    // stage dispatch attaches (wakeRole/stageId/currentParticipant/
+    // allowedActions), so a recovered reviewer run can pass evidence-gated
+    // stage completion instead of stranding the stage forever (SON-6211).
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    const recoveryWakeup = wakeups.find(
+      (wakeup) =>
+        wakeup.reason === "execution_review_participant_recovery" &&
+        wakeup.status !== "skipped",
+    );
+    expect(recoveryWakeup).toBeTruthy();
+
+    const expectedExecutionStage = {
+      wakeRole: "reviewer",
+      stageId,
+      stageType: "review",
+      currentParticipant: { type: "agent", agentId, userId: null },
+      returnAssignee: { type: "agent", agentId, userId: null },
+      reviewRequest: null,
+      lastDecisionOutcome: null,
+      allowedActions: ["approve", "request_changes"],
+    };
+    expect(recoveryWakeup?.payload).toMatchObject({
+      issueId,
+      executionStage: expectedExecutionStage,
+    });
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const recoveryRun = runs.find(
+      (row) =>
+        row.id !== runId &&
+        (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
+          "execution_review_participant_recovery",
+    );
+    expect(recoveryRun).toBeTruthy();
+    expect(recoveryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      taskId: issueId,
+      executionStage: expectedExecutionStage,
+    });
+  });
+
   it("re-enqueues a stranded execution-review participant when another agent has the latest issue run", async () => {
     const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
       await seedInReviewParticipantRunFixture();
