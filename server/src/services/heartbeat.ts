@@ -6653,6 +6653,51 @@ function mergeWakeCommentIds(...values: Array<unknown>): string[] {
   return merged;
 }
 
+/**
+ * SON-6262: interactive self-wakes (paperclip-interactive-session overlay)
+ * carry the user's request and the founder-facing reply binding under
+ * namespaced payload keys. The wake brief must reach the run prompt (as the
+ * wake instruction) and the reply binding must survive onto the snapshot so
+ * the gateway adapter can deliver the run's reply and record a durable
+ * receipt in the run result. Canonical keys already on the snapshot keep
+ * precedence.
+ */
+export const INTERACTIVE_WAKE_REPLY_CONVERSATION_REF_PATTERN = /^conv_[a-f0-9]{32}$/;
+
+const INTERACTIVE_WAKE_REPLY_AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+
+export function enrichInteractiveWakeContextFields(
+  contextSnapshot: Record<string, unknown>,
+  payload: Record<string, unknown> | null | undefined,
+): void {
+  if (!readNonEmptyString(contextSnapshot["wakeMessage"])) {
+    const interactiveMessage = readNonEmptyString(
+      payload?.["interactiveUserMessage"],
+    );
+    if (interactiveMessage) {
+      contextSnapshot.wakeMessage = interactiveMessage;
+    }
+  }
+  if (
+    !readNonEmptyString(contextSnapshot["replyConversationRef"]) &&
+    !readNonEmptyString(contextSnapshot["replyAgentId"])
+  ) {
+    const replyConversationRef = readNonEmptyString(
+      payload?.["replyConversationRef"],
+    );
+    const replyAgentId = readNonEmptyString(payload?.["replyAgentId"]);
+    if (
+      replyConversationRef &&
+      replyAgentId &&
+      INTERACTIVE_WAKE_REPLY_CONVERSATION_REF_PATTERN.test(replyConversationRef) &&
+      INTERACTIVE_WAKE_REPLY_AGENT_ID_PATTERN.test(replyAgentId)
+    ) {
+      contextSnapshot.replyConversationRef = replyConversationRef;
+      contextSnapshot.replyAgentId = replyAgentId;
+    }
+  }
+}
+
 function enrichWakeContextSnapshot(input: {
   contextSnapshot: Record<string, unknown>;
   reason: string | null;
@@ -6705,6 +6750,7 @@ function enrichWakeContextSnapshot(input: {
       contextSnapshot.wakeMessage = wakeMessage;
     }
   }
+  enrichInteractiveWakeContextFields(contextSnapshot, payload);
   if (!readNonEmptyString(contextSnapshot["sourceIssueId"])) {
     const sourceIssueId = readNonEmptyString(payload?.["sourceIssueId"]);
     if (sourceIssueId) {
@@ -22049,6 +22095,15 @@ export function heartbeatService(
                 },
               });
             } else if (presentationDecision.commentAction === "create") {
+              // SON-6262: an interactive wake bound to a founder conversation
+              // delivers its reply through the gateway adapter; when that
+              // receipt exists the demoted run is NOT a silent-success. Keep
+              // the durable receipt visible on the presentation decision so
+              // sweeps can distinguish delivered from silent-success.
+              const replyDelivery = parseObject(
+                persistedResultJson.replyDelivery,
+              );
+              const replyDelivered = replyDelivery.status === "delivered";
               presentationDecision = {
                 ...presentationDecision,
                 commentAction: "none",
@@ -22057,6 +22112,9 @@ export function heartbeatService(
                   skipRunIssueComment || livenessRun.status === "no_op"
                     ? "issue_comment_suppressed"
                     : "run_has_no_issue",
+                  ...(replyDelivered
+                    ? ["reply_delivered_to_bound_conversation"]
+                    : []),
                 ],
               };
             }

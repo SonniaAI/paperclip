@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentParams, resolveClaimedApiKeyPath, resolveSessionKey } from "./execute.js";
+import {
+  buildAgentParams,
+  buildReplyDeliveryRequest,
+  classifyReplyDelivery,
+  resolveClaimedApiKeyPath,
+  resolveSessionKey,
+} from "./execute.js";
 
 describe("resolveSessionKey", () => {
   it("prefixes run-scoped session keys with the configured agent", () => {
@@ -121,5 +127,103 @@ describe("resolveClaimedApiKeyPath", () => {
   it("falls back to the shared default when value is not a string", () => {
     expect(resolveClaimedApiKeyPath(42)).toBe(DEFAULT_PATH);
     expect(resolveClaimedApiKeyPath({})).toBe(DEFAULT_PATH);
+  });
+});
+
+describe("buildReplyDeliveryRequest", () => {
+  const CONVERSATION_REF = `conv_${"a".repeat(32)}`;
+
+  it("builds a per-run idempotent conversations.send request", () => {
+    expect(
+      buildReplyDeliveryRequest({
+        runId: "0f0e0d0c-1111-2222-3333-444455556666",
+        conversationRef: CONVERSATION_REF,
+        agentId: "sonnia",
+        message: "Answer for the founder.",
+      }),
+    ).toEqual({
+      agentId: "sonnia",
+      conversationRef: CONVERSATION_REF,
+      operationId: "paperclip-run-0f0e0d0c-1111-2222-3333-444455556666",
+      message: "Answer for the founder.",
+    });
+  });
+
+  it("rejects a malformed conversation ref", () => {
+    expect(
+      buildReplyDeliveryRequest({
+        runId: "run-1",
+        conversationRef: "not-a-conversation-ref",
+        agentId: "sonnia",
+        message: "hello",
+      }),
+    ).toBeNull();
+    expect(
+      buildReplyDeliveryRequest({
+        runId: "run-1",
+        conversationRef: `conv_${"g".repeat(32)}`,
+        agentId: "sonnia",
+        message: "hello",
+      }),
+    ).toBeNull();
+  });
+
+  it("rejects a missing or malformed owning agent id", () => {
+    expect(
+      buildReplyDeliveryRequest({
+        runId: "run-1",
+        conversationRef: CONVERSATION_REF,
+        agentId: null,
+        message: "hello",
+      }),
+    ).toBeNull();
+    expect(
+      buildReplyDeliveryRequest({
+        runId: "run-1",
+        conversationRef: CONVERSATION_REF,
+        agentId: "Bad Agent Slug",
+        message: "hello",
+      }),
+    ).toBeNull();
+  });
+
+  it("rejects an empty reply so the run fails visibly instead of silently", () => {
+    expect(
+      buildReplyDeliveryRequest({
+        runId: "run-1",
+        conversationRef: CONVERSATION_REF,
+        agentId: "sonnia",
+        message: "   ",
+      }),
+    ).toBeNull();
+    expect(
+      buildReplyDeliveryRequest({
+        runId: "run-1",
+        conversationRef: CONVERSATION_REF,
+        agentId: "sonnia",
+        message: null,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("classifyReplyDelivery", () => {
+  it("treats sent and queued as delivered", () => {
+    expect(classifyReplyDelivery({ status: "sent", channel: "telegram", messageId: "m1" })).toEqual({
+      delivered: true,
+      gatewayStatus: "sent",
+      channel: "telegram",
+      messageId: "m1",
+      queueId: null,
+    });
+    expect(classifyReplyDelivery({ status: "queued", queueId: "q1" }).delivered).toBe(true);
+  });
+
+  it("treats suppressed and unknown as refusals", () => {
+    expect(classifyReplyDelivery({ status: "suppressed" }).delivered).toBe(false);
+    expect(classifyReplyDelivery({ status: "unknown" }).delivered).toBe(false);
+    expect(classifyReplyDelivery(null).delivered).toBe(false);
+    expect(classifyReplyDelivery(undefined).gatewayStatus).toBe("unknown");
+    expect(classifyReplyDelivery({}).gatewayStatus).toBe("unknown");
   });
 });
