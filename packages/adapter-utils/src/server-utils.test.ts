@@ -1538,6 +1538,77 @@ describe("renderPaperclipWakePrompt", () => {
     );
   });
 
+  it("renders a coordination wake instruction without an issue binding (SON-6224)", () => {
+    const payload = {
+      reason: "decision_controller_ask",
+      issue: null,
+      wakeInstruction: {
+        message:
+          "decision_controller_ask: 04eb20cd | 4dce62bf. Read these sources and decide the named interaction.",
+        sourceIssueId: "04eb20cd-e1b8-4727-9347-022aff2b46f7",
+        sourceIssueIds: [],
+        sourceInteractionId: "4dce62bf-866f-495a-9740-80d56bd53863",
+      },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    };
+
+    expect(
+      JSON.parse(stringifyPaperclipWakePayload(payload) ?? "{}"),
+    ).toMatchObject({
+      wakeInstruction: {
+        sourceIssueId: "04eb20cd-e1b8-4727-9347-022aff2b46f7",
+        sourceInteractionId: "4dce62bf-866f-495a-9740-80d56bd53863",
+      },
+    });
+
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain("## Wake instruction");
+    expect(prompt).toContain(
+      "decision_controller_ask: 04eb20cd | 4dce62bf. Read these sources and decide the named interaction.",
+    );
+    expect(prompt).toContain(
+      "- source issue: 04eb20cd-e1b8-4727-9347-022aff2b46f7",
+    );
+    expect(prompt).toContain(
+      "- source interaction: 4dce62bf-866f-495a-9740-80d56bd53863",
+    );
+  });
+
+  it("clips an oversized coordination wake instruction", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "decision_controller_escalation",
+      issue: null,
+      wakeInstruction: {
+        message: "x".repeat(5_000),
+        sourceIssueId: null,
+        sourceIssueIds: [],
+        sourceInteractionId: null,
+      },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).toContain("## Wake instruction");
+    expect(prompt).toContain("[wake instruction truncated]");
+    expect(prompt.length).toBeLessThan(6_000);
+  });
+
+  it("still collapses wakes that carry neither task context nor instruction", () => {
+    const payload = {
+      reason: "decision_controller_ask",
+      issue: null,
+      wakeInstruction: null,
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    };
+
+    expect(stringifyPaperclipWakePayload(payload)).toBeNull();
+  });
+
   it("renders a plugin session message as the user turn without granting it system authority", () => {
     const payload = {
       reason: "gateway_chat_message",

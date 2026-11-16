@@ -63,7 +63,13 @@ async function waitForRunRegistration(delayMs: number) {
 function readRunSourceIssueId(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
   const context = contextSnapshot as Record<string, unknown>;
-  for (const candidate of [context.issueId, context.taskId]) {
+  // SON-6224: decision-controller coordination wakes deliberately omit
+  // issueId/taskId (binding would defer/skip them behind execution-lock and
+  // dependency gates) and instead name their source under `sourceIssueId`.
+  // That named source is this run's anchor: writes to it are same-source
+  // work, not cross-issue influence to cap. Targets other than the named
+  // source keep the existing anchored/batch/cap handling unchanged.
+  for (const candidate of [context.issueId, context.taskId, context.sourceIssueId]) {
     if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
   }
   return null;
