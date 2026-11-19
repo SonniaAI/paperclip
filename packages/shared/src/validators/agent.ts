@@ -206,6 +206,15 @@ export const wakeAgentSchema = z.object({
   source: z.enum(["timer", "assignment", "on_demand", "automation"]).optional().default("on_demand"),
   triggerDetail: z.enum(["manual", "ping", "callback", "system"]).optional(),
   reason: z.string().optional().nullable(),
+  /**
+   * SON-6308: free-form brief for interactive/self wakes. The
+   * interactive-session helper posts the user's request here; the wakeup
+   * route folds it into `payload.interactiveUserMessage` so wake-context
+   * enrichment reads one canonical key regardless of helper variant.
+   * Deliberately separate from `payload` (structured metadata) and never a
+   * substitute for task/comment binding.
+   */
+  message: z.string().max(100_000).optional().nullable(),
   payload: z.record(z.string(), z.unknown()).optional().nullable(),
   idempotencyKey: z.string().optional().nullable(),
   forceFreshSession: z.preprocess(

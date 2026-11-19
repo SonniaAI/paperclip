@@ -5148,11 +5148,61 @@ export function agentRoutes(
       return;
     }
 
+    // SON-6308: the interactive-session helper posts the user's request as a
+    // bare `message` (see wakeAgentSchema). Normalize it into the canonical
+    // `payload.interactiveUserMessage` key so wake enrichment reads one
+    // field regardless of helper variant; an explicit payload value keeps
+    // precedence.
+    let wakePayload = req.body.payload ?? null;
+    const wakeRequestBody = req.body as { message?: unknown };
+    if (
+      typeof wakeRequestBody.message === "string" &&
+      wakeRequestBody.message.trim().length > 0
+    ) {
+      wakePayload = {
+        ...(wakePayload ?? {}),
+        interactiveUserMessage:
+          typeof wakePayload?.["interactiveUserMessage"] === "string" &&
+          (wakePayload["interactiveUserMessage"] as string).trim().length > 0
+            ? (wakePayload["interactiveUserMessage"] as string)
+            : wakeRequestBody.message,
+      };
+    }
+    // SON-6308 fail-loud inbound: an interactive wake with no recoverable
+    // brief is admitted as a run that exits 0 with an empty Wake
+    // instruction — the sender's request silently vanishes and can only be
+    // handled by asking for a resend (5 documented occurrences). Refuse
+    // admission with a visible, stable code and the requester identity
+    // instead of admitting a doomed run.
+    if (req.body.reason === "interactive_request") {
+      const interactiveBrief = [
+        wakePayload?.["interactiveUserMessage"],
+        wakePayload?.["message"],
+      ].find(
+        (value): value is string =>
+          typeof value === "string" && value.trim().length > 0,
+      );
+      if (!interactiveBrief) {
+        throw unprocessable(
+          "Interactive wake rejected: no message body was provided.",
+          {
+            code: "interactive_wake_missing_brief",
+            reason: "interactive_request",
+            requestedByActorType: req.actor.type,
+            requestedByActorId:
+              req.actor.type === "agent"
+                ? req.actor.agentId ?? null
+                : req.actor.userId ?? null,
+          },
+        );
+      }
+    }
+
     const run = await heartbeat.wakeup(id, {
       source: opts.source,
       triggerDetail: req.body.triggerDetail ?? "manual",
       reason: req.body.reason ?? null,
-      payload: req.body.payload ?? null,
+      payload: wakePayload,
       idempotencyKey: req.body.idempotencyKey ?? null,
       requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
