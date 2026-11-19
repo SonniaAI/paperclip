@@ -28,6 +28,8 @@ type WakePayload = {
   wakeCommentId: string | null;
   approvalId: string | null;
   approvalStatus: string | null;
+  replyConversationRef: string | null;
+  replyAgentId: string | null;
   issueIds: string[];
 };
 
@@ -127,6 +129,87 @@ function parseBoolean(value: unknown, fallback = false): boolean {
     if (normalized === "false" || normalized === "0") return false;
   }
   return fallback;
+}
+
+/**
+ * Gateway conversation refs (`conversations.list`) follow `conv_<32 hex>`.
+ * Interactive self-wakes bind their founder-facing reply target with this
+ * shape so the adapter can deliver the run's reply after a successful turn.
+ */
+export const REPLY_DELIVERY_CONVERSATION_REF_PATTERN = /^conv_[a-f0-9]{32}$/;
+
+/** Bounded wait for the gateway `conversations.send` delivery round-trip. */
+const REPLY_DELIVERY_TIMEOUT_MS = 30_000;
+
+const REPLY_DELIVERY_AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+
+export type ReplyDeliveryRequest = {
+  agentId: string;
+  conversationRef: string;
+  operationId: string;
+  message: string;
+};
+
+/**
+ * Build the gateway `conversations.send` request that delivers an interactive
+ * wake run's founder-facing reply to its bound conversation. Returns null when
+ * the wake carries no complete reply binding (or no reply text), so callers
+ * can fail the run visibly instead of silently succeeding.
+ */
+export function buildReplyDeliveryRequest(input: {
+  runId: string;
+  conversationRef: string | null | undefined;
+  agentId: string | null | undefined;
+  message: string | null | undefined;
+}): ReplyDeliveryRequest | null {
+  const conversationRef = input.conversationRef?.trim() ?? "";
+  const agentId = input.agentId?.trim() ?? "";
+  const message = input.message?.trim() ?? "";
+  if (!conversationRef || !REPLY_DELIVERY_CONVERSATION_REF_PATTERN.test(conversationRef)) {
+    return null;
+  }
+  if (!agentId || !REPLY_DELIVERY_AGENT_ID_PATTERN.test(agentId)) {
+    return null;
+  }
+  if (!message) {
+    return null;
+  }
+  return {
+    agentId,
+    conversationRef,
+    // Per-run idempotency: a retried adapter execution for the same run
+    // observes the prior gateway operation instead of re-sending. A fresh run
+    // (process-loss retry) owns a new run id, so its delivery is a new
+    // operation by design.
+    operationId: `paperclip-run-${input.runId}`,
+    message,
+  };
+}
+
+export type ReplyDeliveryVerdict = {
+  delivered: boolean;
+  gatewayStatus: string;
+  channel: string | null;
+  messageId: string | null;
+  queueId: string | null;
+};
+
+/**
+ * Classify a gateway `conversations.send` result. Only `sent` and `queued`
+ * count as delivered; `suppressed` and `unknown` are refusals and must fail
+ * the run visibly (SON-6262: silent-success is the defect being fixed).
+ */
+export function classifyReplyDelivery(
+  raw: Record<string, unknown> | null | undefined,
+): ReplyDeliveryVerdict {
+  const gatewayStatus = (nonEmpty(raw?.status) ?? "unknown").toLowerCase();
+  return {
+    delivered: gatewayStatus === "sent" || gatewayStatus === "queued",
+    gatewayStatus,
+    channel: nonEmpty(raw?.channel),
+    messageId: nonEmpty(raw?.messageId),
+    queueId: nonEmpty(raw?.queueId),
+  };
 }
 
 function normalizeSessionKeyStrategy(value: unknown): SessionKeyStrategy {
@@ -316,6 +399,8 @@ function buildWakePayload(ctx: AdapterExecutionContext): WakePayload {
     wakeCommentId: nonEmpty(context.wakeCommentId) ?? nonEmpty(context.commentId),
     approvalId: nonEmpty(context.approvalId),
     approvalStatus: nonEmpty(context.approvalStatus),
+    replyConversationRef: nonEmpty(context.replyConversationRef),
+    replyAgentId: nonEmpty(context.replyAgentId),
     issueIds: Array.isArray(context.issueIds)
       ? context.issueIds.filter(
           (value): value is string => typeof value === "string" && value.trim().length > 0,
@@ -1385,6 +1470,117 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         null;
       const summary = summaryFromEvents || summaryFromPayload || null;
 
+      // SON-6262: interactive self-wakes bound to a founder conversation must
+      // either deliver their reply or fail visibly — a green run with zero
+      // delivery is the silent-success defect this replaces. The delivery
+      // runs on the still-connected gateway client and its receipt lands in
+      // resultJson.replyDelivery so sweeps can distinguish delivered from
+      // silent-success.
+      const resultPayloadRecord = asRecord(latestResultPayload);
+      const replyConversationRef = wakePayload.replyConversationRef;
+      let replyDelivery: Record<string, unknown> | null = null;
+      if (replyConversationRef) {
+        const deliveryRequest = buildReplyDeliveryRequest({
+          runId: ctx.runId,
+          conversationRef: replyConversationRef,
+          agentId: wakePayload.replyAgentId,
+          message: summary,
+        });
+        if (!deliveryRequest) {
+          const reason = summary ? "binding_invalid" : "no_reply_text";
+          await ctx.onLog(
+            "stderr",
+            `[openclaw-gateway] interactive reply delivery not possible runId=${ctx.runId} reason=${reason}\n`,
+          );
+          return {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            errorMessage:
+              reason === "no_reply_text"
+                ? "Interactive wake run produced no founder-facing reply text to deliver"
+                : `Interactive wake reply binding is incomplete: conversationRef=${replyConversationRef} agentId=${wakePayload.replyAgentId ?? "(missing)"}`,
+            errorCode:
+              reason === "no_reply_text"
+                ? "openclaw_gateway_reply_missing"
+                : "openclaw_gateway_reply_binding_invalid",
+            resultJson: {
+              ...asRecord(latestResultPayload),
+              replyDelivery: {
+                status: "failed",
+                conversationRef: replyConversationRef,
+                reason,
+              },
+            },
+          };
+        }
+        try {
+          const sendResult = await client.request<Record<string, unknown>>(
+            "conversations.send",
+            deliveryRequest,
+            { timeoutMs: REPLY_DELIVERY_TIMEOUT_MS },
+          );
+          const verdict = classifyReplyDelivery(sendResult);
+          if (!verdict.delivered) {
+            await ctx.onLog(
+              "stderr",
+              `[openclaw-gateway] interactive reply delivery refused runId=${ctx.runId} status=${verdict.gatewayStatus}\n`,
+            );
+            return {
+              exitCode: 1,
+              signal: null,
+              timedOut: false,
+              errorMessage: `OpenClaw gateway refused the interactive wake reply delivery (status=${verdict.gatewayStatus})`,
+              errorCode: "openclaw_gateway_reply_delivery_refused",
+              resultJson: {
+                ...asRecord(latestResultPayload),
+                replyDelivery: {
+                  status: "failed",
+                  conversationRef: deliveryRequest.conversationRef,
+                  gatewayStatus: verdict.gatewayStatus,
+                },
+              },
+            };
+          }
+          replyDelivery = {
+            status: "delivered",
+            deliveryStatus: verdict.gatewayStatus,
+            conversationRef: deliveryRequest.conversationRef,
+            agentId: deliveryRequest.agentId,
+            operationId: deliveryRequest.operationId,
+            ...(verdict.channel ? { channel: verdict.channel } : {}),
+            ...(verdict.messageId ? { messageId: verdict.messageId } : {}),
+            ...(verdict.queueId ? { queueId: verdict.queueId } : {}),
+            deliveredAt: new Date().toISOString(),
+          };
+          await ctx.onLog(
+            "stdout",
+            `[openclaw-gateway] interactive reply delivered runId=${ctx.runId} conversationRef=${deliveryRequest.conversationRef} status=${verdict.gatewayStatus}\n`,
+          );
+        } catch (err) {
+          const deliveryError = err instanceof Error ? err.message : String(err);
+          await ctx.onLog(
+            "stderr",
+            `[openclaw-gateway] interactive reply delivery failed runId=${ctx.runId} error=${deliveryError}\n`,
+          );
+          return {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            errorMessage: `Interactive wake reply delivery failed: ${deliveryError}`,
+            errorCode: "openclaw_gateway_reply_delivery_failed",
+            resultJson: {
+              ...asRecord(latestResultPayload),
+              replyDelivery: {
+                status: "failed",
+                conversationRef: deliveryRequest.conversationRef,
+                error: deliveryError,
+              },
+            },
+          };
+        }
+      }
+
       const acceptedResult = asRecord(acceptedPayload?.result);
       const latestPayload = asRecord(latestResultPayload);
       const latestResult = asRecord(latestPayload?.result);
@@ -1417,7 +1613,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(model ? { model } : {}),
         ...(usage ? { usage } : {}),
         ...(costUsd > 0 ? { costUsd } : {}),
-        resultJson: asRecord(latestResultPayload),
+        resultJson:
+          replyDelivery && resultPayloadRecord
+            ? { ...resultPayloadRecord, replyDelivery }
+            : resultPayloadRecord,
         ...(runtimeServices.length > 0 ? { runtimeServices } : {}),
         ...(summary ? { summary } : {}),
       };
