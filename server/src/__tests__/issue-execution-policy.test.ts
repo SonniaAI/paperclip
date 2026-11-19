@@ -1941,37 +1941,173 @@ describe("issue execution policy transitions", () => {
       });
     });
 
-    it("rejects explicitly re-arming a monitor after max attempts are exhausted", () => {
+    it("rejects explicitly re-arming a monitor mid-cycle after max attempts are exhausted", () => {
+      const previousPolicy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2098-06-01T12:30:00.000Z",
+          maxAttempts: 1,
+          scheduledBy: "assignee",
+          timeoutAt: "2099-01-01T12:30:00.000Z",
+        },
+      })!;
       const policy = normalizeIssueExecutionPolicy({
         stages: [],
         monitor: {
-          nextCheckAt: "2099-04-11T12:30:00.000Z",
+          nextCheckAt: "2098-12-01T12:30:00.000Z",
           maxAttempts: 1,
           scheduledBy: "assignee",
+          timeoutAt: "2099-02-01T12:30:00.000Z",
         },
       })!;
 
       expect(() =>
         applyIssueExecutionPolicyTransition({
           issue: {
-            status: "in_review",
+            status: "in_progress",
             assigneeAgentId: coderAgentId,
             assigneeUserId: null,
-            executionPolicy: null,
-            executionState: null,
+            executionPolicy: previousPolicy,
+            executionState: {
+              status: "idle",
+              monitor: {
+                status: "scheduled",
+                nextCheckAt: "2098-06-01T12:30:00.000Z",
+                attemptCount: 1,
+                timeoutAt: "2099-01-01T12:30:00.000Z",
+              },
+            },
             monitorAttemptCount: 1,
-            monitorNextCheckAt: null,
+            monitorNextCheckAt: new Date("2098-06-01T12:30:00.000Z"),
             monitorLastTriggeredAt: null,
             monitorNotes: null,
             monitorScheduledBy: "assignee",
           },
           policy,
-          previousPolicy: null,
+          previousPolicy,
           requestedAssigneePatch: {},
           actor: { agentId: coderAgentId },
           monitorExplicitlyUpdated: true,
         }),
       ).toThrow("Monitor bounds are already exhausted");
+    });
+
+    it("resets the attempt counter when re-arming after the previous monitor cycle triggered", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2099-04-12T06:10:00.000Z",
+          maxAttempts: 2,
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "cluster-job-queue",
+          externalRef: "request-123",
+          timeoutAt: "2099-04-14T06:00:00.000Z",
+          recoveryPolicy: "wake_owner",
+        },
+      })!;
+
+      //SON-6162 daily pattern: yesterday's cycle fired twice (2/2 consumed,
+      //monitor stripped after trigger) and the owner re-arms with the SAME
+      //maxAttempts for the next day.
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: null,
+          executionState: {
+            status: "idle",
+            monitor: {
+              status: "triggered",
+              nextCheckAt: null,
+              lastTriggeredAt: "2099-04-11T06:15:00.000Z",
+              attemptCount: 2,
+              clearReason: null,
+              clearedAt: null,
+            },
+          },
+          monitorAttemptCount: 2,
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2099-04-11T06:15:00.000Z"),
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        policy,
+        previousPolicy: null,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: true,
+      });
+
+      expect(result.patch.monitorAttemptCount).toBe(0);
+      expect(result.patch.monitorLastTriggeredAt).toBeNull();
+      expect(result.patch.monitorNextCheckAt).toEqual(new Date("2099-04-12T06:10:00.000Z"));
+      expect(result.patch.executionState).toMatchObject({
+        monitor: {
+          status: "scheduled",
+          nextCheckAt: "2099-04-12T06:10:00.000Z",
+          attemptCount: 0,
+        },
+      });
+    });
+
+    it("resets the attempt counter when the new arm schedules beyond the previous cycle timeout", () => {
+      const previousPolicy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2098-06-01T12:30:00.000Z",
+          maxAttempts: 2,
+          scheduledBy: "assignee",
+          timeoutAt: "2098-06-02T12:30:00.000Z",
+        },
+      })!;
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2099-01-01T12:30:00.000Z",
+          maxAttempts: 2,
+          scheduledBy: "assignee",
+          timeoutAt: "2099-02-01T12:30:00.000Z",
+        },
+      })!;
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: previousPolicy,
+          executionState: {
+            status: "idle",
+            monitor: {
+              status: "scheduled",
+              nextCheckAt: "2098-06-01T12:30:00.000Z",
+              attemptCount: 2,
+              timeoutAt: "2098-06-02T12:30:00.000Z",
+            },
+          },
+          monitorAttemptCount: 2,
+          monitorNextCheckAt: new Date("2098-06-01T12:30:00.000Z"),
+          monitorLastTriggeredAt: null,
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        policy,
+        previousPolicy,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: true,
+      });
+
+      expect(result.patch.monitorAttemptCount).toBe(0);
+      expect(result.patch.executionState).toMatchObject({
+        monitor: {
+          status: "scheduled",
+          nextCheckAt: "2099-01-01T12:30:00.000Z",
+          attemptCount: 0,
+        },
+      });
     });
   });
 });

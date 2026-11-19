@@ -764,6 +764,75 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it("clears only the monitor when executionPolicy.monitor is explicitly nulled, preserving the rest of the policy", async () => {
+    const storedPolicy = normalizeIssueExecutionPolicy({
+      stages: [
+        { type: "review", participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }] },
+      ],
+      monitor: {
+        nextCheckAt: "2026-12-01T12:00:00.000Z",
+        scheduledBy: "assignee",
+        notes: "Daily collection.",
+        kind: "external_service",
+        serviceName: "cluster-job-queue",
+        externalRef: "request-123",
+        timeoutAt: "2026-12-02T12:00:00.000Z",
+        maxAttempts: 4,
+        recoveryPolicy: "wake_owner",
+      },
+    })!;
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1006B",
+      title: "Monitor-only clear",
+      executionPolicy: storedPolicy,
+      executionState: {
+        status: "idle",
+        monitor: {
+          status: "scheduled",
+          nextCheckAt: "2026-12-01T12:00:00.000Z",
+          attemptCount: 1,
+        },
+      },
+      monitorAttemptCount: 1,
+      monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+      monitorLastTriggeredAt: null,
+      monitorNotes: "Daily collection.",
+      monitorScheduledBy: "assignee",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    const updatePatches: Array<Record<string, unknown>> = [];
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+      updatePatches.push(patch);
+      return { ...issue, ...patch, updatedAt: new Date() };
+    });
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ executionPolicy: { monitor: null } });
+
+    expect(res.status).toBe(200);
+    expect(updatePatches).toHaveLength(1);
+    const patch = updatePatches[0]!;
+    const nextPolicy = patch.executionPolicy as Record<string, unknown> | null | undefined;
+    expect(nextPolicy).not.toBeNull();
+    expect(nextPolicy).toMatchObject({ mode: "normal", commentRequired: true });
+    expect((nextPolicy as { stages: unknown[] }).stages).toHaveLength(1);
+    expect((nextPolicy as { monitor?: unknown }).monitor).toBeUndefined();
+    expect(patch.monitorNextCheckAt).toBeNull();
+    expect(patch.monitorWakeRequestedAt).toBeNull();
+  });
+
   it("allows board-authored in_review repair updates without a review path", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
