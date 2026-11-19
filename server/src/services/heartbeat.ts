@@ -22101,7 +22101,7 @@ export function heartbeatService(
               // the durable receipt visible on the presentation decision so
               // sweeps can distinguish delivered from silent-success.
               const replyDelivery = parseObject(
-                persistedResultJson.replyDelivery,
+                persistedResultJson?.replyDelivery,
               );
               const replyDelivered = replyDelivery.status === "delivered";
               presentationDecision = {
