@@ -1369,6 +1369,14 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
 
+        const staleErrorRecovery = await heartbeat.reconcileStaleErroredAgents();
+        if (staleErrorRecovery.cleared > 0) {
+          logger.warn(
+            { ...staleErrorRecovery },
+            "startup stale agent-error recovery cleared latched lane errors",
+          );
+        }
+
         const reviewed = await heartbeat.reconcileProductivityReviews();
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
@@ -1604,6 +1612,15 @@ export async function startServer(): Promise<StartedServer> {
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            .then(async () => {
+              const staleErrors = await heartbeat.reconcileStaleErroredAgents();
+              if (staleErrors.cleared > 0) {
+                logger.warn(
+                  { ...staleErrors },
+                  "periodic stale agent-error recovery cleared latched lane errors",
+                );
               }
             })
             .then(async () => {
